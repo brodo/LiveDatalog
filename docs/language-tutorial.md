@@ -246,6 +246,14 @@ facts and rules the next time you run a query.
 
 ## Lists
 
+Lists are useful for representing ordered collections as a single value. For
+example, they can hold the children of a person, a path through a graph, or a
+pair of values projected by an aggregate. Because lists are ordinary structural
+terms, they can be nested, stored in facts, passed between relations, and
+decomposed with pattern matching. This keeps collection processing in the
+language: recursive relations can calculate properties such as length or sum
+without requiring a separate built-in aggregate for each operation.
+
 Lists are terms, so they must appear inside a fact, rule, query, or comparison.
 Write a list with square brackets:
 
@@ -325,6 +333,16 @@ Total: 6
 ```
 
 ## Aggregation with `setof`
+
+`setof` is useful when a rule needs to turn all solutions of a goal into one
+collection—for example, grouping every child by parent or collecting every node
+reachable from a starting point. It expresses the collection declaratively,
+without rules that manually build an accumulator. The result is deduplicated
+and deterministically ordered, so it does not depend on fact or rule insertion
+order. It also succeeds with an empty list when there are no matches, allowing
+outer groups to remain in the result. The resulting list can then be passed to
+ordinary list relations for operations such as length, sum, or further
+structural processing.
 
 `setof(Template, Goal, Result)` collects every distinct, fully determined value
 of `Template` produced by `Goal`:
