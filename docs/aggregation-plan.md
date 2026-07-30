@@ -271,6 +271,34 @@ Phase 3 was completed on 2026-07-30 with these decisions:
 Stop when the Chapter 3 examples supported by LiveDatalog's chosen arithmetic
 subset work and the termination boundary is enforced.
 
+### Completed decisions
+
+Phase 4 was completed on 2026-07-30 with these decisions:
+
+- Arithmetic uses signed 64-bit integers and the infix forms `N = A + B` and
+  `N = A - B`. Both operands must be bound integer atoms. The result may bind
+  an output term or check an already-bound output. Invalid operands return
+  `NumericType`; values and operations outside the `i64` range return
+  `NumericOverflow`.
+- Existing comparisons retain their `f64` parsing and compatibility behavior.
+  Arithmetic does not change numeric equality or ordering in this milestone.
+- Recursive list relations are evaluated from a structural input pattern.
+  Canonical list values introduced by later strata, including `setof` results,
+  reseed admissible rules, so `length`, `member`, `sum`, and `collectfirst` can
+  remain ordinary user-defined relations.
+- A recursive call involving `cons` is admissible only when at least one call
+  argument is reached through one or more cons tails of its head argument and
+  every other statically structural argument is unchanged or likewise a tail.
+  This accepts tail-consuming list recursion and rejects element recursion such
+  as `q([X]) :- q(X)`.
+- The checker intentionally rejects rules whose decreasing input position is
+  inconsistent across recursive calls, and it does not attempt a mutual-
+  recursion or semantic-size proof. These are conservative false rejections at
+  the enforceable termination boundary.
+- While admissible rules are probed against canonical structural inputs,
+  numeric type and overflow failures make an unrelated candidate inapplicable.
+  Arithmetic goals evaluated directly still report the explicit numeric error.
+
 ## Phase 5: integration and public documentation
 
 ### Scope
@@ -325,6 +353,7 @@ Each implementation session should end with:
 
 ## Open design questions
 
-- Should arithmetic initially use integers, preserve the current `f64`
-  behavior, or introduce tagged numeric values?
-- How conservative may the admissibility checker be?
+- Whether a later numeric migration should replace atom-backed `i64` arithmetic
+  and the legacy `f64` comparison behavior with tagged numeric values.
+- Whether admissibility should eventually prove mutual recursion or support
+  multiple decreasing input modes instead of conservatively rejecting them.

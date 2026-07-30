@@ -11,6 +11,9 @@ pub const Error = error{
     NotStratified,
     UnboundVariable,
     UnknownOperator,
+    NumericType,
+    NumericOverflow,
+    NotAdmissible,
 };
 
 /// Interns every predicate, variable, and value used by a database. IDs are
@@ -118,6 +121,7 @@ pub const Expr = struct {
 pub const Rule = struct {
     head: Expr,
     body: []Clause,
+    seed_argument: ?usize = null,
 };
 
 pub const Aggregate = struct {
@@ -273,10 +277,14 @@ pub const Jatalog = struct {
     }
 
     fn addRuleClauses(self: *Jatalog, head: Expr, body: []Clause) !void {
-        try self.validateRule(head, body);
+        const seed_argument = try self.validateRule(head, body);
         const owned_body = try self.orderClauses(body);
         errdefer self.allocator.free(owned_body);
-        try self.rules.append(self.allocator, .{ .head = head, .body = owned_body });
+        try self.rules.append(self.allocator, .{
+            .head = head,
+            .body = owned_body,
+            .seed_argument = seed_argument,
+        });
         self.validateStratification() catch |err| {
             _ = self.rules.pop();
             return err;
@@ -362,15 +370,41 @@ pub const Jatalog = struct {
             while (true) {
                 const before = facts.items.len;
                 for (self.rules.items) |rule| {
-                    if ((levels.get(rule.head.predicate) orelse 0) != level) continue;
+                    const rule_level = levels.get(rule.head.predicate) orelse 0;
+                    if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
                     var answers: std.ArrayList(Binding) = .empty;
                     defer {
                         for (answers.items) |*answer| answer.deinit(self.allocator);
                         answers.deinit(self.allocator);
                     }
-                    var initial: Binding = .{};
-                    defer initial.deinit(self.allocator);
-                    try self.matchClauses(rule.body, facts.items, 0, &initial, &answers);
+                    if (rule.seed_argument) |argument| {
+                        const value_count = self.values.values.items.len;
+                        for (0..value_count) |value| {
+                            var initial: Binding = .{};
+                            defer initial.deinit(self.allocator);
+                            const seeded = try self.unifyValueTerm(
+                                @intCast(value),
+                                rule.head.terms[argument],
+                                &initial,
+                            );
+                            if (seeded) {
+                                self.matchClauses(
+                                    rule.body,
+                                    facts.items,
+                                    0,
+                                    &initial,
+                                    &answers,
+                                ) catch |err| switch (err) {
+                                    Error.NumericType, Error.NumericOverflow => continue,
+                                    else => return err,
+                                };
+                            }
+                        }
+                    } else {
+                        var initial: Binding = .{};
+                        defer initial.deinit(self.allocator);
+                        try self.matchClauses(rule.body, facts.items, 0, &initial, &answers);
+                    }
                     for (answers.items) |*answer| {
                         const derived = try self.deriveFact(rule.head, answer);
                         if (containsFact(facts.items, derived)) {
@@ -571,8 +605,24 @@ pub const Jatalog = struct {
     }
 
     fn evalBuiltin(self: *Jatalog, expr_value: Expr, bindings: *Binding) !bool {
-        if (expr_value.terms.len != 2) return Error.InvalidQuery;
         const operator = self.strings.resolve(expr_value.predicate);
+        if (std.mem.eql(u8, operator, "+") or std.mem.eql(u8, operator, "-")) {
+            if (expr_value.terms.len != 3) return Error.InvalidQuery;
+            const left_id = try self.termToValue(expr_value.terms[1], bindings);
+            const right_id = try self.termToValue(expr_value.terms[2], bindings);
+            const left = try self.integerValue(left_id);
+            const right = try self.integerValue(right_id);
+            const result = if (std.mem.eql(u8, operator, "+"))
+                std.math.add(i64, left, right) catch return Error.NumericOverflow
+            else
+                std.math.sub(i64, left, right) catch return Error.NumericOverflow;
+            var buffer: [32]u8 = undefined;
+            const spelling = std.fmt.bufPrint(&buffer, "{d}", .{result}) catch unreachable;
+            const atom = try self.strings.intern(spelling);
+            const value = try self.values.intern(.{ .atom = atom });
+            return self.unifyValueTerm(value, expr_value.terms[0], bindings);
+        }
+        if (expr_value.terms.len != 2) return Error.InvalidQuery;
         const left = expr_value.terms[0];
         const right = expr_value.terms[1];
         const left_id = self.termToValue(left, bindings) catch |err| switch (err) {
@@ -600,6 +650,14 @@ pub const Jatalog = struct {
         if (std.mem.eql(u8, operator, ">")) return left_number > right_number;
         if (std.mem.eql(u8, operator, ">=")) return left_number >= right_number;
         return Error.UnknownOperator;
+    }
+
+    fn integerValue(self: *const Jatalog, value: ValueId) !i64 {
+        const spelling = self.atomString(value) orelse return Error.NumericType;
+        return std.fmt.parseInt(i64, spelling, 10) catch |err| switch (err) {
+            error.Overflow => Error.NumericOverflow,
+            else => Error.NumericType,
+        };
     }
 
     fn atomString(self: *const Jatalog, value: ValueId) ?[]const u8 {
@@ -634,8 +692,9 @@ pub const Jatalog = struct {
         };
     }
 
-    fn validateRule(self: *Jatalog, head: Expr, body: []const Clause) !void {
+    fn validateRule(self: *Jatalog, head: Expr, body: []const Clause) !?usize {
         if (body.len == 0 or head.negated or isBuiltin(self, head)) return Error.InvalidRule;
+        const seed_argument = try admissibleSeedArgument(head, body);
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
         for (head.terms) |term| try collectTermVariables(self.allocator, term, &outer_variables);
@@ -643,10 +702,46 @@ pub const Jatalog = struct {
 
         var bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer bound.deinit(self.allocator);
+        if (seed_argument) |argument|
+            try bindTermVariables(self.allocator, head.terms[argument], &bound);
         const ordered = try self.orderClauses(body);
         defer self.allocator.free(ordered);
         for (ordered) |clause| try self.validateClause(clause, &bound, &outer_variables, Error.InvalidRule);
         for (head.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidRule;
+        return seed_argument;
+    }
+
+    fn admissibleSeedArgument(head: Expr, body: []const Clause) !?usize {
+        var seed: ?usize = null;
+        for (head.terms, 0..) |term, index| {
+            if (termContainsCons(term)) {
+                seed = index;
+                break;
+            }
+        }
+        for (body) |clause| {
+            const call = switch (clause) {
+                .relational => |expression| expression,
+                else => continue,
+            };
+            if (call.predicate != head.predicate or call.terms.len != head.terms.len) continue;
+
+            var involves_cons = false;
+            var call_seed: ?usize = null;
+            for (head.terms, call.terms, 0..) |head_term, call_term, index| {
+                if (!termContainsCons(head_term) and !termContainsCons(call_term)) continue;
+                involves_cons = true;
+                if (!termEqual(head_term, call_term) and !isTailDescendant(head_term, call_term))
+                    return Error.NotAdmissible;
+                if (isTailDescendant(head_term, call_term) and call_seed == null) call_seed = index;
+            }
+            if (!involves_cons) continue;
+            const candidate = call_seed orelse return Error.NotAdmissible;
+            if (seed) |existing| {
+                if (existing != candidate) return Error.NotAdmissible;
+            } else seed = candidate;
+        }
+        return seed;
     }
 
     fn validateClause(
@@ -662,8 +757,15 @@ pub const Jatalog = struct {
             .negated => |expression| for (expression.terms) |term|
                 if (!termVariablesBound(term, bound)) return safety_error,
             .builtin => |expression| {
-                if (expression.terms.len != 2) return safety_error;
                 const operator = self.strings.resolve(expression.predicate);
+                if (std.mem.eql(u8, operator, "+") or std.mem.eql(u8, operator, "-")) {
+                    if (expression.terms.len != 3 or
+                        !termVariablesBound(expression.terms[1], bound) or
+                        !termVariablesBound(expression.terms[2], bound)) return safety_error;
+                    try bindTermVariables(self.allocator, expression.terms[0], bound);
+                    return;
+                }
+                if (expression.terms.len != 2) return safety_error;
                 const a_bound = termVariablesBound(expression.terms[0], bound);
                 const b_bound = termVariablesBound(expression.terms[1], bound);
                 if (std.mem.eql(u8, operator, "=") and !expression.negated) {
@@ -730,6 +832,16 @@ pub const Jatalog = struct {
             },
             else => {},
         };
+        for (clauses) |clause| switch (clause) {
+            .builtin => |expression| {
+                const operator = self.strings.resolve(expression.predicate);
+                if (std.mem.eql(u8, operator, "+") or std.mem.eql(u8, operator, "-")) {
+                    result[index] = clause;
+                    index += 1;
+                }
+            },
+            else => {},
+        };
         for (clauses) |clause| if (clause == .aggregate) {
             result[index] = clause;
             index += 1;
@@ -740,7 +852,9 @@ pub const Jatalog = struct {
                 index += 1;
             },
             .builtin => |expression| if (expression.negated or
-                !std.mem.eql(u8, self.strings.resolve(expression.predicate), "="))
+                (!std.mem.eql(u8, self.strings.resolve(expression.predicate), "=") and
+                    !std.mem.eql(u8, self.strings.resolve(expression.predicate), "+") and
+                    !std.mem.eql(u8, self.strings.resolve(expression.predicate), "-")))
             {
                 result[index] = clause;
                 index += 1;
@@ -756,6 +870,13 @@ pub const Jatalog = struct {
         const ordered = try self.orderGoals(goals);
         defer self.allocator.free(ordered);
         for (ordered) |goal| {
+            if (isArithmetic(self, goal)) {
+                if (goal.negated or goal.terms.len != 3 or
+                    !termVariablesBound(goal.terms[1], &bound) or
+                    !termVariablesBound(goal.terms[2], &bound)) return Error.InvalidQuery;
+                try bindTermVariables(self.allocator, goal.terms[0], &bound);
+                continue;
+            }
             if (!goal.negated and !isBuiltin(self, goal)) {
                 for (goal.terms) |term| try bindTermVariables(self.allocator, term, &bound);
                 continue;
@@ -778,7 +899,8 @@ pub const Jatalog = struct {
         var index: usize = 0;
         for (goals) |goal| {
             const late = goal.negated or (isBuiltin(self, goal) and
-                !std.mem.eql(u8, self.strings.resolve(goal.predicate), "="));
+                !std.mem.eql(u8, self.strings.resolve(goal.predicate), "=") and
+                !isArithmetic(self, goal));
             if (!late) {
                 result[index] = goal;
                 index += 1;
@@ -786,7 +908,8 @@ pub const Jatalog = struct {
         }
         for (goals) |goal| {
             const late = goal.negated or (isBuiltin(self, goal) and
-                !std.mem.eql(u8, self.strings.resolve(goal.predicate), "="));
+                !std.mem.eql(u8, self.strings.resolve(goal.predicate), "=") and
+                !isArithmetic(self, goal));
             if (late) {
                 result[index] = goal;
                 index += 1;
@@ -1142,7 +1265,47 @@ fn isBuiltin(jatalog: *const Jatalog, value: Expr) bool {
     const predicate = jatalog.strings.resolve(value.predicate);
     return std.mem.eql(u8, predicate, "=") or std.mem.eql(u8, predicate, "<>") or
         std.mem.eql(u8, predicate, "<") or std.mem.eql(u8, predicate, "<=") or
-        std.mem.eql(u8, predicate, ">") or std.mem.eql(u8, predicate, ">=");
+        std.mem.eql(u8, predicate, ">") or std.mem.eql(u8, predicate, ">=") or
+        std.mem.eql(u8, predicate, "+") or std.mem.eql(u8, predicate, "-");
+}
+
+fn isArithmetic(jatalog: *const Jatalog, value: Expr) bool {
+    const predicate = jatalog.strings.resolve(value.predicate);
+    return std.mem.eql(u8, predicate, "+") or std.mem.eql(u8, predicate, "-");
+}
+
+fn termContainsCons(term: Term) bool {
+    return switch (term) {
+        .cons => true,
+        else => false,
+    };
+}
+
+fn termEqual(left: Term, right: Term) bool {
+    return switch (left) {
+        .atom => |value| switch (right) {
+            .atom => |other| value == other,
+            else => false,
+        },
+        .variable => |value| switch (right) {
+            .variable => |other| value == other,
+            else => false,
+        },
+        .nil => right == .nil,
+        .cons => |pair| switch (right) {
+            .cons => |other| termEqual(pair.head, other.head) and termEqual(pair.tail, other.tail),
+            else => false,
+        },
+    };
+}
+
+fn isTailDescendant(ancestor: Term, candidate: Term) bool {
+    var current = ancestor;
+    while (current == .cons) {
+        current = current.cons.tail;
+        if (termEqual(current, candidate)) return true;
+    }
+    return false;
 }
 
 fn parseNumber(string: []const u8) ?f64 {
@@ -1303,6 +1466,21 @@ const Parser = struct {
         if (self.parseOperator()) |operator| {
             const second = try self.parseTerm();
             errdefer freeTerm(self.jatalog.allocator, second);
+            if (std.mem.eql(u8, operator, "=")) {
+                const arithmetic = if (self.consume("+")) "+" else if (self.consume("-")) "-" else null;
+                if (arithmetic) |arithmetic_operator| {
+                    if (negated) return Error.InvalidSyntax;
+                    const third = try self.parseTerm();
+                    errdefer freeTerm(self.jatalog.allocator, third);
+                    const predicate = try self.jatalog.strings.intern(arithmetic_operator);
+                    const terms = try self.jatalog.allocator.alloc(Term, 3);
+                    terms[0] = first;
+                    terms[1] = second;
+                    terms[2] = third;
+                    first_owned = false;
+                    return .{ .predicate = predicate, .terms = terms };
+                }
+            }
             const predicate = try self.jatalog.strings.intern(normalizeOperator(operator));
             const terms = try self.jatalog.allocator.alloc(Term, 2);
             terms[0] = first;
@@ -1914,4 +2092,73 @@ test "aggregate parser errors release all partial clause trees" {
         aggregateAllocationScenario,
         .{},
     );
+}
+
+test "recursive list length and sum use checked integer arithmetic" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\person(alice). person(bob). parent(alice, bob).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+        \\numbers([1, 2, 3]).
+        \\sum([], 0).
+        \\sum(H!T, N) :- sum(T, M), N = M + H.
+        \\total(N) :- numbers(S), sum(S, N).
+        \\numchildren(X, N)?
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
+    result.deinit();
+
+    result = try db.execute("total(N)?");
+    try std.testing.expectEqualStrings("6", result.query.answers.items[0].get(&db, "N").?);
+    result.deinit();
+
+    result = try db.execute("person(alice), 3 = 1 + 2, -2 = 1 - 3?");
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    result.deinit();
+
+    result = try db.execute("person(alice), 4 = 1 + 2?");
+    try std.testing.expectEqual(@as(usize, 0), result.query.answers.items.len);
+    result.deinit();
+
+    try std.testing.expectError(Error.NumericType, db.execute("person(alice), N = nope + 1?"));
+    try std.testing.expectError(
+        Error.NumericOverflow,
+        db.execute("person(alice), N = 9223372036854775807 + 1?"),
+    );
+}
+
+test "member and collectfirst are ordinary admissible list relations" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\items([a, b, c]).
+        \\member(X, H!T) :- X = H.
+        \\member(X, H!T) :- member(X, T).
+        \\collectfirst([], []).
+        \\collectfirst([H, K]!T, H!R) :- collectfirst(T, R).
+        \\score(s1, 10). score(s2, 10). score(s3, 20). seed(k).
+        \\bag(S) :- seed(k), setof([Score, Student], score(Student, Score), Pairs), collectfirst(Pairs, S).
+        \\items(S), member(X, S)?
+    );
+    try std.testing.expectEqual(@as(usize, 3), result.query.answers.items.len);
+    result.deinit();
+
+    result = try db.execute("bag(S)?");
+    const value = result.query.answers.items[0].getValue(&db, "S").?;
+    const text = try db.formatValue(std.testing.allocator, value);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("[10, 10, 20]", text);
+    result.deinit();
+}
+
+test "structurally growing recursion is not admissible" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.NotAdmissible, db.execute(
+        \\q([X]) :- q(X).
+    ));
 }
