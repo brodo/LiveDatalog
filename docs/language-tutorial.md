@@ -246,7 +246,8 @@ facts and rules the next time you run a query.
 
 ## Lists
 
-LiveDatalog supports structural lists:
+Lists are terms, so they must appear inside a fact, rule, query, or comparison.
+Write a list with square brackets:
 
 ```datalog
 items([]).
@@ -254,7 +255,24 @@ items([a, b, c]).
 items([a, [b, c]]).
 ```
 
-Use `H!T` to split a non-empty list into its head and tail:
+LiveDatalog also provides `cons(Head, Tail)` as term syntax for constructing a
+list one element at a time. It is not a predicate and cannot be used as a
+standalone statement. This complete program stores a list built with `cons`:
+
+```datalog
+items(cons(a, cons(b, []))).
+items(Value)?
+```
+
+```text
+Value: [a, b]
+```
+
+The value is printed as `[a, b]` because
+`cons(a, cons(b, []))` and `[a, b]` are two ways to write the same list.
+
+Use the `H!T` pattern to split a non-empty list into its head (`H`) and tail
+(`T`):
 
 ```datalog
 [alice, bob] = H!T?
@@ -264,27 +282,21 @@ Use `H!T` to split a non-empty list into its head and tail:
 H: alice, T: [bob]
 ```
 
-`cons(H, T)` is equivalent to `H!T`. For example,
-`cons(a, cons(b, []))` and `[a, b]` represent the same value.
-
 Lists enable ordinary recursive relations:
 
 ```datalog
-items([a, b, c]).
-
 length([], 0).
 length(H!T, N) :- length(T, M), N = M + 1.
 
-items(S), length(S, N)?
+length([a, b, c], N)?
 ```
 
 ```text
-S: [a, b, c], N: 3
+N: 3
 ```
 
 The variable `H` is unused here, but matching `H!T` proves that the input is a
-non-empty list and makes the smaller tail available to the recursive call. The
-`items` fact provides the list passed to `length`.
+non-empty list and makes the smaller tail available to the recursive call.
 
 ## Integer arithmetic
 
@@ -302,16 +314,14 @@ error.
 Arithmetic can be used safely with structurally decreasing list recursion:
 
 ```datalog
-numbers([1, 2, 3]).
-
 sum([], 0).
 sum(H!T, N) :- sum(T, M), N = M + H.
 
-numbers(S), sum(S, Total)?
+sum([1, 2, 3], Total)?
 ```
 
 ```text
-S: [1, 2, 3], Total: 6
+Total: 6
 ```
 
 ## Aggregation with `setof`
@@ -398,7 +408,7 @@ N <= 10
 N > 10
 N >= 10
 
-% Lists
+% List terms (use them inside a statement)
 []
 [a, b, c]
 H!T

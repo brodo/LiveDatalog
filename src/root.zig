@@ -70,6 +70,13 @@ const ValueTable = struct {
         self.* = undefined;
     }
 
+    fn clone(self: *const ValueTable) !ValueTable {
+        return .{
+            .allocator = self.allocator,
+            .values = try self.values.clone(self.allocator),
+        };
+    }
+
     fn intern(self: *ValueTable, value: Value) !ValueId {
         for (self.values.items, 0..) |existing, index| {
             if (std.meta.eql(existing, value)) return @intCast(index);
@@ -80,6 +87,17 @@ const ValueTable = struct {
 
     fn get(self: *const ValueTable, id: ValueId) Value {
         return self.values.items[@intCast(id)];
+    }
+
+    fn internFrom(self: *ValueTable, source: *const ValueTable, id: ValueId) !ValueId {
+        return switch (source.get(id)) {
+            .atom => |atom| try self.intern(.{ .atom = atom }),
+            .nil => try self.intern(.nil),
+            .cons => |pair| try self.intern(.{ .cons = .{
+                .head = try self.internFrom(source, pair.head),
+                .tail = try self.internFrom(source, pair.tail),
+            } }),
+        };
     }
 };
 
@@ -209,6 +227,32 @@ pub const ExecutionResult = union(enum) {
             .query => |*result| result.deinit(),
             else => {},
         }
+        self.* = undefined;
+    }
+};
+
+const QueryValueScope = struct {
+    database: *Jatalog,
+    persistent: ValueTable,
+
+    fn init(database: *Jatalog) !QueryValueScope {
+        const temporary = try database.values.clone();
+        const persistent = database.values;
+        database.values = temporary;
+        return .{ .database = database, .persistent = persistent };
+    }
+
+    fn preserveResult(self: *QueryValueScope, result: *QueryResult) !void {
+        for (result.answers.items) |*answer| {
+            for (answer.values.values()) |*value|
+                value.* = try self.persistent.internFrom(&self.database.values, value.*);
+        }
+    }
+
+    fn deinit(self: *QueryValueScope) void {
+        var temporary = self.database.values;
+        self.database.values = self.persistent;
+        temporary.deinit();
         self.* = undefined;
     }
 };
@@ -367,6 +411,9 @@ pub const Jatalog = struct {
     pub fn query(self: *Jatalog, goals: []const Expr) !QueryResult {
         if (goals.len == 0) return Error.InvalidQuery;
         try self.validateQuery(goals);
+        var value_scope = try QueryValueScope.init(self);
+        defer value_scope.deinit();
+        for (goals) |goal| try self.internGroundStructuresInExpr(goal);
 
         var expanded = try self.cloneFacts();
         defer deinitFacts(self.allocator, &expanded);
@@ -379,6 +426,7 @@ pub const Jatalog = struct {
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
         try self.matchGoals(ordered, expanded.items, 0, &initial, &result.answers);
+        try value_scope.preserveResult(&result);
         return result;
     }
 
@@ -396,6 +444,9 @@ pub const Jatalog = struct {
         defer self.allocator.free(ordered);
         for (ordered) |clause|
             try self.validateClause(clause, &bound, &outer_variables, Error.InvalidQuery);
+        var value_scope = try QueryValueScope.init(self);
+        defer value_scope.deinit();
+        for (goals) |clause| try self.internGroundStructuresInClause(clause);
 
         var expanded = try self.cloneFacts();
         defer deinitFacts(self.allocator, &expanded);
@@ -406,6 +457,7 @@ pub const Jatalog = struct {
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
         try self.matchClauses(ordered, expanded.items, 0, &initial, &result.answers);
+        try value_scope.preserveResult(&result);
         return result;
     }
 
@@ -438,7 +490,8 @@ pub const Jatalog = struct {
 
         for (0..max_level + 1) |level| {
             while (true) {
-                const before = facts.items.len;
+                const fact_count_before = facts.items.len;
+                const value_count_before = self.values.values.items.len;
                 for (self.rules.items) |rule| {
                     const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
                     if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
@@ -487,7 +540,8 @@ pub const Jatalog = struct {
                         }
                     }
                 }
-                if (facts.items.len == before) break;
+                if (facts.items.len == fact_count_before and
+                    self.values.values.items.len == value_count_before) break;
             }
         }
     }
@@ -512,6 +566,39 @@ pub const Jatalog = struct {
                 .tail = try self.termToValue(pair.tail, bindings),
             } }),
         };
+    }
+
+    // Structural recursion is seeded from interned values during expansion, so
+    // ground structures supplied by a query must join that seed set first.
+    fn internGroundStructuresInExpr(self: *Jatalog, expression: Expr) !void {
+        for (expression.terms) |term| try self.internGroundStructuresInTerm(term);
+    }
+
+    fn internGroundStructuresInClause(self: *Jatalog, clause: Clause) !void {
+        switch (clause) {
+            .relational, .builtin, .negated => |expression| try self.internGroundStructuresInExpr(expression),
+            .aggregate => |aggregate| {
+                try self.internGroundStructuresInTerm(aggregate.template);
+                for (aggregate.body) |body_clause|
+                    try self.internGroundStructuresInClause(body_clause);
+                try self.internGroundStructuresInTerm(aggregate.output);
+            },
+        }
+    }
+
+    fn internGroundStructuresInTerm(self: *Jatalog, term: Term) !void {
+        switch (term) {
+            .nil => _ = try self.termToValue(term, null),
+            .cons => |pair| {
+                if (term.isGround()) {
+                    _ = try self.termToValue(term, null);
+                    return;
+                }
+                try self.internGroundStructuresInTerm(pair.head);
+                try self.internGroundStructuresInTerm(pair.tail);
+            },
+            .atom, .variable => {},
+        }
     }
 
     fn matchGoals(
@@ -2273,6 +2360,49 @@ test "recursive list length and sum use checked integer arithmetic" {
         Error.NumericOverflow,
         db.execute("person(alice), N = 9223372036854775807 + 1?"),
     );
+}
+
+test "ground list query inputs seed recursive evaluation" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+
+    var result = try db.execute(
+        \\sum([], 0).
+        \\sum(H!T, N) :- sum(T, M), N = M + H.
+        \\sum([3, 3, 3], Total)?
+    );
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try std.testing.expectEqualStrings("9", result.query.answers.items[0].get(&db, "Total").?);
+    result.deinit();
+
+    result = try db.execute(
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\length([a, b, c], Count)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try std.testing.expectEqualStrings("3", result.query.answers.items[0].get(&db, "Count").?);
+
+    const goal = try db.expr("sum", &.{ "[4, 5]", "Total" });
+    defer db.freeExpression(goal);
+    const value_count_before_typed_query = db.values.values.items.len;
+    var query_result = try db.query(&.{goal});
+    defer query_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), query_result.answers.items.len);
+    try std.testing.expectEqualStrings("9", query_result.answers.items[0].get(&db, "Total").?);
+    try std.testing.expectEqual(value_count_before_typed_query, db.values.values.items.len);
+
+    var open_result = try db.execute("sum(Input, Total)?");
+    defer open_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), open_result.query.answers.items.len);
+    try expectBindingValue(&db, &open_result.query.answers.items[0], "Input", "[]");
+    try std.testing.expectEqualStrings("0", open_result.query.answers.items[0].get(&db, "Total").?);
+
+    var structural_result = try db.execute("Value = [a, b]?");
+    defer structural_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), structural_result.query.answers.items.len);
+    try expectBindingValue(&db, &structural_result.query.answers.items[0], "Value", "[a, b]");
 }
 
 test "member and collectfirst are ordinary admissible list relations" {
