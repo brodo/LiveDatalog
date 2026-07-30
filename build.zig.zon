@@ -45,6 +45,9 @@
         "build.zig",
         "build.zig.zon",
         "README.md",
+        "docs/aggregation-performance.md",
+        "docs/language-tutorial.md",
+        "examples",
         "src",
         // For example...
         //"LICENSE",

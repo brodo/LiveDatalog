@@ -175,8 +175,8 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // Exercise the installed command-line program against the README language
-    // tour so documentation and executable behavior cannot drift apart.
+    // Exercise the installed command-line program against the language
+    // tutorial example so documentation and executable behavior cannot drift.
     const run_cli_test = b.addRunArtifact(exe);
     run_cli_test.addFileArg(b.path("examples/aggregation.dl"));
     run_cli_test.expectStdOutEqual(
