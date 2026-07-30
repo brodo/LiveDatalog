@@ -1,24 +1,54 @@
 const std = @import("std");
 const LiveDatalog = @import("LiveDatalog");
+const Linenoise = @import("linenoise").Linenoise;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    const source = if (args.len > 1)
-        try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], allocator, .unlimited)
-    else source: {
-        var buffer: [4096]u8 = undefined;
-        var reader = std.Io.File.stdin().readerStreaming(init.io, &buffer);
-        break :source try reader.interface.allocRemaining(allocator, .unlimited);
-    };
 
     var database: LiveDatalog.Jatalog = .init(allocator);
     defer database.deinit();
+
+    if (args.len > 1) {
+        const source = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], allocator, .unlimited);
+        return executeAndPrint(init.io, &database, source);
+    }
+
+    if (!(std.Io.File.stdin().isTty(init.io) catch false)) {
+        var buffer: [4096]u8 = undefined;
+        var reader = std.Io.File.stdin().readerStreaming(init.io, &buffer);
+        const source = try reader.interface.allocRemaining(allocator, .unlimited);
+        return executeAndPrint(init.io, &database, source);
+    }
+
+    return repl(allocator, init, &database);
+}
+
+fn repl(allocator: std.mem.Allocator, init: std.process.Init, database: *LiveDatalog.Jatalog) !void {
+    var line_editor = Linenoise.init(allocator, init.io, init.environ_map);
+    defer line_editor.deinit();
+
+    while (try line_editor.linenoise("datalog> ")) |line| {
+        defer allocator.free(line);
+        const command = std.mem.trim(u8, line, &std.ascii.whitespace);
+        if (command.len == 0) continue;
+        if (std.mem.eql(u8, command, ".quit") or std.mem.eql(u8, command, ".exit")) break;
+        if (std.mem.eql(u8, command, ".help")) {
+            try writeHelp(init.io);
+            continue;
+        }
+
+        try line_editor.history.add(line);
+        executeAndPrint(init.io, database, line) catch |err| try writeError(init.io, err);
+    }
+}
+
+fn executeAndPrint(io: std.Io, database: *LiveDatalog.Jatalog, source: []const u8) !void {
     var result = try database.execute(source);
     defer result.deinit();
 
     var output_buffer: [4096]u8 = undefined;
-    var file_writer = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var file_writer = std.Io.File.stdout().writer(io, &output_buffer);
     const writer = &file_writer.interface;
     switch (result) {
         .none => {},
@@ -42,6 +72,22 @@ pub fn main(init: std.process.Init) !void {
             }
         },
     }
+    try writer.flush();
+}
+
+fn writeHelp(io: std.Io) !void {
+    var output_buffer: [256]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writer(io, &output_buffer);
+    const writer = &file_writer.interface;
+    try writer.writeAll("Enter Datalog facts, rules, queries, or retractions. Use .quit or .exit to leave.\n");
+    try writer.flush();
+}
+
+fn writeError(io: std.Io, err: anyerror) !void {
+    var output_buffer: [256]u8 = undefined;
+    var file_writer = std.Io.File.stderr().writer(io, &output_buffer);
+    const writer = &file_writer.interface;
+    try writer.print("Error: {s}\n", .{@errorName(err)});
     try writer.flush();
 }
 

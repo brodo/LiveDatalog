@@ -36,6 +36,10 @@
             .url = "git+https://github.com/rockorager/ziglint.git?ref=v0.5.3#80d2b08a7eb4aa9c96e2b2183716b347dcacb64b",
             .hash = "ziglint-0.5.3-t0bwLwHRBQC5VCdOCq3C7P-y81sE5PaDYJwnapDuPdWC",
         },
+        .linenoize = .{
+            .url = "git+https://github.com/hazre/linenoize.git?ref=feat/port-zig-0.16#2bbea8dd5f0168d97252025d52e97c290ca67605",
+            .hash = "linenoize-0.1.1-J7HK8Ij0AABZHu5JxdH3U_-PTri09lsSxVXzInmRCcba",
+        },
     },
     .paths = .{
         "build.zig",

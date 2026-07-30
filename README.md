@@ -14,7 +14,17 @@ Run a Datalog file:
 zig build run -- program.dl
 ```
 
-Or pipe a program through standard input:
+Start the interactive REPL:
+
+```sh
+zig build run
+```
+
+Enter a fact, rule, query, or retraction on each line. Use `.help` for a
+reminder and `.quit` or `.exit` to leave. The REPL supports line editing and
+history through [linenoize](https://github.com/hazre/linenoize/tree/feat/port-zig-0.16).
+
+Or pipe a complete program through standard input:
 
 ```sh
 printf 'parent(alice, bob). parent(alice, X)?' | zig build run
