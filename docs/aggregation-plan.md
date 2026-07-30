@@ -98,6 +98,32 @@ setof([Score, Student], (score(Test, Student, Score), passed(Student)), S)
 Stop after structural terms work everywhere ordinary scalar terms work. Do not
 add `setof` in this phase.
 
+### Completed decisions
+
+Phase 1 was completed on 2026-07-30 with these decisions:
+
+- Expression terms are recursive variable/atom/nil/cons patterns. Ground terms
+  are canonicalized in a database-owned value table; atom leaves continue to
+  use the existing string table. Facts and bindings therefore store compact
+  canonical value IDs rather than owning duplicate trees.
+- Proper lists print canonically as `[a, b]`. Ground improper lists are valid
+  data and print with the unambiguous constructor form `cons(Head, Tail)`.
+  Variables anywhere in facts, including improper tails, remain invalid.
+- `H!T` is a right-associative cons pattern. `cons(H, T)` is the equivalent
+  structural constructor, and bracket syntax supports empty, flat, and nested
+  proper lists.
+- The total ground-term order is atoms first (ordered bytewise by interned
+  spelling), then `nil`, then cons cells ordered lexicographically by head and
+  tail. It is independent of insertion order.
+- The scalar embedding API remains source-compatible: `expr` and `not` still
+  accept string slices, now parsing each string as a structural term, and
+  `Binding.get` still returns scalar atoms. Structural bindings use
+  `Binding.getValue` with `Jatalog.writeValue` or `Jatalog.formatValue`.
+- Recursive expression trees are caller-owned under the existing expression
+  ownership rules. Canonical ground values live for the database lifetime.
+  Exhaustive allocation-failure tests cover structural parsing, rule/query
+  evaluation, formatting, and teardown.
+
 ## Phase 2: aggregate syntax, safety, and stratification
 
 ### Scope
@@ -246,14 +272,8 @@ Each implementation session should end with:
 
 ## Open design questions
 
-- Should atom and list ground terms be hash-consed into one canonical value
-  table, or should only scalar leaves remain interned?
-- Should improper lists be permitted as ground data, or only as intermediate
-  unification patterns?
-- What is the total ordering across atoms, numbers, and nested lists?
 - Should arithmetic initially use integers, preserve the current `f64`
   behavior, or introduce tagged numeric values?
 - How conservative may the admissibility checker be?
 - Should `setof` bodies use explicit parentheses, braces, or another syntax to
   delimit conjunctions unambiguously?
-

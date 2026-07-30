@@ -62,10 +62,8 @@ fn executeAndPrint(io: std.Io, database: *LiveDatalog.Jatalog, source: []const u
                 for (query_result.answers.items) |answer| {
                     for (answer.values.keys(), answer.values.values(), 0..) |variable, value, index| {
                         if (index != 0) try writer.writeAll(", ");
-                        try writer.print("{s}: {s}", .{
-                            database.strings.resolve(variable),
-                            database.strings.resolve(value),
-                        });
+                        try writer.print("{s}: ", .{database.strings.resolve(variable)});
+                        try database.writeValue(writer, value);
                     }
                     try writer.writeByte('\n');
                 }

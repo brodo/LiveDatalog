@@ -2,6 +2,7 @@
 const std = @import("std");
 
 pub const Id = u64;
+pub const ValueId = u64;
 pub const Error = error{
     InvalidFact,
     InvalidRule,
@@ -47,9 +48,56 @@ pub const StringTable = struct {
     }
 };
 
-pub const Term = struct {
-    id: Id,
-    variable: bool,
+const Value = union(enum) {
+    atom: Id,
+    nil,
+    cons: struct { head: ValueId, tail: ValueId },
+};
+
+const ValueTable = struct {
+    allocator: std.mem.Allocator,
+    values: std.ArrayList(Value) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ValueTable {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ValueTable) void {
+        self.values.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn intern(self: *ValueTable, value: Value) !ValueId {
+        for (self.values.items, 0..) |existing, index| {
+            if (std.meta.eql(existing, value)) return @intCast(index);
+        }
+        try self.values.append(self.allocator, value);
+        return @intCast(self.values.items.len - 1);
+    }
+
+    fn get(self: *const ValueTable, id: ValueId) Value {
+        return self.values.items[@intCast(id)];
+    }
+};
+
+pub const Term = union(enum) {
+    atom: Id,
+    variable: Id,
+    nil,
+    cons: *Cons,
+
+    pub const Cons = struct {
+        head: Term,
+        tail: Term,
+    };
+
+    pub fn isGround(self: Term) bool {
+        return switch (self) {
+            .variable => false,
+            .cons => |pair| pair.head.isGround() and pair.tail.isGround(),
+            else => true,
+        };
+    }
 };
 
 pub const Expr = struct {
@@ -62,7 +110,7 @@ pub const Expr = struct {
     }
 
     pub fn isGround(self: Expr) bool {
-        for (self.terms) |term| if (term.variable) return false;
+        for (self.terms) |term| if (!term.isGround()) return false;
         return true;
     }
 };
@@ -74,11 +122,11 @@ pub const Rule = struct {
 
 const Fact = struct {
     predicate: Id,
-    terms: []Id,
+    terms: []ValueId,
 };
 
 pub const Binding = struct {
-    values: std.array_hash_map.Auto(Id, Id) = .empty,
+    values: std.array_hash_map.Auto(Id, ValueId) = .empty,
 
     pub fn deinit(self: *Binding, allocator: std.mem.Allocator) void {
         self.values.deinit(allocator);
@@ -88,7 +136,15 @@ pub const Binding = struct {
     pub fn get(self: *const Binding, jatalog: *const Jatalog, variable: []const u8) ?[]const u8 {
         const variable_id = jatalog.strings.get(variable) orelse return null;
         const value_id = self.values.get(variable_id) orelse return null;
-        return jatalog.strings.resolve(value_id);
+        return switch (jatalog.values.get(value_id)) {
+            .atom => |atom| jatalog.strings.resolve(atom),
+            else => null,
+        };
+    }
+
+    pub fn getValue(self: *const Binding, jatalog: *const Jatalog, variable: []const u8) ?ValueId {
+        const variable_id = jatalog.strings.get(variable) orelse return null;
+        return self.values.get(variable_id);
     }
 
     fn clone(self: *const Binding, allocator: std.mem.Allocator) !Binding {
@@ -124,11 +180,12 @@ pub const ExecutionResult = union(enum) {
 pub const Jatalog = struct {
     allocator: std.mem.Allocator,
     strings: StringTable,
+    values: ValueTable,
     facts: std.ArrayList(Fact) = .empty,
     rules: std.ArrayList(Rule) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
-        return .{ .allocator = allocator, .strings = .init(allocator) };
+        return .{ .allocator = allocator, .strings = .init(allocator), .values = .init(allocator) };
     }
 
     pub fn deinit(self: *Jatalog) void {
@@ -140,6 +197,7 @@ pub const Jatalog = struct {
             self.allocator.free(rule.body);
         }
         self.rules.deinit(self.allocator);
+        self.values.deinit();
         self.strings.deinit();
         self.* = undefined;
     }
@@ -159,12 +217,17 @@ pub const Jatalog = struct {
     fn makeExpr(self: *Jatalog, predicate: []const u8, terms: []const []const u8, negated: bool) !Expr {
         const predicate_id = try self.strings.intern(normalizeOperator(predicate));
         const result_terms = try self.allocator.alloc(Term, terms.len);
-        errdefer self.allocator.free(result_terms);
-        for (terms, result_terms) |string, *term| {
-            term.* = .{
-                .id = try self.strings.intern(string),
-                .variable = isVariable(string),
-            };
+        var initialized: usize = 0;
+        errdefer {
+            for (result_terms[0..initialized]) |term| freeTerm(self.allocator, term);
+            self.allocator.free(result_terms);
+        }
+        for (terms, result_terms) |source, *term| {
+            var parser: Parser = .{ .jatalog = self, .source = source };
+            term.* = try parser.parseTerm();
+            initialized += 1;
+            parser.skipSpace();
+            if (parser.index != source.len) return Error.InvalidSyntax;
         }
         return .{ .predicate = predicate_id, .terms = result_terms, .negated = negated };
     }
@@ -177,9 +240,9 @@ pub const Jatalog = struct {
 
     pub fn addFactExpr(self: *Jatalog, value: Expr) !void {
         if (!value.isGround() or value.negated or isBuiltin(self, value)) return Error.InvalidFact;
-        const terms = try self.allocator.alloc(Id, value.terms.len);
+        const terms = try self.allocator.alloc(ValueId, value.terms.len);
         errdefer self.allocator.free(terms);
-        for (value.terms, terms) |term, *id| id.* = term.id;
+        for (value.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
         const fact: Fact = .{ .predicate = value.predicate, .terms = terms };
         if (containsFact(self.facts.items, fact)) {
             self.allocator.free(terms);
@@ -227,10 +290,14 @@ pub const Jatalog = struct {
         var result: std.ArrayList(Fact) = .empty;
         errdefer deinitFacts(self.allocator, &result);
         for (self.facts.items) |fact| {
-            try result.append(self.allocator, .{
+            const terms = try self.allocator.dupe(ValueId, fact.terms);
+            result.append(self.allocator, .{
                 .predicate = fact.predicate,
-                .terms = try self.allocator.dupe(Id, fact.terms),
-            });
+                .terms = terms,
+            }) catch |err| {
+                self.allocator.free(terms);
+                return err;
+            };
         }
         return result;
     }
@@ -259,7 +326,10 @@ pub const Jatalog = struct {
                         if (containsFact(facts.items, derived)) {
                             self.allocator.free(derived.terms);
                         } else {
-                            try facts.append(self.allocator, derived);
+                            facts.append(self.allocator, derived) catch |err| {
+                                self.allocator.free(derived.terms);
+                                return err;
+                            };
                         }
                     }
                 }
@@ -269,15 +339,25 @@ pub const Jatalog = struct {
     }
 
     fn deriveFact(self: *Jatalog, head: Expr, bindings: *const Binding) !Fact {
-        const terms = try self.allocator.alloc(Id, head.terms.len);
+        const terms = try self.allocator.alloc(ValueId, head.terms.len);
         errdefer self.allocator.free(terms);
-        for (head.terms, terms) |term, *id| {
-            id.* = if (term.variable)
-                bindings.values.get(term.id) orelse return Error.UnboundVariable
-            else
-                term.id;
-        }
+        for (head.terms, terms) |term, *id| id.* = try self.termToValue(term, bindings);
         return .{ .predicate = head.predicate, .terms = terms };
+    }
+
+    fn termToValue(self: *Jatalog, term: Term, bindings: ?*const Binding) !ValueId {
+        return switch (term) {
+            .atom => |atom| try self.values.intern(.{ .atom = atom }),
+            .nil => try self.values.intern(.nil),
+            .variable => |variable| if (bindings) |bound|
+                bound.values.get(variable) orelse Error.UnboundVariable
+            else
+                Error.UnboundVariable,
+            .cons => |pair| try self.values.intern(.{ .cons = .{
+                .head = try self.termToValue(pair.head, bindings),
+                .tail = try self.termToValue(pair.tail, bindings),
+            } }),
+        };
     }
 
     fn matchGoals(
@@ -289,7 +369,11 @@ pub const Jatalog = struct {
         answers: *std.ArrayList(Binding),
     ) !void {
         if (index == goals.len) {
-            try answers.append(self.allocator, try bindings.clone(self.allocator));
+            var answer = try bindings.clone(self.allocator);
+            answers.append(self.allocator, answer) catch |err| {
+                answer.deinit(self.allocator);
+                return err;
+            };
             return;
         }
         const goal = goals[index];
@@ -305,7 +389,7 @@ pub const Jatalog = struct {
                 if (fact.predicate != goal.predicate or fact.terms.len != goal.terms.len) continue;
                 var next = try bindings.clone(self.allocator);
                 defer next.deinit(self.allocator);
-                if (try unify(self.allocator, fact, goal, &next)) return;
+                if (try self.unify(fact, goal, &next)) return;
             }
             try self.matchGoals(goals, facts, index + 1, bindings, answers);
             return;
@@ -314,9 +398,37 @@ pub const Jatalog = struct {
             if (fact.predicate != goal.predicate or fact.terms.len != goal.terms.len) continue;
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
-            if (try unify(self.allocator, fact, goal, &next))
+            if (try self.unify(fact, goal, &next))
                 try self.matchGoals(goals, facts, index + 1, &next, answers);
         }
+    }
+
+    fn unify(self: *Jatalog, fact: Fact, goal: Expr, bindings: *Binding) !bool {
+        for (fact.terms, goal.terms) |value, term| {
+            if (!try self.unifyValueTerm(value, term, bindings)) return false;
+        }
+        return true;
+    }
+
+    fn unifyValueTerm(self: *Jatalog, value: ValueId, term: Term, bindings: *Binding) !bool {
+        return switch (term) {
+            .variable => |variable| if (bindings.values.get(variable)) |bound|
+                bound == value
+            else blk: {
+                try bindings.values.put(self.allocator, variable, value);
+                break :blk true;
+            },
+            .atom => |atom| switch (self.values.get(value)) {
+                .atom => |actual| actual == atom,
+                else => false,
+            },
+            .nil => self.values.get(value) == .nil,
+            .cons => |pair| switch (self.values.get(value)) {
+                .cons => |actual| try self.unifyValueTerm(actual.head, pair.head, bindings) and
+                    try self.unifyValueTerm(actual.tail, pair.tail, bindings),
+                else => false,
+            },
+        };
     }
 
     fn evalBuiltin(self: *Jatalog, expr_value: Expr, bindings: *Binding) !bool {
@@ -324,26 +436,26 @@ pub const Jatalog = struct {
         const operator = self.strings.resolve(expr_value.predicate);
         const left = expr_value.terms[0];
         const right = expr_value.terms[1];
-        const left_id = if (left.variable) bindings.values.get(left.id) else left.id;
-        const right_id = if (right.variable) bindings.values.get(right.id) else right.id;
+        const left_id = self.termToValue(left, bindings) catch |err| switch (err) {
+            Error.UnboundVariable => null,
+            else => return err,
+        };
+        const right_id = self.termToValue(right, bindings) catch |err| switch (err) {
+            Error.UnboundVariable => null,
+            else => return err,
+        };
 
         if (std.mem.eql(u8, operator, "=")) {
             if (left_id == null and right_id == null) return Error.UnboundVariable;
-            if (left_id == null) {
-                try bindings.values.put(self.allocator, left.id, right_id.?);
-                return true;
-            }
-            if (right_id == null) {
-                try bindings.values.put(self.allocator, right.id, left_id.?);
-                return true;
-            }
+            if (left_id == null) return self.unifyValueTerm(right_id.?, left, bindings);
+            if (right_id == null) return self.unifyValueTerm(left_id.?, right, bindings);
             return self.valuesEqual(left_id.?, right_id.?);
         }
         if (left_id == null or right_id == null) return Error.UnboundVariable;
         if (std.mem.eql(u8, operator, "<>")) return !self.valuesEqual(left_id.?, right_id.?);
 
-        const left_number = parseNumber(self.strings.resolve(left_id.?)) orelse 0;
-        const right_number = parseNumber(self.strings.resolve(right_id.?)) orelse 0;
+        const left_number = parseNumber(self.atomString(left_id.?) orelse "") orelse 0;
+        const right_number = parseNumber(self.atomString(right_id.?) orelse "") orelse 0;
         if (std.mem.eql(u8, operator, "<")) return left_number < right_number;
         if (std.mem.eql(u8, operator, "<=")) return left_number <= right_number;
         if (std.mem.eql(u8, operator, ">")) return left_number > right_number;
@@ -351,13 +463,36 @@ pub const Jatalog = struct {
         return Error.UnknownOperator;
     }
 
-    fn valuesEqual(self: *const Jatalog, left: Id, right: Id) bool {
-        const left_string = self.strings.resolve(left);
-        const right_string = self.strings.resolve(right);
-        const left_number = parseNumber(left_string);
-        const right_number = parseNumber(right_string);
-        if (left_number != null and right_number != null) return left_number.? == right_number.?;
-        return std.mem.eql(u8, left_string, right_string);
+    fn atomString(self: *const Jatalog, value: ValueId) ?[]const u8 {
+        return switch (self.values.get(value)) {
+            .atom => |atom| self.strings.resolve(atom),
+            else => null,
+        };
+    }
+
+    fn valuesEqual(self: *const Jatalog, left: ValueId, right: ValueId) bool {
+        const left_value = self.values.get(left);
+        const right_value = self.values.get(right);
+        return switch (left_value) {
+            .atom => |left_atom| switch (right_value) {
+                .atom => |right_atom| blk: {
+                    const left_string = self.strings.resolve(left_atom);
+                    const right_string = self.strings.resolve(right_atom);
+                    const left_number = parseNumber(left_string);
+                    const right_number = parseNumber(right_string);
+                    if (left_number != null and right_number != null)
+                        break :blk left_number.? == right_number.?;
+                    break :blk std.mem.eql(u8, left_string, right_string);
+                },
+                else => false,
+            },
+            .nil => right_value == .nil,
+            .cons => |left_cons| switch (right_value) {
+                .cons => |right_cons| self.valuesEqual(left_cons.head, right_cons.head) and
+                    self.valuesEqual(left_cons.tail, right_cons.tail),
+                else => false,
+            },
+        };
     }
 
     fn validateRule(self: *Jatalog, head: Expr, body: []const Expr) !void {
@@ -370,22 +505,20 @@ pub const Jatalog = struct {
             if (isBuiltin(self, clause)) {
                 if (clause.terms.len != 2) return Error.InvalidRule;
                 const operator = self.strings.resolve(clause.predicate);
-                const a_bound = !clause.terms[0].variable or bound.contains(clause.terms[0].id);
-                const b_bound = !clause.terms[1].variable or bound.contains(clause.terms[1].id);
+                const a_bound = termVariablesBound(clause.terms[0], &bound);
+                const b_bound = termVariablesBound(clause.terms[1], &bound);
                 if (std.mem.eql(u8, operator, "=")) {
                     if (!a_bound and !b_bound) return Error.InvalidRule;
-                    if (clause.terms[0].variable) try bound.put(self.allocator, clause.terms[0].id, {});
-                    if (clause.terms[1].variable) try bound.put(self.allocator, clause.terms[1].id, {});
+                    try bindTermVariables(self.allocator, clause.terms[0], &bound);
+                    try bindTermVariables(self.allocator, clause.terms[1], &bound);
                 } else if (!a_bound or !b_bound) return Error.InvalidRule;
             } else if (clause.negated) {
-                for (clause.terms) |term| if (term.variable and !bound.contains(term.id)) return Error.InvalidRule;
+                for (clause.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidRule;
             } else {
-                for (clause.terms) |term| if (term.variable) try bound.put(self.allocator, term.id, {});
+                for (clause.terms) |term| try bindTermVariables(self.allocator, term, &bound);
             }
         }
-        for (head.terms) |term| {
-            if (!term.variable or !bound.contains(term.id)) return Error.InvalidRule;
-        }
+        for (head.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidRule;
     }
 
     fn validateQuery(self: *Jatalog, goals: []const Expr) !void {
@@ -395,18 +528,18 @@ pub const Jatalog = struct {
         defer self.allocator.free(ordered);
         for (ordered) |goal| {
             if (!goal.negated and !isBuiltin(self, goal)) {
-                for (goal.terms) |term| if (term.variable) try bound.put(self.allocator, term.id, {});
+                for (goal.terms) |term| try bindTermVariables(self.allocator, term, &bound);
                 continue;
             }
             if (isBuiltin(self, goal) and std.mem.eql(u8, self.strings.resolve(goal.predicate), "=")) {
                 if (goal.terms.len != 2) return Error.InvalidQuery;
-                const a_bound = !goal.terms[0].variable or bound.contains(goal.terms[0].id);
-                const b_bound = !goal.terms[1].variable or bound.contains(goal.terms[1].id);
+                const a_bound = termVariablesBound(goal.terms[0], &bound);
+                const b_bound = termVariablesBound(goal.terms[1], &bound);
                 if (!a_bound and !b_bound) return Error.InvalidQuery;
-                if (goal.terms[0].variable) try bound.put(self.allocator, goal.terms[0].id, {});
-                if (goal.terms[1].variable) try bound.put(self.allocator, goal.terms[1].id, {});
+                try bindTermVariables(self.allocator, goal.terms[0], &bound);
+                try bindTermVariables(self.allocator, goal.terms[1], &bound);
             } else {
-                for (goal.terms) |term| if (term.variable and !bound.contains(term.id)) return Error.InvalidQuery;
+                for (goal.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidQuery;
             }
         }
     }
@@ -480,15 +613,9 @@ pub const Jatalog = struct {
                 for (goals) |goal| {
                     if (goal.negated or isBuiltin(self, goal) or
                         goal.predicate != fact.predicate or goal.terms.len != fact.terms.len) continue;
-                    var matches = true;
-                    for (goal.terms, fact.terms) |term, value| {
-                        const expected = if (term.variable) answer.values.get(term.id) else term.id;
-                        if (expected == null or expected.? != value) {
-                            matches = false;
-                            break;
-                        }
-                    }
-                    if (matches) remove = true;
+                    var matched = try answer.clone(self.allocator);
+                    defer matched.deinit(self.allocator);
+                    if (try self.unify(fact, goal, &matched)) remove = true;
                 }
             }
             if (remove) {
@@ -499,10 +626,147 @@ pub const Jatalog = struct {
         }
         return changed;
     }
+
+    pub fn formatValue(self: *const Jatalog, allocator: std.mem.Allocator, value: ValueId) ![]u8 {
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        self.writeValue(&output.writer, value) catch return error.OutOfMemory;
+        return output.toOwnedSlice();
+    }
+
+    pub fn writeValue(self: *const Jatalog, writer: *std.Io.Writer, value: ValueId) !void {
+        switch (self.values.get(value)) {
+            .atom => |atom| try writeAtom(writer, self.strings.resolve(atom)),
+            .nil => try writer.writeAll("[]"),
+            .cons => |pair| if (self.isProperList(value)) {
+                try writer.writeByte('[');
+                var current = value;
+                var first = true;
+                while (true) {
+                    switch (self.values.get(current)) {
+                        .cons => |cell| {
+                            if (!first) try writer.writeAll(", ");
+                            try self.writeValue(writer, cell.head);
+                            current = cell.tail;
+                            first = false;
+                        },
+                        .nil => break,
+                        else => unreachable,
+                    }
+                }
+                try writer.writeByte(']');
+            } else {
+                try writer.writeAll("cons(");
+                try self.writeValue(writer, pair.head);
+                try writer.writeAll(", ");
+                try self.writeValue(writer, pair.tail);
+                try writer.writeByte(')');
+            },
+        }
+    }
+
+    fn isProperList(self: *const Jatalog, value: ValueId) bool {
+        var current = value;
+        while (true) switch (self.values.get(current)) {
+            .nil => return true,
+            .cons => |pair| current = pair.tail,
+            else => return false,
+        };
+    }
+
+    /// Deterministic total order for canonical ground values: atoms by spelling,
+    /// then nil, then cons cells lexicographically by head and tail.
+    pub fn compareValues(self: *const Jatalog, left: ValueId, right: ValueId) std.math.Order {
+        const a = self.values.get(left);
+        const b = self.values.get(right);
+        const a_rank: u2 = switch (a) {
+            .atom => 0,
+            .nil => 1,
+            .cons => 2,
+        };
+        const b_rank: u2 = switch (b) {
+            .atom => 0,
+            .nil => 1,
+            .cons => 2,
+        };
+        if (a_rank != b_rank) return std.math.order(a_rank, b_rank);
+        return switch (a) {
+            .atom => |a_atom| switch (b) {
+                .atom => |b_atom| std.mem.order(u8, self.strings.resolve(a_atom), self.strings.resolve(b_atom)),
+                else => unreachable,
+            },
+            .nil => .eq,
+            .cons => |a_pair| switch (b) {
+                .cons => |b_pair| blk: {
+                    const head_order = self.compareValues(a_pair.head, b_pair.head);
+                    break :blk if (head_order != .eq) head_order else self.compareValues(a_pair.tail, b_pair.tail);
+                },
+                else => unreachable,
+            },
+        };
+    }
 };
 
+fn writeAtom(writer: *std.Io.Writer, atom: []const u8) !void {
+    if (isBareAtom(atom)) return writer.writeAll(atom);
+    try writer.writeByte('\'');
+    for (atom) |byte| {
+        if (byte == '\\' or byte == '\'') try writer.writeByte('\\');
+        try writer.writeByte(byte);
+    }
+    try writer.writeByte('\'');
+}
+
+fn isBareAtom(atom: []const u8) bool {
+    if (atom.len == 0 or isVariable(atom)) return false;
+    for (atom, 0..) |byte, index| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '_') continue;
+        if (byte == '.' and index > 0 and index + 1 < atom.len and
+            std.ascii.isDigit(atom[index - 1]) and std.ascii.isDigit(atom[index + 1])) continue;
+        if ((byte == '+' or byte == '-') and (index == 0 or
+            (index > 0 and (atom[index - 1] == 'e' or atom[index - 1] == 'E')))) continue;
+        return false;
+    }
+    return true;
+}
+
 fn freeExpr(allocator: std.mem.Allocator, value: Expr) void {
+    for (value.terms) |term| freeTerm(allocator, term);
     allocator.free(value.terms);
+}
+
+fn freeTerm(allocator: std.mem.Allocator, term: Term) void {
+    switch (term) {
+        .cons => |pair| {
+            freeTerm(allocator, pair.head);
+            freeTerm(allocator, pair.tail);
+            allocator.destroy(pair);
+        },
+        else => {},
+    }
+}
+
+fn termVariablesBound(term: Term, bound: *const std.AutoHashMapUnmanaged(Id, void)) bool {
+    return switch (term) {
+        .variable => |variable| bound.contains(variable),
+        .cons => |pair| termVariablesBound(pair.head, bound) and termVariablesBound(pair.tail, bound),
+        else => true,
+    };
+}
+
+fn bindTermVariables(
+    allocator: std.mem.Allocator,
+    term: Term,
+    bound: *std.AutoHashMapUnmanaged(Id, void),
+) !void {
+    switch (term) {
+        .variable => |variable| try bound.put(allocator, variable, {}),
+        .cons => |pair| {
+            try bindTermVariables(allocator, pair.head, bound);
+            try bindTermVariables(allocator, pair.tail, bound);
+        },
+        else => {},
+    }
 }
 
 fn isVariable(string: []const u8) bool {
@@ -538,17 +802,6 @@ fn deinitFacts(allocator: std.mem.Allocator, facts: *std.ArrayList(Fact)) void {
     facts.deinit(allocator);
 }
 
-fn unify(allocator: std.mem.Allocator, fact: Fact, goal: Expr, bindings: *Binding) !bool {
-    for (fact.terms, goal.terms) |value, term| {
-        if (term.variable) {
-            if (bindings.values.get(term.id)) |bound| {
-                if (bound != value) return false;
-            } else try bindings.values.put(allocator, term.id, value);
-        } else if (term.id != value) return false;
-    }
-    return true;
-}
-
 const Parser = struct {
     jatalog: *Jatalog,
     source: []const u8,
@@ -576,7 +829,11 @@ const Parser = struct {
             defer body.deinit(self.jatalog.allocator);
             errdefer for (body.items) |expr_value| freeExpr(self.jatalog.allocator, expr_value);
             while (true) {
-                try body.append(self.jatalog.allocator, try self.parseExpr());
+                const clause = try self.parseExpr();
+                body.append(self.jatalog.allocator, clause) catch |err| {
+                    freeExpr(self.jatalog.allocator, clause);
+                    return err;
+                };
                 self.skipSpace();
                 if (!self.consume(",")) break;
             }
@@ -598,7 +855,13 @@ const Parser = struct {
         }
         try goals.append(self.jatalog.allocator, head);
         head_owned = false;
-        while (self.consume(",")) try goals.append(self.jatalog.allocator, try self.parseExpr());
+        while (self.consume(",")) {
+            const goal = try self.parseExpr();
+            goals.append(self.jatalog.allocator, goal) catch |err| {
+                freeExpr(self.jatalog.allocator, goal);
+                return err;
+            };
+        }
         if (self.consume("?")) return .{ .query = try self.jatalog.query(goals.items) };
         if (self.consume("~")) return .{ .changed = try self.jatalog.delete(goals.items) };
         return Error.InvalidSyntax;
@@ -612,36 +875,65 @@ const Parser = struct {
             negated = true;
         }
         const first = try self.parseTerm();
+        var first_owned = true;
+        errdefer if (first_owned) freeTerm(self.jatalog.allocator, first);
         self.skipSpace();
         if (self.parseOperator()) |operator| {
             const second = try self.parseTerm();
+            errdefer freeTerm(self.jatalog.allocator, second);
+            const predicate = try self.jatalog.strings.intern(normalizeOperator(operator));
             const terms = try self.jatalog.allocator.alloc(Term, 2);
             terms[0] = first;
             terms[1] = second;
+            first_owned = false;
             return .{
-                .predicate = try self.jatalog.strings.intern(normalizeOperator(operator)),
+                .predicate = predicate,
                 .terms = terms,
                 .negated = negated,
             };
         }
         if (!self.consume("(")) return Error.InvalidSyntax;
+        const predicate = switch (first) {
+            .atom => |atom| atom,
+            else => return Error.InvalidSyntax,
+        };
+        first_owned = false;
         var terms: std.ArrayList(Term) = .empty;
-        errdefer terms.deinit(self.jatalog.allocator);
+        errdefer {
+            for (terms.items) |term| freeTerm(self.jatalog.allocator, term);
+            terms.deinit(self.jatalog.allocator);
+        }
         self.skipSpace();
         if (!self.consume(")")) {
             while (true) {
-                try terms.append(self.jatalog.allocator, try self.parseTerm());
+                const term = try self.parseTerm();
+                terms.append(self.jatalog.allocator, term) catch |err| {
+                    freeTerm(self.jatalog.allocator, term);
+                    return err;
+                };
                 self.skipSpace();
                 if (self.consume(")")) break;
                 try self.expect(",");
             }
         }
-        return .{ .predicate = first.id, .terms = try terms.toOwnedSlice(self.jatalog.allocator), .negated = negated };
+        return .{ .predicate = predicate, .terms = try terms.toOwnedSlice(self.jatalog.allocator), .negated = negated };
     }
 
-    fn parseTerm(self: *Parser) !Term {
+    fn parseTerm(self: *Parser) anyerror!Term {
+        var head = try self.parseTermPrimary();
+        errdefer freeTerm(self.jatalog.allocator, head);
+        if (self.consumeConsBang()) {
+            const tail = try self.parseTerm();
+            errdefer freeTerm(self.jatalog.allocator, tail);
+            head = try self.makeCons(head, tail);
+        }
+        return head;
+    }
+
+    fn parseTermPrimary(self: *Parser) anyerror!Term {
         self.skipSpace();
         if (self.index == self.source.len) return Error.InvalidSyntax;
+        if (self.consume("[")) return self.parseListTail();
         if (self.source[self.index] == '"' or self.source[self.index] == '\'') {
             const quote = self.source[self.index];
             self.index += 1;
@@ -654,10 +946,49 @@ const Parser = struct {
             }
             if (self.index == self.source.len) return Error.InvalidSyntax;
             self.index += 1;
-            return .{ .id = try self.jatalog.strings.intern(string.items), .variable = false };
+            return .{ .atom = try self.jatalog.strings.intern(string.items) };
         }
         const value = try self.parseBare();
-        return .{ .id = try self.jatalog.strings.intern(value), .variable = isVariable(value) };
+        if (std.mem.eql(u8, value, "cons") and self.consume("(")) {
+            const head = try self.parseTerm();
+            errdefer freeTerm(self.jatalog.allocator, head);
+            try self.expect(",");
+            const tail = try self.parseTerm();
+            errdefer freeTerm(self.jatalog.allocator, tail);
+            try self.expect(")");
+            return self.makeCons(head, tail);
+        }
+        const id = try self.jatalog.strings.intern(value);
+        return if (isVariable(value)) .{ .variable = id } else .{ .atom = id };
+    }
+
+    fn parseListTail(self: *Parser) anyerror!Term {
+        if (self.consume("]")) return .nil;
+        const head = try self.parseTerm();
+        errdefer freeTerm(self.jatalog.allocator, head);
+        var tail: Term = undefined;
+        if (self.consume("]")) {
+            tail = .nil;
+        } else if (self.consume(",")) {
+            tail = try self.parseListTail();
+        } else if (self.consumeConsBang()) {
+            tail = try self.parseImproperListTail();
+        } else return Error.InvalidSyntax;
+        errdefer freeTerm(self.jatalog.allocator, tail);
+        return self.makeCons(head, tail);
+    }
+
+    fn parseImproperListTail(self: *Parser) anyerror!Term {
+        const tail = try self.parseTerm();
+        errdefer freeTerm(self.jatalog.allocator, tail);
+        try self.expect("]");
+        return tail;
+    }
+
+    fn makeCons(self: *Parser, head: Term, tail: Term) !Term {
+        const pair = try self.jatalog.allocator.create(Term.Cons);
+        pair.* = .{ .head = head, .tail = tail };
+        return .{ .cons = pair };
     }
 
     fn parseBare(self: *Parser) ![]const u8 {
@@ -707,6 +1038,14 @@ const Parser = struct {
         self.skipSpace();
         if (!std.mem.startsWith(u8, self.source[self.index..], token)) return false;
         self.index += token.len;
+        return true;
+    }
+
+    fn consumeConsBang(self: *Parser) bool {
+        self.skipSpace();
+        if (!std.mem.startsWith(u8, self.source[self.index..], "!") or
+            std.mem.startsWith(u8, self.source[self.index..], "!=")) return false;
+        self.index += 1;
         return true;
     }
 
@@ -774,4 +1113,111 @@ test "a parse error after a query releases the previous result" {
         \\p(a). p(X)?
         \\bad(X) :- q(X), X <>.
     ));
+}
+
+fn expectBindingValue(
+    db: *const Jatalog,
+    binding: *const Binding,
+    variable: []const u8,
+    expected: []const u8,
+) !void {
+    const value = binding.getValue(db, variable) orelse return error.MissingBinding;
+    const formatted = try db.formatValue(std.testing.allocator, value);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expectEqualStrings(expected, formatted);
+}
+
+test "lists round trip through queries and nested terms unify structurally" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\nested([a, [b, []]]).
+        \\nested(X)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "X", "[a, [b, []]]");
+}
+
+test "head tail patterns work in rules and cons syntax is equivalent" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\items(cons(a, cons(b, []))).
+        \\tail(T) :- items(H!T).
+        \\tail(X)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "X", "[b]");
+}
+
+test "repeated variables inside structures enforce equality" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\pair([a, [a]]). pair([a, [b]]).
+        \\pair([X, [X]])?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try std.testing.expectEqualStrings("a", result.query.answers.items[0].get(&db, "X").?);
+}
+
+test "facts reject variables at every structural depth" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.InvalidFact, db.execute("bad([a, X])."));
+    try std.testing.expectError(Error.InvalidFact, db.execute("bad(a!T)."));
+
+    var result = try db.execute("improper(a!b). improper(X)?");
+    defer result.deinit();
+    try expectBindingValue(&db, &result.query.answers.items[0], "X", "cons(a, b)");
+}
+
+test "structural equality binds variables recursively and parse errors clean up" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute("seed(a). seed(X), [X] = [a]?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try std.testing.expectEqualStrings("a", result.query.answers.items[0].get(&db, "X").?);
+
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("broken([a, [b])."));
+}
+
+test "ground values have a deterministic structural total order" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const expression = try db.expr("values", &.{ "z", "a", "[]", "[a]", "[a, b]" });
+    defer db.freeExpression(expression);
+    var ids: [5]ValueId = undefined;
+    for (expression.terms, &ids) |term, *id| id.* = try db.termToValue(term, null);
+    try std.testing.expectEqual(std.math.Order.gt, db.compareValues(ids[0], ids[1]));
+    try std.testing.expectEqual(std.math.Order.lt, db.compareValues(ids[1], ids[2]));
+    try std.testing.expectEqual(std.math.Order.lt, db.compareValues(ids[2], ids[3]));
+    try std.testing.expectEqual(std.math.Order.lt, db.compareValues(ids[3], ids[4]));
+}
+
+fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\items([a, [b], c]).
+        \\tail(T) :- items(H!T).
+        \\tail([X, c])?
+    );
+    defer result.deinit();
+    const value = result.query.answers.items[0].getValue(&db, "X").?;
+    const formatted = try db.formatValue(allocator, value);
+    defer allocator.free(formatted);
+    try std.testing.expectEqualStrings("[b]", formatted);
+}
+
+test "structural parsing and evaluation release every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        structuralAllocationScenario,
+        .{},
+    );
 }
