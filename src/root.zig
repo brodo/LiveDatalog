@@ -9,7 +9,6 @@ pub const Error = error{
     InvalidQuery,
     InvalidSyntax,
     NotStratified,
-    AggregateEvaluationNotImplemented,
     UnboundVariable,
     UnknownOperator,
 };
@@ -470,8 +469,48 @@ pub const Jatalog = struct {
             };
             return;
         }
+        if (clauses[index] == .aggregate) {
+            const aggregate = clauses[index].aggregate;
+            var inner_answers: std.ArrayList(Binding) = .empty;
+            defer {
+                for (inner_answers.items) |*answer| answer.deinit(self.allocator);
+                inner_answers.deinit(self.allocator);
+            }
+            try self.matchClauses(aggregate.body, facts, 0, bindings, &inner_answers);
+
+            var values: std.ArrayList(ValueId) = .empty;
+            defer values.deinit(self.allocator);
+            for (inner_answers.items) |*answer| {
+                const value = try self.termToValue(aggregate.template, answer);
+                var duplicate = false;
+                for (values.items) |existing| {
+                    if (existing == value) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) try values.append(self.allocator, value);
+            }
+            self.sortValues(values.items);
+
+            var list = try self.values.intern(.nil);
+            var value_index = values.items.len;
+            while (value_index > 0) {
+                value_index -= 1;
+                list = try self.values.intern(.{ .cons = .{
+                    .head = values.items[value_index],
+                    .tail = list,
+                } });
+            }
+
+            var next = try bindings.clone(self.allocator);
+            defer next.deinit(self.allocator);
+            if (try self.unifyValueTerm(list, aggregate.output, &next))
+                try self.matchClauses(clauses, facts, index + 1, &next, answers);
+            return;
+        }
         const expression = switch (clauses[index]) {
-            .aggregate => return Error.AggregateEvaluationNotImplemented,
+            .aggregate => unreachable,
             .relational => |value| value,
             .builtin => |value| value,
             .negated => |value| value,
@@ -853,15 +892,33 @@ pub const Jatalog = struct {
     }
 
     fn deleteClauses(self: *Jatalog, goals: []const Clause) !bool {
-        const expressions = try self.allocator.alloc(Expr, goals.len);
-        defer self.allocator.free(expressions);
-        for (goals, expressions) |clause, *expression| expression.* = switch (clause) {
-            .aggregate => return Error.AggregateEvaluationNotImplemented,
-            .relational => |value| value,
-            .builtin => |value| value,
-            .negated => |value| value,
-        };
-        return self.delete(expressions);
+        var result = try self.queryClauses(goals);
+        defer result.deinit();
+        var changed = false;
+        var index = self.facts.items.len;
+        while (index > 0) {
+            index -= 1;
+            const fact = self.facts.items[index];
+            var remove = false;
+            for (result.answers.items) |*answer| {
+                for (goals) |clause| {
+                    const goal = switch (clause) {
+                        .relational => |expression| expression,
+                        else => continue,
+                    };
+                    if (goal.predicate != fact.predicate or goal.terms.len != fact.terms.len) continue;
+                    var matched = try answer.clone(self.allocator);
+                    defer matched.deinit(self.allocator);
+                    if (try self.unify(fact, goal, &matched)) remove = true;
+                }
+            }
+            if (remove) {
+                self.allocator.free(fact.terms);
+                _ = self.facts.orderedRemove(index);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     pub fn formatValue(self: *const Jatalog, allocator: std.mem.Allocator, value: ValueId) ![]u8 {
@@ -941,6 +998,18 @@ pub const Jatalog = struct {
                 else => unreachable,
             },
         };
+    }
+
+    fn sortValues(self: *const Jatalog, values: []ValueId) void {
+        if (values.len < 2) return;
+        for (values[1..], 1..) |value, index| {
+            var insertion = index;
+            while (insertion > 0 and self.compareValues(value, values[insertion - 1]) == .lt) {
+                values[insertion] = values[insertion - 1];
+                insertion -= 1;
+            }
+            values[insertion] = value;
+        }
     }
 };
 
@@ -1691,23 +1760,135 @@ test "negation and aggregate strict edges share one dependency graph" {
     try std.testing.expectEqual(@as(usize, 2), levels.get(db.strings.get("summary").?).?);
 }
 
-test "aggregate evaluation remains deferred to phase 3" {
+test "grouped setof is sorted, deduplicated, and includes empty groups" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute(
-        \\seed(k). item(a).
+        \\person(bob). person(alice). parent(alice, carol). parent(alice, bob).
+        \\from_left(X, Y) :- parent(X, Y).
+        \\from_right(X, Y) :- parent(X, Y).
+        \\child(X, Y) :- from_left(X, Y).
+        \\child(X, Y) :- from_right(X, Y).
+        \\children(X, S) :- person(X), setof(Y, child(X, Y), S).
+        \\children(X, S)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
+    for (result.query.answers.items) |*answer| {
+        const person = answer.get(&db, "X").?;
+        if (std.mem.eql(u8, person, "alice")) {
+            try expectBindingValue(&db, answer, "S", "[bob, carol]");
+        } else if (std.mem.eql(u8, person, "bob")) {
+            try expectBindingValue(&db, answer, "S", "[]");
+        } else return error.UnexpectedPerson;
+    }
+}
+
+test "setof evaluates directly in queries" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute("item(c). item(a). setof(X, item(X), S)?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a, c]");
+}
+
+test "setof sees completed recursive strata and preserves structural templates" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\edge(a, b). edge(b, c). edge(c, d). seed(k).
+        \\reachable(X, Y) :- edge(X, Y).
+        \\reachable(X, Y) :- reachable(X, Z), edge(Z, Y).
+        \\all(S) :- seed(k), setof([Y, X], reachable(X, Y), S).
+        \\all(S)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(
+        &db,
+        &result.query.answers.items[0],
+        "S",
+        "[[b, a], [c, a], [c, b], [d, a], [d, b], [d, c]]",
+    );
+}
+
+test "nested and multiple setof goals evaluate from correlated bindings" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\seed(k). group(g2). group(g1). item(g1, b). item(g1, a).
+        \\summary(All, Groups) :- seed(k), setof(X, item(g1, X), All),
+        \\  setof([G, S], (group(G), setof(X, item(G, X), S)), Groups).
+        \\summary(All, Groups)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "All", "[a, b]");
+    try expectBindingValue(&db, &result.query.answers.items[0], "Groups", "[[g1, [a, b]], [g2, []]]");
+}
+
+test "setof recomputes after retraction" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\seed(k). item(b). item(a).
         \\items(S) :- seed(k), setof(X, item(X), S).
+        \\item(b)~
     );
     result.deinit();
-    try std.testing.expectError(Error.AggregateEvaluationNotImplemented, db.execute("seed(X)?"));
+    result = try db.execute("items(S)?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a]");
+}
 
-    var query_db: Jatalog = .init(std.testing.allocator);
-    defer query_db.deinit();
-    var fact_result = try query_db.execute("item(a).");
-    fact_result.deinit();
-    try std.testing.expectError(
-        Error.AggregateEvaluationNotImplemented,
-        query_db.execute("setof(X, item(X), S)?"),
+test "setof ordering is independent of insertion and rule order" {
+    var first: Jatalog = .init(std.testing.allocator);
+    defer first.deinit();
+    var first_result = try first.execute(
+        \\seed(k). base(c). base(a). base(b).
+        \\value(X) :- base(X).
+        \\values(S) :- seed(k), setof(X, value(X), S).
+        \\values(S)?
+    );
+    defer first_result.deinit();
+
+    var second: Jatalog = .init(std.testing.allocator);
+    defer second.deinit();
+    var second_result = try second.execute(
+        \\base(b). base(c). base(a). seed(k).
+        \\values(S) :- seed(k), setof(X, value(X), S).
+        \\value(X) :- base(X).
+        \\values(S)?
+    );
+    defer second_result.deinit();
+
+    const first_value = first_result.query.answers.items[0].getValue(&first, "S").?;
+    const first_text = try first.formatValue(std.testing.allocator, first_value);
+    defer std.testing.allocator.free(first_text);
+    const second_value = second_result.query.answers.items[0].getValue(&second, "S").?;
+    const second_text = try second.formatValue(std.testing.allocator, second_value);
+    defer std.testing.allocator.free(second_text);
+    try std.testing.expectEqualStrings(first_text, second_text);
+}
+
+fn aggregateEvaluationAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\group(g1). group(g2). item(g1, b). item(g1, a).
+        \\grouped(Groups) :- group(g1), setof([G, S], (group(G), setof(X, item(G, X), S)), Groups).
+        \\grouped(Groups)?
+    );
+    defer result.deinit();
+}
+
+test "aggregate evaluation releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        aggregateEvaluationAllocationScenario,
+        .{},
     );
 }
 

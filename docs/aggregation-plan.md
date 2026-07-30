@@ -185,9 +185,9 @@ Phase 2 was completed on 2026-07-30 with these decisions:
   nested aggregate, creates a strict dependency. Negated dependencies are also
   strict, and a single stratum computation rejects cycles containing either
   kind of edge while preserving ordinary positive recursion below aggregates.
-- Phase 2 intentionally does not evaluate `setof`. Reaching an aggregate during
-  expansion or querying returns `AggregateEvaluationNotImplemented`; Phase 3
-  will replace that boundary with the set semantics described below.
+- Phase 2 intentionally did not evaluate `setof`. Reaching an aggregate during
+  expansion or querying returned `AggregateEvaluationNotImplemented`; Phase 3
+  replaced that temporary boundary with the set semantics described below.
 
 ## Phase 3: `setof` evaluation
 
@@ -219,6 +219,27 @@ Phase 2 was completed on 2026-07-30 with these decisions:
 
 Stop when `setof` itself is semantically complete. Built-in aggregate shortcuts
 are not a substitute for these tests.
+
+### Completed decisions
+
+Phase 3 was completed on 2026-07-30 with these decisions:
+
+- Expansion evaluates strata in ascending order and reaches a fixpoint within
+  each stratum before rules in the next stratum run. Aggregate bodies therefore
+  see completed lower-stratum relations, including recursive ones.
+- Aggregate evaluation begins with a clone of the current outer binding. Every
+  successful inner binding grounds the template through the canonical value
+  table; an unground projection returns `UnboundVariable` rather than creating
+  a partial value.
+- Projected canonical values are deduplicated, ordered with the structural total
+  order from Phase 1, and folded into a canonical proper list. No solutions
+  produce the canonical `[]` value.
+- Nested and multiple aggregate goals execute directly through the recursive
+  clause evaluator. Each aggregate independently reads the completed fact set
+  and can correlate variables already bound by preceding outer clauses.
+- Queries may contain aggregate clauses directly. Retraction still triggers
+  full recomputation on the next query, so aggregate results reflect the
+  current base facts without incremental maintenance.
 
 ## Phase 4: list functions, arithmetic, and admissibility
 
