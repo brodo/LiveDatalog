@@ -152,6 +152,15 @@ const Fact = struct {
     terms: []ValueId,
 };
 
+const PredicateKey = struct {
+    name: Id,
+    arity: usize,
+};
+
+fn predicateKey(expression: Expr) PredicateKey {
+    return .{ .name = expression.predicate, .arity = expression.terms.len };
+}
+
 pub const Binding = struct {
     values: std.array_hash_map.Auto(Id, ValueId) = .empty,
 
@@ -339,6 +348,10 @@ pub const Jatalog = struct {
             .body = owned_body,
             .seed_argument = seed_argument,
         });
+        self.validateRecursiveArithmetic() catch |err| {
+            _ = self.rules.pop();
+            return err;
+        };
         self.validateStratification() catch |err| {
             _ = self.rules.pop();
             return err;
@@ -427,7 +440,7 @@ pub const Jatalog = struct {
             while (true) {
                 const before = facts.items.len;
                 for (self.rules.items) |rule| {
-                    const rule_level = levels.get(rule.head.predicate) orelse 0;
+                    const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
                     if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
                     var answers: std.ArrayList(Binding) = .empty;
                     defer {
@@ -751,31 +764,47 @@ pub const Jatalog = struct {
 
     fn validateRule(self: *Jatalog, head: Expr, body: []const Clause) !?usize {
         if (body.len == 0 or head.negated or isBuiltin(self, head)) return Error.InvalidRule;
-        const seed_argument = try admissibleSeedArgument(head, body);
+        const recursive_seed = try admissibleSeedArgument(head, body);
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
         for (head.terms) |term| try collectTermVariables(self.allocator, term, &outer_variables);
         for (body) |clause| try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
 
+        const ordered = try self.orderClauses(body);
+        defer self.allocator.free(ordered);
+        if (recursive_seed) |seed_argument| {
+            try self.validateRuleSafety(head, ordered, &outer_variables, seed_argument);
+            return seed_argument;
+        }
+        self.validateRuleSafety(head, ordered, &outer_variables, null) catch |err| switch (err) {
+            Error.InvalidRule => {
+                const seed_argument = firstStructuralArgument(head) orelse
+                    return Error.InvalidRule;
+                try self.validateRuleSafety(head, ordered, &outer_variables, seed_argument);
+                return seed_argument;
+            },
+            else => return err,
+        };
+        return null;
+    }
+
+    fn validateRuleSafety(
+        self: *Jatalog,
+        head: Expr,
+        ordered: []const Clause,
+        outer_variables: *const std.AutoHashMapUnmanaged(Id, void),
+        seed_argument: ?usize,
+    ) !void {
         var bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer bound.deinit(self.allocator);
         if (seed_argument) |argument|
             try bindTermVariables(self.allocator, head.terms[argument], &bound);
-        const ordered = try self.orderClauses(body);
-        defer self.allocator.free(ordered);
-        for (ordered) |clause| try self.validateClause(clause, &bound, &outer_variables, Error.InvalidRule);
+        for (ordered) |clause| try self.validateClause(clause, &bound, outer_variables, Error.InvalidRule);
         for (head.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidRule;
-        return seed_argument;
     }
 
     fn admissibleSeedArgument(head: Expr, body: []const Clause) !?usize {
         var seed: ?usize = null;
-        for (head.terms, 0..) |term, index| {
-            if (termContainsCons(term)) {
-                seed = index;
-                break;
-            }
-        }
         for (body) |clause| {
             const call = switch (clause) {
                 .relational => |expression| expression,
@@ -799,6 +828,61 @@ pub const Jatalog = struct {
             } else seed = candidate;
         }
         return seed;
+    }
+
+    fn firstStructuralArgument(head: Expr) ?usize {
+        for (head.terms, 0..) |term, index|
+            if (termContainsCons(term)) return index;
+        return null;
+    }
+
+    fn validateRecursiveArithmetic(self: *Jatalog) !void {
+        for (self.rules.items) |rule| {
+            if (!self.ruleContainsArithmetic(rule)) continue;
+            const head = predicateKey(rule.head);
+            for (rule.body) |clause| {
+                const expression = switch (clause) {
+                    .relational => |value| value,
+                    else => continue,
+                };
+                var visited: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+                defer visited.deinit(self.allocator);
+                const dependency = predicateKey(expression);
+                const structurally_proven = rule.seed_argument != null and std.meta.eql(dependency, head);
+                if (!structurally_proven and try self.predicateReaches(dependency, head, &visited))
+                    return Error.NotAdmissible;
+            }
+        }
+    }
+
+    fn ruleContainsArithmetic(self: *const Jatalog, rule: Rule) bool {
+        for (rule.body) |clause| switch (clause) {
+            .builtin => |expression| if (isArithmetic(self, expression)) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    fn predicateReaches(
+        self: *Jatalog,
+        current: PredicateKey,
+        target: PredicateKey,
+        visited: *std.AutoHashMapUnmanaged(PredicateKey, void),
+    ) !bool {
+        if (std.meta.eql(current, target)) return true;
+        if (visited.contains(current)) return false;
+        try visited.put(self.allocator, current, {});
+        for (self.rules.items) |rule| {
+            if (!std.meta.eql(predicateKey(rule.head), current)) continue;
+            for (rule.body) |clause| {
+                const expression = switch (clause) {
+                    .relational => |value| value,
+                    else => continue,
+                };
+                if (try self.predicateReaches(predicateKey(expression), target, visited)) return true;
+            }
+        }
+        return false;
     }
 
     fn validateClause(
@@ -980,11 +1064,11 @@ pub const Jatalog = struct {
         levels.deinit(self.allocator);
     }
 
-    fn computeStrata(self: *Jatalog) !std.array_hash_map.Auto(Id, usize) {
-        var levels: std.array_hash_map.Auto(Id, usize) = .empty;
+    fn computeStrata(self: *Jatalog) !std.array_hash_map.Auto(PredicateKey, usize) {
+        var levels: std.array_hash_map.Auto(PredicateKey, usize) = .empty;
         errdefer levels.deinit(self.allocator);
         for (self.rules.items) |rule| {
-            try levels.put(self.allocator, rule.head.predicate, 0);
+            try levels.put(self.allocator, predicateKey(rule.head), 0);
             for (rule.body) |clause| try self.collectDependencyPredicates(clause, &levels);
         }
         const predicate_count = levels.count();
@@ -994,9 +1078,10 @@ pub const Jatalog = struct {
                 var required: usize = 0;
                 for (rule.body) |clause|
                     required = @max(required, self.clauseRequiredStratum(clause, &levels, false));
-                const current = levels.get(rule.head.predicate) orelse 0;
+                const head = predicateKey(rule.head);
+                const current = levels.get(head) orelse 0;
                 if (required > current) {
-                    try levels.put(self.allocator, rule.head.predicate, required);
+                    try levels.put(self.allocator, head, required);
                     changed = true;
                 }
             }
@@ -1009,12 +1094,12 @@ pub const Jatalog = struct {
     fn collectDependencyPredicates(
         self: *Jatalog,
         clause: Clause,
-        levels: *std.array_hash_map.Auto(Id, usize),
+        levels: *std.array_hash_map.Auto(PredicateKey, usize),
     ) !void {
         switch (clause) {
-            .relational => |expression| try levels.put(self.allocator, expression.predicate, 0),
+            .relational => |expression| try levels.put(self.allocator, predicateKey(expression), 0),
             .negated => |expression| if (!isBuiltin(self, expression))
-                try levels.put(self.allocator, expression.predicate, 0),
+                try levels.put(self.allocator, predicateKey(expression), 0),
             .builtin => {},
             .aggregate => |aggregate| for (aggregate.body) |body_clause|
                 try self.collectDependencyPredicates(body_clause, levels),
@@ -1024,16 +1109,16 @@ pub const Jatalog = struct {
     fn clauseRequiredStratum(
         self: *const Jatalog,
         clause: Clause,
-        levels: *const std.array_hash_map.Auto(Id, usize),
+        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
         aggregate_context: bool,
     ) usize {
         return switch (clause) {
-            .relational => |expression| (levels.get(expression.predicate) orelse 0) +
+            .relational => |expression| (levels.get(predicateKey(expression)) orelse 0) +
                 @intFromBool(aggregate_context),
             .negated => |expression| if (isBuiltin(self, expression))
                 0
             else
-                (levels.get(expression.predicate) orelse 0) + 1,
+                (levels.get(predicateKey(expression)) orelse 0) + 1,
             .builtin => 0,
             .aggregate => |aggregate| blk: {
                 var required: usize = 0;
@@ -1974,8 +2059,8 @@ test "positive recursion may complete below an aggregate stratum" {
     defer result.deinit();
     var levels = try db.computeStrata();
     defer levels.deinit(std.testing.allocator);
-    const reachable = db.strings.get("reachable").?;
-    const all_reachable = db.strings.get("all_reachable").?;
+    const reachable: PredicateKey = .{ .name = db.strings.get("reachable").?, .arity = 2 };
+    const all_reachable: PredicateKey = .{ .name = db.strings.get("all_reachable").?, .arity = 1 };
     try std.testing.expectEqual(@as(usize, 0), levels.get(reachable).?);
     try std.testing.expectEqual(@as(usize, 1), levels.get(all_reachable).?);
 }
@@ -1991,8 +2076,10 @@ test "negation and aggregate strict edges share one dependency graph" {
     defer result.deinit();
     var levels = try db.computeStrata();
     defer levels.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), levels.get(db.strings.get("allowed").?).?);
-    try std.testing.expectEqual(@as(usize, 2), levels.get(db.strings.get("summary").?).?);
+    const allowed: PredicateKey = .{ .name = db.strings.get("allowed").?, .arity = 1 };
+    const summary: PredicateKey = .{ .name = db.strings.get("summary").?, .arity = 1 };
+    try std.testing.expectEqual(@as(usize, 1), levels.get(allowed).?);
+    try std.testing.expectEqual(@as(usize, 2), levels.get(summary).?);
 }
 
 test "grouped setof is sorted, deduplicated, and includes empty groups" {
@@ -2218,6 +2305,86 @@ test "structurally growing recursion is not admissible" {
     try std.testing.expectError(Error.NotAdmissible, db.execute(
         \\q([X]) :- q(X).
     ));
+}
+
+test "non-recursive rules may construct structural head values" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\item(a).
+        \\wrapped([X]) :- item(X).
+        \\wrapped(Value)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "Value", "[a]");
+}
+
+test "structurally recursive rules retain their proven input seed" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\base(a).
+        \\p([a]).
+        \\p(H!T) :- base(H), p(T).
+        \\p(Value)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "Value", "[a]");
+}
+
+test "recursive arithmetic generators are not admissible" {
+    var direct: Jatalog = .init(std.testing.allocator);
+    defer direct.deinit();
+    try std.testing.expectError(Error.NotAdmissible, direct.execute(
+        \\number(0).
+        \\number(N) :- number(M), N = M + 1.
+    ));
+
+    var indirect: Jatalog = .init(std.testing.allocator);
+    defer indirect.deinit();
+    try std.testing.expectError(Error.NotAdmissible, indirect.execute(
+        \\left(0).
+        \\left(N) :- right(N).
+        \\right(N) :- left(M), N = M + 1.
+    ));
+}
+
+fn recursiveArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = db.execute(
+        \\left(0).
+        \\left(N) :- right(N).
+        \\right(N) :- left(M), N = M + 1.
+    ) catch |err| switch (err) {
+        Error.NotAdmissible => return,
+        else => return err,
+    };
+    result.deinit();
+    return error.ExpectedNotAdmissible;
+}
+
+test "recursive arithmetic rejection is allocation safe" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        recursiveArithmeticAllocationScenario,
+        .{},
+    );
+}
+
+test "stratification distinguishes predicate arities" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\p(a, b). seed(k).
+        \\p(S) :- seed(k), setof([X, Y], p(X, Y), S).
+        \\p(S)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[[a, b]]");
 }
 
 test "embedding API constructs structural aggregate rules and queries" {

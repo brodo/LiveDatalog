@@ -185,6 +185,8 @@ Phase 2 was completed on 2026-07-30 with these decisions:
   nested aggregate, creates a strict dependency. Negated dependencies are also
   strict, and a single stratum computation rejects cycles containing either
   kind of edge while preserving ordinary positive recursion below aggregates.
+  Dependency identity includes predicate arity, so relations that share a name
+  but have different arities remain distinct.
 - Phase 2 intentionally did not evaluate `setof`. Reaching an aggregate during
   expansion or querying returned `AggregateEvaluationNotImplemented`; Phase 3
   replaced that temporary boundary with the set semantics described below.
@@ -286,6 +288,9 @@ Phase 4 was completed on 2026-07-30 with these decisions:
   Canonical list values introduced by later strata, including `setof` results,
   reseed admissible rules, so `length`, `member`, `sum`, and `collectfirst` can
   remain ordinary user-defined relations.
+- Structural input seeding is used only when ordinary body evaluation cannot
+  bind a constructor-bearing head. Non-recursive rules may therefore construct
+  new list values in their heads without requiring those values to exist first.
 - A recursive call involving `cons` is admissible only when at least one call
   argument is reached through one or more cons tails of its head argument and
   every other statically structural argument is unchanged or likewise a tail.
@@ -295,6 +300,10 @@ Phase 4 was completed on 2026-07-30 with these decisions:
   inconsistent across recursive calls, and it does not attempt a mutual-
   recursion or semantic-size proof. These are conservative false rejections at
   the enforceable termination boundary.
+- A recursive dependency cycle containing value-producing arithmetic is
+  rejected unless it is a direct recursive list call covered by the structural
+  decrease proof. This prevents unbounded generators such as
+  `number(N) :- number(M), N = M + 1` from entering materialization.
 - While admissible rules are probed against canonical structural inputs,
   numeric type and overflow failures make an unrelated candidate inapplicable.
   Arithmetic goals evaluated directly still report the explicit numeric error.

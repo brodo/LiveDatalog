@@ -165,6 +165,9 @@ local to its template/body cannot escape. Recursive list rules must consume at
 least one structural argument through a cons tail without growing another
 tracked argument. This intentionally conservative check accepts `length`,
 `member`, and `sum`, while rejecting rules such as `q([X]) :- q(X)`.
+Recursive arithmetic generators without that direct structural decrease are
+also rejected with `NotAdmissible` instead of being allowed to materialize
+forever.
 
 Integer expressions use signed 64-bit arithmetic: `N = A + B` and
 `N = A - B`. Operands must already be bound integer atoms; overflow and
@@ -260,7 +263,7 @@ and must release them. `Binding.get` returns scalar atoms; use
 The public error names mark separate failure boundaries: `InvalidSyntax` for
 parsing, `InvalidRule`/`InvalidQuery` for safety, `NotStratified` for recursion
 through negation or aggregation, `UnboundVariable` for grounding, and
-`NotAdmissible` for structural termination checks. Arithmetic additionally
+`NotAdmissible` for termination checks. Arithmetic additionally
 reports `NumericType` and `NumericOverflow`.
 
 ## Development
