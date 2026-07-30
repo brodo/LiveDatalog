@@ -157,6 +157,38 @@ Phase 1 was completed on 2026-07-30 with these decisions:
 
 Stop with aggregates represented and validated but not necessarily evaluated.
 
+### Completed decisions
+
+Phase 2 was completed on 2026-07-30 with these decisions:
+
+- Rule bodies use a tagged clause union with distinct relational, built-in,
+  negated, and aggregate variants. `Aggregate` owns a template term, a clause
+  body, and an output term.
+- `setof(Template, Goal, Result)` accepts a single goal directly. Multi-goal
+  bodies use the parenthesized conjunction syntax
+  `setof(Template, (Goal1, Goal2), Result)`. Structural terms are accepted in
+  both the template and output positions.
+- Nested aggregates are represented directly as recursive clause trees rather
+  than lowered to generated predicates. This keeps source-level variable scope
+  explicit for safety checking and leaves lowering as an optional future
+  optimization.
+- A variable used inside an aggregate and elsewhere in its enclosing scope is
+  correlated and must be bound before that aggregate is scheduled. Variables
+  confined to the aggregate template/body are local; they cannot escape through
+  the result, another outer clause, or the rule head. Aggregate output terms
+  bind their variables after the aggregate safety check.
+- Safety scheduling retains the engine's existing conjunction behavior:
+  positive relational goals and binding equality run first, aggregates run
+  next in source order, and negation/comparison checks run last. The same rules
+  apply recursively inside nested aggregates and to parsed aggregate queries.
+- Every relational predicate anywhere in an aggregate body, including inside a
+  nested aggregate, creates a strict dependency. Negated dependencies are also
+  strict, and a single stratum computation rejects cycles containing either
+  kind of edge while preserving ordinary positive recursion below aggregates.
+- Phase 2 intentionally does not evaluate `setof`. Reaching an aggregate during
+  expansion or querying returns `AggregateEvaluationNotImplemented`; Phase 3
+  will replace that boundary with the set semantics described below.
+
 ## Phase 3: `setof` evaluation
 
 ### Scope
@@ -275,5 +307,3 @@ Each implementation session should end with:
 - Should arithmetic initially use integers, preserve the current `f64`
   behavior, or introduce tagged numeric values?
 - How conservative may the admissibility checker be?
-- Should `setof` bodies use explicit parentheses, braces, or another syntax to
-  delimit conjunctions unambiguously?
