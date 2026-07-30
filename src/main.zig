@@ -2,6 +2,47 @@ const std = @import("std");
 const LiveDatalog = @import("LiveDatalog");
 const Linenoise = @import("linenoise").Linenoise;
 
+const help_text =
+    \\LiveDatalog syntax reference
+    \\
+    \\% Fact
+    \\predicate(atom, value).
+    \\
+    \\% Rule
+    \\derived(X) :- source(X), condition(X).
+    \\
+    \\% Query
+    \\derived(X)?
+    \\
+    \\% Retraction
+    \\source(X)~
+    \\
+    \\% Negation
+    \\allowed(X) :- item(X), not blocked(X).
+    \\
+    \\% Equality, inequality, and numeric comparison
+    \\X = value
+    \\X != Y
+    \\X <> Y
+    \\N < 10
+    \\N <= 10
+    \\N > 10
+    \\N >= 10
+    \\
+    \\% List terms (use them inside a statement)
+    \\[]
+    \\[a, b, c]
+    \\H!T
+    \\cons(H, T)
+    \\
+    \\% Aggregate
+    \\setof(Template, Goal, Result)
+    \\setof(Template, (Goal1, Goal2), Result)
+    \\
+    \\REPL commands: .help, .quit, .exit
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -77,8 +118,12 @@ fn writeHelp(io: std.Io) !void {
     var output_buffer: [256]u8 = undefined;
     var file_writer = std.Io.File.stdout().writer(io, &output_buffer);
     const writer = &file_writer.interface;
-    try writer.writeAll("Enter Datalog facts, rules, queries, or retractions. Use .quit or .exit to leave.\n");
+    try writeHelpTo(writer);
     try writer.flush();
+}
+
+fn writeHelpTo(writer: *std.Io.Writer) !void {
+    try writer.writeAll(help_text);
 }
 
 fn writeError(io: std.Io, err: anyerror) !void {
@@ -91,4 +136,15 @@ fn writeError(io: std.Io, err: anyerror) !void {
 
 test {
     _ = LiveDatalog;
+}
+
+test "REPL help prints the syntax reference" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try writeHelpTo(&output.writer);
+
+    try std.testing.expectEqualStrings(help_text, output.written());
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "% Fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "% Aggregate") != null);
 }
