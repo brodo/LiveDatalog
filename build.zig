@@ -122,9 +122,22 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const benchmark_exe = b.addExecutable(.{
+        .name = "aggregation-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/aggregation.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const benchmark_step = b.step("benchmark-aggregation", "Run the aggregation baseline workload");
+    benchmark_step.dependOn(&b.addRunArtifact(benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",
+        "benchmarks",
         "src",
     };
 
@@ -136,7 +149,11 @@ pub fn build(b: *std.Build) void {
 
     const ziglint_dep = b.dependency("ziglint", .{ .optimize = .ReleaseFast });
     const lint_step = b.step("lint", "Run ziglint");
-    lint_step.dependOn(ziglint.addLint(b, ziglint_dep, &.{ b.path("src"), b.path("build.zig") }));
+    lint_step.dependOn(ziglint.addLint(
+        b,
+        ziglint_dep,
+        &.{ b.path("src"), b.path("benchmarks"), b.path("build.zig") },
+    ));
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -158,6 +175,16 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Exercise the installed command-line program against the README language
+    // tour so documentation and executable behavior cannot drift apart.
+    const run_cli_test = b.addRunArtifact(exe);
+    run_cli_test.addFileArg(b.path("examples/aggregation.dl"));
+    run_cli_test.expectStdOutEqual(
+        \\X: alice, N: 1
+        \\X: bob, N: 0
+        \\
+    );
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -166,6 +193,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(lint_step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_cli_test.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

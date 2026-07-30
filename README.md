@@ -7,6 +7,8 @@ LiveDatalog is an embeddable Datalog engine for Zig 0.16, modelled after
 
 - Facts, rules, and multi-clause queries
 - Recursive rules and stratified negation
+- Structural lists, deterministic `setof`, and nested aggregates
+- Checked 64-bit integer addition and subtraction for recursive list functions
 - Equality (`=`), inequality (`!=` or `<>`), and numeric comparisons (`<`, `<=`, `>`, `>=`)
 - Bare and quoted values, including escaped quotes
 - Line comments (`%` and `//`) and block comments (`/* ... */`)
@@ -122,13 +124,66 @@ p(X) :- q(X).
 q(X) :- not p(X), seed(X).
 ```
 
+### Aggregation and structural lists
+
+The checked-in `examples/aggregation.dl` language tour runs verbatim with
+`zig build run -- examples/aggregation.dl`:
+
+```datalog
+% Structural lists, set aggregation, and an ordinary recursive list function.
+person(alice).
+person(bob).
+parent(alice, bob).
+
+children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+
+length([], 0).
+length(H!T, N) :- length(T, M), N = M + 1.
+
+numchildren(X, N) :- children(X, S), length(S, N).
+numchildren(X, N)?
+```
+
+```text
+X: alice, N: 1
+X: bob, N: 0
+```
+
+Terms support `[]`, `[a, b]`, nested lists, the head/tail pattern `H!T`, and
+the equivalent `cons(H, T)` constructor. `setof(Template, Goal, Result)`
+collects distinct ground template values into a deterministically ordered
+proper list. It succeeds with `[]` when there are no matches. Parenthesize a
+multi-goal body:
+
+```datalog
+setof([Score, Student], (score(Test, Student, Score), passed(Student)), S)
+```
+
+Aggregates may be nested, but their bodies may only depend on completed lower
+strata. Correlated variables must be bound before the aggregate; variables
+local to its template/body cannot escape. Recursive list rules must consume at
+least one structural argument through a cons tail without growing another
+tracked argument. This intentionally conservative check accepts `length`,
+`member`, and `sum`, while rejecting rules such as `q([X]) :- q(X)`.
+
+Integer expressions use signed 64-bit arithmetic: `N = A + B` and
+`N = A - B`. Operands must already be bound integer atoms; overflow and
+non-integer inputs are errors.
+
 ## Embed it in Zig
 
-Use `execute` when you want to parse Datalog source, or use `expr`/`not` to
-construct expressions directly. Expressions created with `expr` or `not` are
-owned by the caller until they are passed successfully to `addRule`; free
-other expressions with `freeExpression`. Query and execution results also
-need to be deinitialized.
+Use `execute` to parse Datalog source. For typed construction, `expr` and `not`
+create caller-owned expressions, `clauseFromExpr` classifies one as a
+relational, built-in, or negated clause, and `setof` creates a structural
+aggregate goal. Term strings passed to `expr` and `setof` accept the structural
+syntax described above.
+
+`setof` takes ownership of its body clauses only on success. Likewise,
+`addRule` and `addRuleClauses` take ownership of their head and body expressions
+only on success. Release anything not transferred with `freeExpression` or
+`freeClause`; freeing an aggregate clause recursively frees its template,
+output, and body. `query` and `queryClauses` only borrow their goals. Every
+`QueryResult` and `ExecutionResult` must be deinitialized.
 
 ```zig
 const std = @import("std");
@@ -158,6 +213,56 @@ For negated clauses, construct them with `database.not("employed", &.{ "X" })`.
 Use `ExecutionResult.deinit` after `execute`; it is a tagged union of `none`,
 `changed`, and `query`.
 
+Aggregate rules use clauses so nested goals retain their ownership explicitly:
+
+```zig
+try database.addFact("person", &.{"alice"});
+
+const parent = try database.expr("parent", &.{ "X", "Y" });
+var parent_owned = true;
+defer if (parent_owned) database.freeExpression(parent);
+const set = try database.setof("Y", &.{database.clauseFromExpr(parent)}, "S");
+parent_owned = false; // set owns parent after setof succeeds.
+var set_owned = true;
+defer if (set_owned) database.freeClause(set);
+
+const person = try database.expr("person", &.{"X"});
+var person_owned = true;
+defer if (person_owned) database.freeExpression(person);
+const children = try database.expr("children", &.{ "X", "S" });
+var children_owned = true;
+defer if (children_owned) database.freeExpression(children);
+
+// On success, the database owns children, person, set, and set's parent goal.
+try database.addRuleClauses(children, &.{ database.clauseFromExpr(person), set });
+children_owned = false;
+person_owned = false;
+set_owned = false;
+
+const goal = try database.expr("children", &.{ "alice", "S" });
+const goal_clause = database.clauseFromExpr(goal);
+defer database.freeClause(goal_clause); // queryClauses only borrows it.
+var result = try database.queryClauses(&.{goal_clause});
+defer result.deinit();
+
+const value = result.answers.items[0].getValue(&database, "S").?;
+const text = try database.formatValue(std.heap.page_allocator, value);
+defer std.heap.page_allocator.free(text);
+std.debug.print("{s}\\n", .{text}); // [bob]
+```
+
+If a fallible ownership-taking call fails, the caller still owns all inputs
+and must release them. `Binding.get` returns scalar atoms; use
+`Binding.getValue` with `formatValue` or `writeValue` for structural bindings.
+
+### Errors
+
+The public error names mark separate failure boundaries: `InvalidSyntax` for
+parsing, `InvalidRule`/`InvalidQuery` for safety, `NotStratified` for recursion
+through negation or aggregation, `UnboundVariable` for grounding, and
+`NotAdmissible` for structural termination checks. Arithmetic additionally
+reports `NumericType` and `NumericOverflow`.
+
 ## Development
 
 ```sh
@@ -168,3 +273,12 @@ zig build lint
 ```
 
 The test step runs unit tests, formatting verification, and Ziglint.
+
+Run the reproducible aggregate workload with:
+
+```sh
+zig build benchmark-aggregation -Doptimize=ReleaseFast
+```
+
+Its workload and Phase 5 measurements are documented in
+[`docs/aggregation-performance.md`](docs/aggregation-performance.md).

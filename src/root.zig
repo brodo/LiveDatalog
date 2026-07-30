@@ -83,6 +83,9 @@ const ValueTable = struct {
     }
 };
 
+/// A caller-owned structural term pattern. Terms returned inside an `Expr` or
+/// `Clause` are released with `Jatalog.freeExpression` or `Jatalog.freeClause`.
+/// Atom and variable IDs refer to the creating database's string table.
 pub const Term = union(enum) {
     atom: Id,
     variable: Id,
@@ -103,6 +106,8 @@ pub const Term = union(enum) {
     }
 };
 
+/// A caller-owned relational or built-in expression. Pass it to an ownership-
+/// taking rule/aggregate operation, or release it with `freeExpression`.
 pub const Expr = struct {
     predicate: Id,
     terms: []Term,
@@ -124,12 +129,17 @@ pub const Rule = struct {
     seed_argument: ?usize = null,
 };
 
+/// A caller-owned aggregate expression. Its template, output, and recursively
+/// owned body are all released when the containing `Clause` is released.
 pub const Aggregate = struct {
     template: Term,
     body: []Clause,
     output: Term,
 };
 
+/// A caller-owned goal. A clause owns the expression or aggregate in its active
+/// variant and must be released with `Jatalog.freeClause` unless ownership is
+/// transferred successfully to a rule or enclosing aggregate.
 pub const Clause = union(enum) {
     relational: Expr,
     builtin: Expr,
@@ -210,7 +220,7 @@ pub const Jatalog = struct {
         self.facts.deinit(self.allocator);
         for (self.rules.items) |rule| {
             freeExpr(self.allocator, rule.head);
-            for (rule.body) |clause| freeClause(self.allocator, clause);
+            for (rule.body) |clause| freeClauseTree(self.allocator, clause);
             self.allocator.free(rule.body);
         }
         self.rules.deinit(self.allocator);
@@ -231,6 +241,38 @@ pub const Jatalog = struct {
         freeExpr(self.allocator, value);
     }
 
+    /// Wraps an owned expression as the appropriate relational, built-in, or
+    /// negated clause. The returned clause takes over the expression's storage.
+    pub fn clauseFromExpr(self: *const Jatalog, expression: Expr) Clause {
+        return self.classifyExpr(expression);
+    }
+
+    /// Constructs `setof(template, body, output)`. Structural term strings use
+    /// the same syntax as `expr`. On success the returned clause owns every
+    /// clause in `body`; on failure ownership remains with the caller.
+    pub fn setof(
+        self: *Jatalog,
+        template: []const u8,
+        body: []const Clause,
+        output: []const u8,
+    ) !Clause {
+        const template_term = try self.parseTerm(template);
+        errdefer freeTerm(self.allocator, template_term);
+        const output_term = try self.parseTerm(output);
+        errdefer freeTerm(self.allocator, output_term);
+        const owned_body = try self.allocator.dupe(Clause, body);
+        return .{ .aggregate = .{
+            .template = template_term,
+            .body = owned_body,
+            .output = output_term,
+        } };
+    }
+
+    /// Releases a clause and all recursively owned structural terms and goals.
+    pub fn freeClause(self: *Jatalog, value: Clause) void {
+        freeClauseTree(self.allocator, value);
+    }
+
     fn makeExpr(self: *Jatalog, predicate: []const u8, terms: []const []const u8, negated: bool) !Expr {
         const predicate_id = try self.strings.intern(normalizeOperator(predicate));
         const result_terms = try self.allocator.alloc(Term, terms.len);
@@ -247,6 +289,15 @@ pub const Jatalog = struct {
             if (parser.index != source.len) return Error.InvalidSyntax;
         }
         return .{ .predicate = predicate_id, .terms = result_terms, .negated = negated };
+    }
+
+    fn parseTerm(self: *Jatalog, source: []const u8) !Term {
+        var parser: Parser = .{ .jatalog = self, .source = source };
+        const result = try parser.parseTerm();
+        errdefer freeTerm(self.allocator, result);
+        parser.skipSpace();
+        if (parser.index != source.len) return Error.InvalidSyntax;
+        return result;
     }
 
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const []const u8) !void {
@@ -276,7 +327,10 @@ pub const Jatalog = struct {
         try self.addRuleClauses(head, clauses);
     }
 
-    fn addRuleClauses(self: *Jatalog, head: Expr, body: []Clause) !void {
+    /// Adds a rule whose body may contain aggregate clauses. On success the
+    /// database owns `head` and every clause in `body`; on failure the caller
+    /// retains ownership. The body slice itself is only borrowed.
+    pub fn addRuleClauses(self: *Jatalog, head: Expr, body: []const Clause) !void {
         const seed_argument = try self.validateRule(head, body);
         const owned_body = try self.orderClauses(body);
         errdefer self.allocator.free(owned_body);
@@ -315,7 +369,10 @@ pub const Jatalog = struct {
         return result;
     }
 
-    fn queryClauses(self: *Jatalog, goals: []const Clause) !QueryResult {
+    /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
+    /// their structural terms remain caller-owned and may be freed immediately
+    /// after this function returns.
+    pub fn queryClauses(self: *Jatalog, goals: []const Clause) !QueryResult {
         if (goals.len == 0) return Error.InvalidQuery;
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
@@ -1164,12 +1221,12 @@ fn freeExpr(allocator: std.mem.Allocator, value: Expr) void {
     allocator.free(value.terms);
 }
 
-fn freeClause(allocator: std.mem.Allocator, clause: Clause) void {
+fn freeClauseTree(allocator: std.mem.Allocator, clause: Clause) void {
     switch (clause) {
         .relational, .builtin, .negated => |expression| freeExpr(allocator, expression),
         .aggregate => |aggregate| {
             freeTerm(allocator, aggregate.template);
-            for (aggregate.body) |body_clause| freeClause(allocator, body_clause);
+            for (aggregate.body) |body_clause| freeClauseTree(allocator, body_clause);
             allocator.free(aggregate.body);
             freeTerm(allocator, aggregate.output);
         },
@@ -1346,7 +1403,7 @@ const Parser = struct {
     fn executeStatement(self: *Parser) !ExecutionResult {
         const first = try self.parseClause();
         var first_owned = true;
-        errdefer if (first_owned) freeClause(self.jatalog.allocator, first);
+        errdefer if (first_owned) freeClauseTree(self.jatalog.allocator, first);
         self.skipSpace();
         if (self.consume(":-")) {
             const head = switch (first) {
@@ -1355,11 +1412,11 @@ const Parser = struct {
             };
             var body: std.ArrayList(Clause) = .empty;
             defer body.deinit(self.jatalog.allocator);
-            errdefer for (body.items) |clause| freeClause(self.jatalog.allocator, clause);
+            errdefer for (body.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
             while (true) {
                 const clause = try self.parseClause();
                 body.append(self.jatalog.allocator, clause) catch |err| {
-                    freeClause(self.jatalog.allocator, clause);
+                    freeClauseTree(self.jatalog.allocator, clause);
                     return err;
                 };
                 self.skipSpace();
@@ -1377,14 +1434,14 @@ const Parser = struct {
                 else => return Error.InvalidFact,
             };
             try self.jatalog.addFactExpr(fact);
-            freeClause(self.jatalog.allocator, first);
+            freeClauseTree(self.jatalog.allocator, first);
             first_owned = false;
             return .none;
         }
 
         var goals: std.ArrayList(Clause) = .empty;
         defer {
-            for (goals.items) |clause| freeClause(self.jatalog.allocator, clause);
+            for (goals.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
             goals.deinit(self.jatalog.allocator);
         }
         try goals.append(self.jatalog.allocator, first);
@@ -1392,7 +1449,7 @@ const Parser = struct {
         while (self.consume(",")) {
             const goal = try self.parseClause();
             goals.append(self.jatalog.allocator, goal) catch |err| {
-                freeClause(self.jatalog.allocator, goal);
+                freeClauseTree(self.jatalog.allocator, goal);
                 return err;
             };
         }
@@ -1419,14 +1476,14 @@ const Parser = struct {
 
         var body: std.ArrayList(Clause) = .empty;
         errdefer {
-            for (body.items) |clause| freeClause(self.jatalog.allocator, clause);
+            for (body.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
             body.deinit(self.jatalog.allocator);
         }
         if (self.consume("(")) {
             while (true) {
                 const clause = try self.parseClause();
                 body.append(self.jatalog.allocator, clause) catch |err| {
-                    freeClause(self.jatalog.allocator, clause);
+                    freeClauseTree(self.jatalog.allocator, clause);
                     return err;
                 };
                 if (self.consume(")")) break;
@@ -1435,7 +1492,7 @@ const Parser = struct {
         } else {
             const clause = try self.parseClause();
             body.append(self.jatalog.allocator, clause) catch |err| {
-                freeClause(self.jatalog.allocator, clause);
+                freeClauseTree(self.jatalog.allocator, clause);
                 return err;
             };
         }
@@ -2161,4 +2218,112 @@ test "structurally growing recursion is not admissible" {
     try std.testing.expectError(Error.NotAdmissible, db.execute(
         \\q([X]) :- q(X).
     ));
+}
+
+test "embedding API constructs structural aggregate rules and queries" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try db.addFact("person", &.{"alice"});
+    try db.addFact("person", &.{"bob"});
+    try db.addFact("parent", &.{ "alice", "bob" });
+
+    const parent = try db.expr("parent", &.{ "X", "Y" });
+    const children = try db.setof("Y", &.{db.clauseFromExpr(parent)}, "S");
+    var children_owned = true;
+    defer if (children_owned) db.freeClause(children);
+
+    const person = try db.expr("person", &.{"X"});
+    var person_owned = true;
+    defer if (person_owned) db.freeExpression(person);
+    const head = try db.expr("children", &.{ "X", "S" });
+    var head_owned = true;
+    defer if (head_owned) db.freeExpression(head);
+    try db.addRuleClauses(head, &.{ db.clauseFromExpr(person), children });
+    head_owned = false;
+    person_owned = false;
+    children_owned = false;
+
+    const query_expression = try db.expr("children", &.{ "X", "S" });
+    const query_clause = db.clauseFromExpr(query_expression);
+    defer db.freeClause(query_clause);
+    var result = try db.queryClauses(&.{query_clause});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.answers.items.len);
+    for (result.answers.items) |*answer| {
+        const person_name = answer.get(&db, "X").?;
+        if (std.mem.eql(u8, person_name, "alice")) {
+            try expectBindingValue(&db, answer, "S", "[bob]");
+        } else {
+            try std.testing.expectEqualStrings("bob", person_name);
+            try expectBindingValue(&db, answer, "S", "[]");
+        }
+    }
+}
+
+fn embeddedAggregateAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try db.addFact("item", &.{"b"});
+    try db.addFact("item", &.{"a"});
+
+    const item = try db.expr("item", &.{"X"});
+    var item_owned = true;
+    defer if (item_owned) db.freeExpression(item);
+    const aggregate_goal = try db.setof("[X]", &.{db.clauseFromExpr(item)}, "S");
+    item_owned = false;
+    defer db.freeClause(aggregate_goal);
+    var result = try db.queryClauses(&.{aggregate_goal});
+    defer result.deinit();
+    try expectBindingValue(&db, &result.answers.items[0], "S", "[[a], [b]]");
+}
+
+test "embedding aggregate ownership is allocation safe" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        embeddedAggregateAllocationScenario,
+        .{},
+    );
+}
+
+test "aggregate retraction is correct across the complete language tour" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\person(alice). person(bob). parent(alice, bob).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+        \\numchildren(X, N)?
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
+    result.deinit();
+
+    result = try db.execute("parent(alice, bob)~");
+    try std.testing.expect(result.changed);
+    result.deinit();
+
+    result = try db.execute("children(alice, S), numchildren(alice, N)?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[]");
+    try std.testing.expectEqualStrings("0", result.query.answers.items[0].get(&db, "N").?);
+}
+
+test "public errors distinguish each aggregation failure boundary" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("broken([a)."));
+    try std.testing.expectError(
+        Error.InvalidRule,
+        db.execute("bad(X, S) :- setof(Y, parent(X, Y), S)."),
+    );
+    try std.testing.expectError(
+        Error.NotStratified,
+        db.execute("seed(k). cycle(S) :- seed(k), setof(X, cycle(X), S)."),
+    );
+    const unground = try db.expr("project", &.{"X"});
+    defer db.freeExpression(unground);
+    try std.testing.expectError(Error.UnboundVariable, db.termToValue(unground.terms[0], null));
+    try std.testing.expectError(Error.NotAdmissible, db.execute("grow([X]) :- grow(X)."));
 }

@@ -319,6 +319,29 @@ Phase 4 was completed on 2026-07-30 with these decisions:
   aggregate expression.
 - No derived aggregate state survives a base-fact retraction incorrectly.
 
+### Completed decisions
+
+Phase 5 was completed on 2026-07-30 with these decisions:
+
+- The README language tour now covers structural lists, empty-group `setof`,
+  recursive list functions, arithmetic, termination rules, error boundaries,
+  and retraction behavior. Its checked-in aggregate program is also exercised
+  through the command-line executable by the default test step.
+- The typed embedding API uses `clauseFromExpr`, `setof`, `addRuleClauses`, and
+  `queryClauses`. Aggregate clauses recursively own their template, output,
+  and body; ownership transfers only after a successful ownership-taking call,
+  while query clauses remain caller-owned.
+- `InvalidSyntax`, `InvalidRule`/`InvalidQuery`, `NotStratified`,
+  `UnboundVariable`, and `NotAdmissible` remain the distinct syntax, safety,
+  stratification, grounding, and termination errors. Numeric failures retain
+  the separate `NumericType` and `NumericOverflow` errors.
+- End-to-end tests cover the public aggregate API, CLI output, complete
+  query/retraction recomputation, and exhaustive allocation failures through
+  typed aggregate construction and evaluation.
+- `zig build benchmark-aggregation -Doptimize=ReleaseFast` is the reproducible
+  naive-evaluation workload. The initial 25-node recursive-closure aggregate
+  baseline is recorded in `docs/aggregation-performance.md` for later work.
+
 ## Deferred projects
 
 ### Incremental view maintenance

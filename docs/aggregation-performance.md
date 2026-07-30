@@ -1,0 +1,26 @@
+# Aggregation performance baseline
+
+Phase 5 records a naive-evaluation baseline for later optimization work. Run
+the workload with:
+
+```sh
+zig build benchmark-aggregation -Doptimize=ReleaseFast
+```
+
+The benchmark constructs a 25-node chain (24 base edges), computes its full
+recursive transitive closure (300 `reachable` tuples), and collects every
+`[From, To]` pair into one structural `setof` result. After one warm-up, it
+runs ten identical summary queries. Each query intentionally rebuilds all
+derived facts because persistent or incremental materialization is deferred.
+
+## 2026-07-30 baseline
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.2
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 6.332, 6.284, 6.297, 6.218, and 6.256 ms
+- median: **6.284 ms/query**
+
+This is a comparison baseline, not a cross-machine performance promise. Future
+measurements should retain the workload and warm-up behavior, report all five
+samples, and compare medians on the same host and toolchain where possible.

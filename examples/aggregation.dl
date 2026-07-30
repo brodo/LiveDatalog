@@ -1,0 +1,12 @@
+% Structural lists, set aggregation, and an ordinary recursive list function.
+person(alice).
+person(bob).
+parent(alice, bob).
+
+children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+
+length([], 0).
+length(H!T, N) :- length(T, M), N = M + 1.
+
+numchildren(X, N) :- children(X, S), length(S, N).
+numchildren(X, N)?
