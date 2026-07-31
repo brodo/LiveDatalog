@@ -353,6 +353,10 @@ Phase 5 was completed on 2026-07-30 with these decisions:
 
 ## Deferred projects
 
+The implementation roadmap for all deferred work is now maintained in
+[`deferred-projects-plan.md`](deferred-projects-plan.md). The summaries below
+explain why each item was separated from the completed Chapter 3 milestone.
+
 ### Incremental view maintenance
 
 Chapter 5 requires persistent materialized derived relations, delta rules,

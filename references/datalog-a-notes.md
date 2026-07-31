@@ -99,6 +99,36 @@ Chapter 5 therefore requires a separate persistent-view and delta-maintenance
 design; it is not necessary for a correct first implementation of the Chapter
 3 semantics.
 
+## Query folding
+
+Chapter 6 defines query folding as finding a query plan over supplied views
+that is equivalent to a query, or otherwise maximally contained in it. The
+ordinary Inverse Method reconstructs view-body relations with inverse rules;
+variables omitted from a view head become Skolem terms parameterized by the
+head. The resulting rules can feed recursive query definitions. (Sections
+6.1–6.2, pp. 39–41.)
+
+`InverseAgg` extends inversion to conjunctive `setof` views. It first rewrites
+multiple or nested aggregates so generated rules contain a single unnested
+aggregate, then inverts outer and inner relations and uses list membership to
+recover facts represented by an aggregate output. Aggregate output omitted
+from a view head is represented internally by a Skolem set. (Sections
+6.3–6.3.2 and Algorithms 6.1–6.2, pp. 41–45.)
+
+The unrestricted transformation is not sound: the dissertation gives a query
+whose folded plan is not even contained in the original query. It proves
+maximal containment only for restricted monotonic DatalogA queries, or when
+canonical aggregate views are supplied for relations used inside aggregates
+and negation. An implementation must therefore reject unsupported folding
+problems rather than assume that every generated plan is valid. (Section 6.4,
+Definitions 6.4.1–6.4.3 and Theorems 6.4.1–6.4.2, pp. 45–51.)
+
+Arbitrary recursive list functions in view definitions can make inverse plans
+non-terminating. The dissertation sketches a restricted extension when query
+list functions are identical to, or conjunctive views over, functions exposed
+by the supplied views. It uses auxiliary aggregate views and functional-
+dependency chase rules to equate Skolem sets. (Section 6.5, pp. 51–57.)
+
 ## Consequences for LiveDatalog
 
 - Flat interned scalar terms are insufficient; unification and bindings must
