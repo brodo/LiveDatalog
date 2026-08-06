@@ -2,13 +2,14 @@
 
 ## Goal
 
-Continue from the completed five-phase DatalogA implementation with three
+Continue from the completed five-phase DatalogA implementation with four
 related projects:
 
-1. an indexed evaluation foundation;
-2. persistent and incremental view maintenance based on Chapter 5 of
+1. first-class finite `f64` scalars;
+2. an indexed evaluation foundation;
+3. persistent and incremental view maintenance based on Chapter 5 of
    Mohapatra's dissertation;
-3. query folding based on the `InverseAgg` work in Chapter 6.
+4. query folding based on the `InverseAgg` work in Chapter 6.
 
 The projects share storage and rule-analysis infrastructure, but they have
 different correctness contracts. Incremental maintenance must produce exactly
@@ -31,9 +32,15 @@ The plan assumes the implementation present after aggregation Phase 5:
   derivation counts.
 - Retraction deletes matching base facts; the next query obtains correct
   derived results by rebuilding them from scratch.
-- Structural values are canonical inside `ValueTable`. Query evaluation uses a
-  temporary value scope so query-only values do not permanently grow the
-  database.
+- Atoms and exact signed 64-bit integers are canonical scalars. Bare decimal
+  and exponent-shaped literals are reserved with `NumericType` until the
+  floating-point project below lands.
+- Structural values are canonical inside `ValueTable`. Queries and retractions
+  use transactional staging so query-only scalars, symbols, and structures do
+  not permanently grow the database.
+- Typed input uses borrowed `input.Term` and `input.Goal` descriptors. Query
+  results own their names, scalars, and reachable structures independently of
+  the originating database.
 - The aggregate benchmark records the cost of this intentionally naive model
   in [`aggregation-performance.md`](aggregation-performance.md).
 
@@ -43,14 +50,17 @@ oracle throughout the deferred work.
 ## Project ordering
 
 ```text
-P1 indexed relation store
- ├─> P2 semi-naive evaluation
- │    └─> M1 persistent materialization
- │         ├─> M2 insertion deltas
- │         ├─> M3 deletion and negation maintenance
- │         └─> M4–M6 aggregate maintenance
- └─> F1–F5 query folding
-      └─> F6 planner/materialization integration
+S1 finite-f64 policy and syntax
+ └─> S2 canonical numeric semantics
+      └─> S3 embedding, results, and migration
+           └─> P1 indexed relation store
+                ├─> P2 semi-naive evaluation
+                │    └─> M1 persistent materialization
+                │         ├─> M2 insertion deltas
+                │         ├─> M3 deletion and negation maintenance
+                │         └─> M4–M6 aggregate maintenance
+                └─> F1–F5 query folding
+                     └─> F6 planner/materialization integration
 ```
 
 Query-folding transformations can be developed independently after P1, but
@@ -75,6 +85,110 @@ project is stable.
    status explicit.
 7. Differential tests compare optimized results with a fresh database rebuilt
    from the same base facts and rules after every update batch.
+
+# Project S: first-class finite `f64` scalars
+
+This project extends the scalar policy established by first-class integers.
+It must remain local to the scalar and input-compilation layers: structural
+terms continue to contain one opaque scalar identity, and callers never observe
+representation-specific scalar IDs.
+
+## S1: finite-value policy, syntax, and formatting
+
+### Scope
+
+- Record an ADR fixing the public behavior for NaN, infinities, overflow, and
+  underflow before implementation. The default policy is to accept finite
+  values only; typed non-finite inputs fail during compilation, and arithmetic
+  that produces a non-finite result reports a numeric error.
+- Parse the already-reserved decimal and exponent forms as `f64` without
+  changing quoted values: `'1.0'` remains an atom.
+- Keep integer-shaped source literals on the checked `i64` path, including
+  `NumericOverflow` immediately outside the integer limits.
+- Define a deterministic, locale-independent, round-trippable spelling for
+  non-integral floats. Values canonicalized to integers format as integers.
+- Preserve the parser-extraction boundary: numeric recognition and
+  canonicalization belong to the scalar module rather than introducing a
+  parser dependency into it.
+
+### Acceptance tests
+
+- Decimal and exponent literals cover positive, negative, subnormal, minimum
+  normal, and maximum finite values.
+- Quoted decimal and exponent text remains atom data in facts, equality,
+  structures, formatting, and `setof`.
+- Malformed numeric-looking source remains an explicit syntax or numeric error
+  according to the documented grammar; it is never silently reclassified.
+- Every formatted float parses back to the same canonical scalar identity.
+- The selected non-finite and arithmetic-overflow errors are stable public
+  behavior and allocation safe.
+
+## S2: canonical mixed numeric semantics
+
+### Scope
+
+- Extend `scalar.Store` with canonical finite `f64` values while keeping
+  `scalar.Id` opaque and leaving structural term/value variants unchanged.
+- Canonicalize every exactly representable in-range integral float to the
+  existing integer scalar. This includes both floating-point zero signs.
+- Define scalar equality numerically rather than by representation: `1`,
+  `1.0`, and `1e0` share one identity, while nearby values remain distinct.
+- Compare mixed integers and floats exactly without first converting the
+  integer to `f64`. Preserve the total ground-value order: all numbers in
+  numeric order, atoms lexically, `nil`, then cons values recursively.
+- Extend addition and subtraction so integer-only operations remain checked
+  `i64`, while an operation involving a float produces `f64` and then
+  canonicalizes an exact in-range integral result back to an integer.
+- Route unification, explicit equality, fact deduplication, arithmetic output
+  checking, structural equality, ordering, and `setof` deduplication through
+  the same canonical scalar identity.
+
+### Acceptance tests
+
+- `1`, `1.0`, `01`, and `1e0` deduplicate in facts and aggregates; quoted
+  equivalents remain distinct atoms.
+- Mixed equality and ordering are exact around `2^53`, both `i64` limits, and
+  adjacent representable floats. Total ordering reports equality exactly when
+  scalar identity is equal.
+- Numeric semantics remain correct recursively inside proper and improper
+  lists and nested aggregate templates.
+- Integer-only overflow behavior is unchanged. Mixed positive and negative
+  addition/subtraction cover binding, bound-output success and mismatch,
+  underflow, overflow, and canonical integral results.
+- Source and typed programs produce identical answers for every supported
+  mixed numeric operation.
+
+## S3: typed embedding, owned results, and migration
+
+### Scope
+
+- Add an allocation-free `input.float` descriptor helper without changing
+  list, cons, relation, or goal descriptor shapes.
+- Add `ResultValue.getFloat` and `Answer.getFloat`. Preserve distinct
+  `UnknownVariable` and `TypeMismatch` errors; integer getters never coerce
+  floats and float getters never coerce integers. An integral float
+  canonicalized to an integer is consequently retrieved with `getInteger`.
+- Copy float values into self-contained `QueryResult` storage so results remain
+  readable after database destruction.
+- Preserve strong per-operation rollback for typed input, each parsed
+  statement, queries, result construction, and retractions. Novel float query
+  literals and derived values must not grow persistent storage.
+- Update the README, language tutorial, CLI help, examples, and benchmarks to
+  describe mixed numeric identity, construction, access, formatting, and the
+  chosen finite-value policy.
+
+### Completion gate
+
+- Public-interface tests cover source and typed construction, getters,
+  structural inspection, result lifetime, query-local storage, and every
+  numeric error boundary.
+- Exhaustive allocation-failure tests prove rollback and cleanup across scalar
+  interning, input compilation, evaluation, answer copying, and result
+  construction.
+- Existing integer, aggregation, recursive-list arithmetic, retraction, and
+  CLI behavior remains green without representation-specific test access.
+- `zig build test` and the ReleaseFast aggregation workload pass, with any
+  performance change recorded.
 
 # Project P: indexed and semi-naive evaluation
 
@@ -491,21 +605,24 @@ can produce a plan that is not contained in the original query.
 
 Use one session and one commit per phase unless a phase proves too large:
 
-1. P1 relation store and indexes
-2. P2 semi-naive evaluation
-3. M1 persistent rebuild-equivalent materialization
-4. M2 insertion deltas
-5. M3 deletion and negation maintenance
-6. M4 aggregate group maintenance
-7. M5 projected views and CReaM counts
-8. M6 downstream propagation and public API
-9. P3 join planning and aggregate lookup
-10. F1 folding IR and view catalog
-11. F2 ordinary Inverse Method
-12. F3 conjunctive aggregate inversion
-13. F4 soundness restrictions
-14. F5 list functions and dependency chase
-15. F6 execution and view selection
+1. S1 finite-f64 policy, syntax, and formatting
+2. S2 canonical mixed numeric semantics
+3. S3 typed embedding, owned results, and migration
+4. P1 relation store and indexes
+5. P2 semi-naive evaluation
+6. M1 persistent rebuild-equivalent materialization
+7. M2 insertion deltas
+8. M3 deletion and negation maintenance
+9. M4 aggregate group maintenance
+10. M5 projected views and CReaM counts
+11. M6 downstream propagation and public API
+12. P3 join planning and aggregate lookup
+13. F1 folding IR and view catalog
+14. F2 ordinary Inverse Method
+15. F3 conjunctive aggregate inversion
+16. F4 soundness restrictions
+17. F5 list functions and dependency chase
+18. F6 execution and view selection
 
 P3 may move earlier if profiling shows join scans dominate M-project test runs.
 F1–F5 may run in parallel with M2–M6 in separate branches because they share
@@ -538,4 +655,3 @@ Each phase ends with:
   printable Datalog extended with internal function terms?
 - Is `maximally_contained` useful to embedders without an accompanying
   explanation of which source relations could not be reconstructed?
-
