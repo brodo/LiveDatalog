@@ -294,14 +294,19 @@ const AuxiliaryView = struct {
     }
 };
 
-fn fillOuterClauses(rule: Rule, clause_index: usize, buffer: []Clause) usize {
+/// The rule's body with the clause at `skip_index` removed: the outer goals
+/// of an aggregate rule, or the body occurrences that remain to be joined
+/// when over-deleting through one occurrence. The clauses themselves are
+/// borrowed from the rule; the caller owns only the returned slice.
+fn outerClauses(allocator: std.mem.Allocator, rule: Rule, skip_index: usize) ![]Clause {
+    const result = try allocator.alloc(Clause, rule.body.len - 1);
     var count: usize = 0;
     for (rule.body, 0..) |clause, index| {
-        if (index == clause_index) continue;
-        buffer[count] = clause;
+        if (index == skip_index) continue;
+        result[count] = clause;
         count += 1;
     }
-    return count;
+    return result;
 }
 
 /// Returns the body index of the single unnested `setof` occurrence a rule
@@ -323,12 +328,48 @@ fn maintainableAggregateIndex(rule: Rule) ?usize {
     return found;
 }
 
-fn copyFactInto(allocator: std.mem.Allocator, store: *RelationStore, fact: Fact) !void {
+/// Inserts a copy of `fact` into `store`, which takes ownership of the copied
+/// terms. The single place the database duplicates a fact between stores.
+fn copyFactInto(
+    allocator: std.mem.Allocator,
+    store: *RelationStore,
+    fact: Fact,
+    derived: bool,
+) !void {
     const terms = try allocator.dupe(ValueId, fact.terms);
-    _ = store.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
+    _ = store.insert(.{ .predicate = fact.predicate, .terms = terms }, derived) catch |err| {
         allocator.free(terms);
         return err;
     };
+}
+
+/// Appends a copy of `fact` to `list`, which takes ownership of the copied
+/// terms. The `std.ArrayList` counterpart of `copyFactInto`, used where facts
+/// are queued for later application rather than stored.
+fn appendFactCopy(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Fact),
+    fact: Fact,
+) !void {
+    const terms = try allocator.dupe(ValueId, fact.terms);
+    list.append(allocator, .{ .predicate = fact.predicate, .terms = terms }) catch |err| {
+        allocator.free(terms);
+        return err;
+    };
+}
+
+/// Collects the distinct predicate keys of `store[from..]`, the set the
+/// stratum-impact analysis tests a batch's reach against.
+fn collectPredicateKeys(
+    allocator: std.mem.Allocator,
+    store: *const RelationStore,
+    from: usize,
+    keys: *std.AutoHashMapUnmanaged(PredicateKey, void),
+) !void {
+    for (from..store.len()) |index| {
+        const fact = store.factAt(index);
+        try keys.put(allocator, .{ .name = fact.predicate, .arity = fact.terms.len }, {});
+    }
 }
 
 fn bindingsEqual(left: *const Binding, right: *const Binding) bool {
@@ -361,6 +402,30 @@ const Analysis = struct {
         self.* = undefined;
     }
 };
+
+/// Whether `rule` still derives facts while stratum `level` runs. An ordinary
+/// rule is active only in its head's own stratum, which has reached its
+/// fixpoint by the time a higher stratum starts. A seeded structural rule
+/// stays active in every stratum at or above its own, because its seed set is
+/// the growing value table rather than a completed relation.
+fn ruleActiveAt(
+    levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+    rule: Rule,
+    level: usize,
+) bool {
+    const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
+    if (rule_level == level) return true;
+    return rule.seed_argument != null and rule_level < level;
+}
+
+/// The stratum a rule's head belongs to, ignoring the cross-stratum reach of
+/// seeded rules that `ruleActiveAt` grants.
+fn ruleStratum(
+    levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+    rule: Rule,
+) usize {
+    return levels.get(predicateKey(rule.head)) orelse 0;
+}
 
 const Aggregate = struct {
     template: Term,
@@ -800,7 +865,7 @@ pub const Jatalog = struct {
             index -= 1;
             const fact = committed.facts.factAt(index);
             if (try staging.facts.contains(fact)) continue;
-            try copyFactInto(committed.allocator, &removed, fact);
+            try copyFactInto(committed.allocator, &removed, fact, false);
             committed.facts.removeAt(index);
         }
         const delta = removed.len();
@@ -815,7 +880,7 @@ pub const Jatalog = struct {
             var touched: RelationStore = .init(committed.allocator);
             defer touched.deinit();
             for (0..removed.len()) |position|
-                try copyFactInto(committed.allocator, &touched, removed.factAt(position));
+                try copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
             if (touched.len() > 0) try committed.maintainAggregates(&touched);
             committed.noteMaintenanceWork(delta, committed.work - work_before);
         } else {
@@ -1040,11 +1105,7 @@ pub const Jatalog = struct {
             if (try self.facts.removeFact(fact)) {
                 changed = true;
                 if (maintain) {
-                    const copy = try self.allocator.dupe(ValueId, terms);
-                    _ = removed.insert(.{ .predicate = fact.predicate, .terms = copy }, false) catch |err| {
-                        self.allocator.free(copy);
-                        return err;
-                    };
+                    try copyFactInto(self.allocator, &removed, fact, false);
                 } else {
                     try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
                 }
@@ -1054,7 +1115,7 @@ pub const Jatalog = struct {
         defer touched.deinit();
         if (maintain and removed.len() > 0) {
             try self.propagateDeletions(&removed);
-            for (0..removed.len()) |index| try copyFactInto(self.allocator, &touched, removed.factAt(index));
+            for (0..removed.len()) |index| try copyFactInto(self.allocator, &touched, removed.factAt(index), false);
         }
 
         // Insertions follow the same decision as deletions; the closure
@@ -1070,7 +1131,7 @@ pub const Jatalog = struct {
             try self.propagateInsertions(batch_start);
             if (self.materialization == .clean) {
                 for (batch_start..self.closure.?.len()) |index|
-                    try copyFactInto(self.allocator, &touched, self.closure.?.factAt(index));
+                    try copyFactInto(self.allocator, &touched, self.closure.?.factAt(index), false);
             }
         }
         if (touched.len() > 0) try self.maintainAggregates(&touched);
@@ -1089,7 +1150,7 @@ pub const Jatalog = struct {
         const max_level = analysis.max_level;
         var level: usize = 0;
         while (level <= max_level) : (level += 1) {
-            if (try self.propagationBlocked(level, batch_start)) {
+            if (try self.strataBlockedBy(level, &self.closure.?, batch_start)) {
                 self.rebuild_fallbacks += 1;
                 self.markDirty(level);
                 try self.ensureMaterialized();
@@ -1100,29 +1161,20 @@ pub const Jatalog = struct {
         self.propagated_facts += self.closure.?.len() - start_len;
     }
 
-    /// A stratum blocks incremental propagation when one of its rules reads
-    /// a predicate that gained facts during this batch through negation or
-    /// through an aggregate this phase cannot maintain.
-    fn propagationBlocked(self: *Jatalog, level: usize, batch_start: usize) !bool {
-        const closure = &self.closure.?;
-        var grown: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
-        defer grown.deinit(self.allocator);
-        for (batch_start..closure.len()) |index| {
-            const fact = closure.factAt(index);
-            try grown.put(self.allocator, .{
-                .name = fact.predicate,
-                .arity = fact.terms.len,
-            }, {});
-        }
-        return self.strataBlockedBy(level, &grown);
-    }
-
+    /// Whether stratum `level` must be rebuilt rather than maintained because
+    /// the facts in `changed[from..]` reach one of its rules through negation
+    /// or through an aggregate this phase cannot maintain. Insertions pass the
+    /// closure from the batch's start, deletions the whole deleted set.
     fn strataBlockedBy(
         self: *Jatalog,
         level: usize,
-        changed: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+        changed: *const RelationStore,
+        from: usize,
     ) !bool {
-        return try self.stratumImpact(level, changed) == .rebuild;
+        var keys: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+        defer keys.deinit(self.allocator);
+        try collectPredicateKeys(self.allocator, changed, from, &keys);
+        return try self.stratumImpact(level, &keys) == .rebuild;
     }
 
     /// Classifies how a batch's changed predicates affect one stratum:
@@ -1139,8 +1191,7 @@ pub const Jatalog = struct {
         const analysis = try self.ensureAnalysis();
         var impact: StratumImpact = .none;
         for (self.rules.items) |rule| {
-            const rule_level = analysis.strata.get(predicateKey(rule.head)) orelse 0;
-            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            if (!ruleActiveAt(&analysis.strata, rule, level)) continue;
             for (rule.body) |clause| switch (clause) {
                 .negated => |expression| if (changed.contains(predicateKey(expression))) return .rebuild,
                 .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, changed)) {
@@ -1180,13 +1231,7 @@ pub const Jatalog = struct {
             }
             var changed: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
             defer changed.deinit(self.allocator);
-            for (0..touched.len()) |index| {
-                const fact = touched.factAt(index);
-                try changed.put(self.allocator, .{
-                    .name = fact.predicate,
-                    .arity = fact.terms.len,
-                }, {});
-            }
+            try collectPredicateKeys(self.allocator, touched, 0, &changed);
             for (self.rules.items) |rule| {
                 const clause_index = maintainableAggregateIndex(rule) orelse continue;
                 // A projected view also reacts to outer-goal changes, which
@@ -1203,36 +1248,20 @@ pub const Jatalog = struct {
             touched.clear();
             if (removals.len() > 0) {
                 try self.propagateDeletions(&removals);
-                for (0..removals.len()) |index| {
-                    const fact = removals.factAt(index);
-                    const terms = try self.allocator.dupe(ValueId, fact.terms);
-                    _ = touched.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
-                        self.allocator.free(terms);
-                        return err;
-                    };
-                }
+                for (0..removals.len()) |index|
+                    try copyFactInto(self.allocator, touched, removals.factAt(index), false);
             }
             if (self.materialization != .clean) return;
             const batch_start = self.closure.?.len();
             for (additions.items) |fact| {
                 if (try self.closure.?.contains(fact)) continue;
-                const terms = try self.allocator.dupe(ValueId, fact.terms);
-                _ = self.closure.?.insert(.{ .predicate = fact.predicate, .terms = terms }, true) catch |err| {
-                    self.allocator.free(terms);
-                    return err;
-                };
+                try copyFactInto(self.allocator, &self.closure.?, fact, true);
             }
             if (self.closure.?.len() > batch_start) {
                 try self.propagateInsertions(batch_start);
                 if (self.materialization != .clean) return;
-                for (batch_start..self.closure.?.len()) |index| {
-                    const fact = self.closure.?.factAt(index);
-                    const terms = try self.allocator.dupe(ValueId, fact.terms);
-                    _ = touched.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
-                        self.allocator.free(terms);
-                        return err;
-                    };
-                }
+                for (batch_start..self.closure.?.len()) |index|
+                    try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
             }
         }
     }
@@ -1246,15 +1275,14 @@ pub const Jatalog = struct {
         additions: *std.ArrayList(Fact),
     ) !void {
         const aggregate = rule.body[clause_index].aggregate;
-        const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
+        const outer = try outerClauses(self.allocator, rule, clause_index);
         defer self.allocator.free(outer);
-        const outer_count = fillOuterClauses(rule, clause_index, outer);
 
         // Only variables the outer goals or the head can constrain identify a
         // group; variables local to the aggregate body must stay free.
         var scope: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer scope.deinit(self.allocator);
-        for (outer[0..outer_count]) |clause|
+        for (outer) |clause|
             try collectClauseSurfaceVariables(self.allocator, clause, &scope);
         for (rule.head.terms) |term| try collectTermVariables(self.allocator, term, &scope);
 
@@ -1269,7 +1297,7 @@ pub const Jatalog = struct {
         const view = self.auxiliaryFor(rule.id);
         for (0..touched.len()) |index| {
             const fact = touched.factAt(index);
-            for ([_][]const Clause{ aggregate.body, outer[0..outer_count] }) |clauses| {
+            for ([_][]const Clause{ aggregate.body, outer }) |clauses| {
                 for (clauses) |candidate| {
                     const expression = switch (candidate) {
                         .relational => |value| value,
@@ -1286,7 +1314,7 @@ pub const Jatalog = struct {
                         if (scope.contains(variable))
                             try restricted.values.put(self.allocator, variable, value);
                     }
-                    try self.collectAggregateGroups(outer[0..outer_count], &restricted, &groups);
+                    try self.collectAggregateGroups(outer, &restricted, &groups);
                 }
             }
         }
@@ -1351,14 +1379,7 @@ pub const Jatalog = struct {
                 defer owner.deinit(self.allocator);
                 if (!try self.unify(head, rule.head, &owner)) continue;
                 if (try derived.contains(head)) continue;
-                const terms = try self.allocator.dupe(ValueId, tuple.terms);
-                stale.append(self.allocator, .{
-                    .predicate = view.rule_id,
-                    .terms = terms,
-                }) catch |err| {
-                    self.allocator.free(terms);
-                    return err;
-                };
+                try appendFactCopy(self.allocator, &stale, tuple);
             }
         }
         for (stale.items) |tuple| {
@@ -1381,16 +1402,8 @@ pub const Jatalog = struct {
                 self.allocator.free(terms);
                 return err;
             };
-            if (before == 0 and !try self.closure.?.contains(head)) {
-                const copy = try self.allocator.dupe(ValueId, head.terms);
-                additions.append(self.allocator, .{
-                    .predicate = head.predicate,
-                    .terms = copy,
-                }) catch |err| {
-                    self.allocator.free(copy);
-                    return err;
-                };
-            }
+            if (before == 0 and !try self.closure.?.contains(head))
+                try appendFactCopy(self.allocator, additions, head);
         }
     }
 
@@ -1408,13 +1421,12 @@ pub const Jatalog = struct {
         touched: *RelationStore,
         removals: *RelationStore,
     ) !void {
-        const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
+        const outer = try outerClauses(self.allocator, rule, clause_index);
         defer self.allocator.free(outer);
-        const outer_count = fillOuterClauses(rule, clause_index, outer);
 
         var candidates: RelationStore = .init(self.allocator);
         defer candidates.deinit();
-        try self.collectSweepCandidates(rule, view, outer[0..outer_count], touched, &candidates);
+        try self.collectSweepCandidates(rule, view, outer, touched, &candidates);
 
         for (0..candidates.len()) |index| {
             const tuple = candidates.factAt(index);
@@ -1435,7 +1447,7 @@ pub const Jatalog = struct {
                 solutions.deinit(self.allocator);
             }
             self.matchClauses(
-                outer[0..outer_count],
+                outer,
                 &self.closure.?,
                 0,
                 &seed,
@@ -1499,7 +1511,7 @@ pub const Jatalog = struct {
                 for (try view.tuples.lookup(view.key(), mask, bound[0..count])) |candidate| {
                     const tuple = view.tuples.factAt(candidate);
                     if (try candidates.contains(tuple)) continue;
-                    try copyFactInto(self.allocator, candidates, tuple);
+                    try copyFactInto(self.allocator, candidates, tuple, false);
                 }
             }
         }
@@ -1514,11 +1526,7 @@ pub const Jatalog = struct {
         const fact: Fact = .{ .predicate = rule.head.predicate, .terms = @constCast(head) };
         if (!try self.closure.?.contains(fact)) return;
         if (try removals.contains(fact)) return;
-        const terms = try self.allocator.dupe(ValueId, head);
-        _ = removals.insert(.{ .predicate = rule.head.predicate, .terms = terms }, true) catch |err| {
-            self.allocator.free(terms);
-            return err;
-        };
+        try copyFactInto(self.allocator, removals, fact, true);
     }
 
     fn deriveGroupHeads(
@@ -1614,24 +1622,13 @@ pub const Jatalog = struct {
             if (!try self.unify(stored, rule.head, &matched)) continue;
             if (try derived.contains(stored)) continue;
             if (try removals.contains(stored)) continue;
-            const terms = try self.allocator.dupe(ValueId, stored.terms);
-            _ = removals.insert(.{ .predicate = stored.predicate, .terms = terms }, true) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
+            try copyFactInto(self.allocator, removals, stored, true);
         }
 
         for (0..derived.len()) |index| {
             const fact = derived.factAt(index);
             if (try self.closure.?.contains(fact)) continue;
-            const terms = try self.allocator.dupe(ValueId, fact.terms);
-            additions.append(self.allocator, .{
-                .predicate = fact.predicate,
-                .terms = terms,
-            }) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
+            try appendFactCopy(self.allocator, additions, fact);
         }
     }
 
@@ -1644,6 +1641,13 @@ pub const Jatalog = struct {
     /// after their base support disappears. A stratum whose negated or
     /// aggregated dependencies lost facts is invalidated and recomputed
     /// through the dirty-stratum rebuild instead.
+    ///
+    /// Note: `overdeleteLevel` selects a stratum's rules by head stratum
+    /// alone, while `propagateLevel` and `expandLevel` also keep seeded
+    /// structural rules active in higher strata. Whether over-deletion needs
+    /// the same cross-stratum reach is unresolved; no test currently
+    /// distinguishes the two, and shadow verification has not caught a
+    /// disagreement.
     fn propagateDeletions(self: *Jatalog, deleted: *RelationStore) !void {
         var old_closure = try self.closure.?.clone();
         defer old_closure.deinit();
@@ -1653,7 +1657,7 @@ pub const Jatalog = struct {
         const analysis = try self.ensureAnalysis();
         var level: usize = 0;
         while (level <= analysis.max_level) : (level += 1) {
-            if (try self.deletionBlocked(level, deleted)) {
+            if (try self.strataBlockedBy(level, deleted, 0)) {
                 self.rebuild_fallbacks += 1;
                 self.markDirty(level);
                 try self.ensureMaterialized();
@@ -1665,24 +1669,16 @@ pub const Jatalog = struct {
         self.removed_facts += deleted.len();
     }
 
-    fn deletionBlocked(self: *Jatalog, level: usize, deleted: *const RelationStore) !bool {
-        var shrunk: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
-        defer shrunk.deinit(self.allocator);
-        for (0..deleted.len()) |index| {
-            const fact = deleted.factAt(index);
-            try shrunk.put(self.allocator, .{
-                .name = fact.predicate,
-                .arity = fact.terms.len,
-            }, {});
-        }
-        return self.strataBlockedBy(level, &shrunk);
-    }
-
     /// Over-deletes stratum `level`: every fact derivable by one of the
     /// stratum's rules from at least one already-deleted fact is removed
     /// from the closure and queued for rederivation. The remaining body
     /// occurrences join against the pre-deletion snapshot so derivations
     /// that used several deleted facts are still found.
+    ///
+    /// Unlike the propagation and expansion phases this selects rules by
+    /// `ruleStratum` rather than `ruleActiveAt`, so a seeded structural rule
+    /// is over-deleted only in its own stratum and not in the higher strata
+    /// it stays active in. See the note in `propagateDeletions`.
     fn overdeleteLevel(
         self: *Jatalog,
         old_closure: *RelationStore,
@@ -1694,7 +1690,7 @@ pub const Jatalog = struct {
         while (cursor < deleted.len()) : (cursor += 1) {
             const victim = deleted.factAt(cursor);
             for (self.rules.items) |rule| {
-                if ((levels.get(predicateKey(rule.head)) orelse 0) != level) continue;
+                if (ruleStratum(levels, rule) != level) continue;
                 for (rule.body, 0..) |clause, clause_index| {
                     const expression = switch (clause) {
                         .relational => |value| value,
@@ -1726,14 +1722,8 @@ pub const Jatalog = struct {
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
         if (!try self.unify(victim, expression, &initial)) return;
-        const rest = try self.allocator.alloc(Clause, rule.body.len - 1);
+        const rest = try outerClauses(self.allocator, rule, clause_index);
         defer self.allocator.free(rest);
-        var count: usize = 0;
-        for (rule.body, 0..) |clause, index| {
-            if (index == clause_index) continue;
-            rest[count] = clause;
-            count += 1;
-        }
         var answers: std.ArrayList(Binding) = .empty;
         defer {
             for (answers.items) |*answer| answer.deinit(self.allocator);
@@ -1781,14 +1771,7 @@ pub const Jatalog = struct {
                     index += 1;
                     continue;
                 }
-                const terms = try self.allocator.dupe(ValueId, candidate.terms);
-                _ = self.closure.?.insert(.{
-                    .predicate = candidate.predicate,
-                    .terms = terms,
-                }, true) catch |err| {
-                    self.allocator.free(terms);
-                    return err;
-                };
+                try copyFactInto(self.allocator, &self.closure.?, candidate, true);
                 deleted.removeAt(index);
                 progress = true;
             }
@@ -1845,8 +1828,7 @@ pub const Jatalog = struct {
             active.deinit(self.allocator);
         }
         for (self.rules.items) |rule| {
-            const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
-            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            if (!ruleActiveAt(levels, rule, level)) continue;
             var occurrences: std.ArrayList(usize) = .empty;
             errdefer occurrences.deinit(self.allocator);
             if (rule.seed_argument == null) {
@@ -1978,11 +1960,7 @@ pub const Jatalog = struct {
         terms_owned = false;
         if (!added) return false;
         if (propagate) {
-            const copy = try self.allocator.dupe(ValueId, terms);
-            _ = self.closure.?.insert(.{ .predicate = fact.predicate, .terms = copy }, false) catch |err| {
-                self.allocator.free(copy);
-                return err;
-            };
+            try copyFactInto(self.allocator, &self.closure.?, fact, false);
         } else {
             try self.markBaseChanged(key);
         }
@@ -2213,12 +2191,11 @@ pub const Jatalog = struct {
     /// retains every outer variable, so each head tuple already belongs to
     /// exactly one group and no auxiliary view is needed.
     fn projectedVariables(self: *Jatalog, rule: Rule, clause_index: usize) ![]Id {
-        const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
+        const outer = try outerClauses(self.allocator, rule, clause_index);
         defer self.allocator.free(outer);
-        const outer_count = fillOuterClauses(rule, clause_index, outer);
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
-        for (outer[0..outer_count]) |clause|
+        for (outer) |clause|
             try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
         var head_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer head_variables.deinit(self.allocator);
@@ -2252,9 +2229,8 @@ pub const Jatalog = struct {
         projected_owned = false;
         errdefer view.deinit(self.allocator);
 
-        const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
+        const outer = try outerClauses(self.allocator, rule, clause_index);
         defer self.allocator.free(outer);
-        const outer_count = fillOuterClauses(rule, clause_index, outer);
         var groups: std.ArrayList(Binding) = .empty;
         defer {
             for (groups.items) |*group| group.deinit(self.allocator);
@@ -2263,7 +2239,7 @@ pub const Jatalog = struct {
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
         self.matchClauses(
-            outer[0..outer_count],
+            outer,
             &self.closure.?,
             0,
             &initial,
@@ -2432,11 +2408,7 @@ pub const Jatalog = struct {
                     const fact = old.factAt(index);
                     const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
                     if ((analysis.strata.get(key) orelse 0) >= from_level) continue;
-                    const terms = try self.allocator.dupe(ValueId, fact.terms);
-                    _ = closure.insert(.{ .predicate = fact.predicate, .terms = terms }, true) catch |err| {
-                        self.allocator.free(terms);
-                        return err;
-                    };
+                    try copyFactInto(self.allocator, &closure, fact, true);
                 }
             }
         }
@@ -2468,8 +2440,7 @@ pub const Jatalog = struct {
                 const fact_count_before = facts.len();
                 const value_count_before = self.values.values.items.len;
                 for (self.rules.items) |rule| {
-                    const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
-                    if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+                    if (!ruleActiveAt(&levels, rule, level)) continue;
                     try self.applyRule(facts, rule, null);
                 }
                 if (facts.len() == fact_count_before and
@@ -2505,14 +2476,12 @@ pub const Jatalog = struct {
         var growing: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
         defer growing.deinit(self.allocator);
         for (self.rules.items) |rule| {
-            const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
-            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            if (!ruleActiveAt(levels, rule, level)) continue;
             if (rule.seed_argument != null)
                 try growing.put(self.allocator, predicateKey(rule.head), {});
         }
         for (self.rules.items) |rule| {
-            const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
-            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            if (!ruleActiveAt(levels, rule, level)) continue;
             var occurrences: std.ArrayList(usize) = .empty;
             errdefer occurrences.deinit(self.allocator);
             if (rule.seed_argument == null) {
