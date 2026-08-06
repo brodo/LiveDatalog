@@ -557,6 +557,38 @@ M2 was completed on 2026-08-06 with these decisions:
 Stop when ordinary Datalog and stratified negation are incrementally correct.
 Aggregate strata may still rebuild.
 
+### Completed decisions
+
+M3 was completed on 2026-08-06 with these decisions:
+
+- `applyChanges` treats a batch as one transition by running deletions as
+  phase A (delete-and-rederive) and insertions as phase B (the M2 delta
+  engine). Sequencing keeps phase B's append-only index-range deltas valid,
+  and a fact deleted then re-inserted in one batch is simply rederived by
+  phase B — the final state always equals a clean rebuild.
+- Over-deletion pins each deleted fact at every matching body occurrence
+  and joins the remaining clauses against a snapshot of the pre-deletion
+  closure, so derivations that consumed several deleted facts are still
+  found. Rederivation unifies each over-deleted fact with matching rule
+  heads and evaluates bodies against the reduced closure, repeating until
+  chains of rederivations settle. Reference counts are deliberately not
+  used to skip over-deletion: support counters remain approximate
+  bookkeeping, and cyclic derivations require the over-delete/rederive
+  discipline anyway.
+- Both phases are per-stratum with the same fallback: a stratum whose rules
+  read a shrunk (or grown) predicate through negation or inside a `setof`
+  body is invalidated and recomputed via the dirty-stratum rebuild, with
+  maintained strata below it retained. Anti-join negation deltas remain
+  future work as planned.
+- The pinned-occurrence join needs no evaluator changes: matching uses the
+  rule body with the pinned clause removed and its bindings pre-applied,
+  which is safe because clause-order validation only requires binders to
+  precede consumers. Numeric errors during pinned matching are swallowed
+  exactly as in seeded rule application.
+- A `removed_facts` counter mirrors `propagated_facts` for instrumentation,
+  and a 40-batch random mixed-update trace over a program with recursion,
+  negation, and aggregation matches a clean rebuild after every batch.
+
 ## M4: materialized aggregate groups
 
 ### Scope

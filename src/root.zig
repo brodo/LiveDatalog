@@ -523,6 +523,9 @@ pub const Jatalog = struct {
     /// Counts facts added to the closure by incremental batch propagation,
     /// distinguishing incrementally added facts from rebuilt facts.
     propagated_facts: usize = 0,
+    /// Counts facts removed from the closure by incremental
+    /// delete-and-rederive, net of rederived facts.
+    removed_facts: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -571,6 +574,7 @@ pub const Jatalog = struct {
         result.materialization = self.materialization;
         result.expansions = self.expansions;
         result.propagated_facts = self.propagated_facts;
+        result.removed_facts = self.removed_facts;
         errdefer {
             for (result.rules.items) |rule| freeRule(self.allocator, rule);
             result.rules.deinit(self.allocator);
@@ -688,6 +692,9 @@ pub const Jatalog = struct {
         deletions: []const input.Relation,
     ) !bool {
         var changed = false;
+        const maintain = self.closure != null and self.materialization == .clean;
+        var removed: RelationStore = .init(self.allocator);
+        defer removed.deinit();
         for (deletions) |relation| {
             const expression = try self.compileRelation(relation.predicate, relation.terms, false);
             defer freeExpr(self.allocator, expression);
@@ -697,10 +704,19 @@ pub const Jatalog = struct {
             for (expression.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
             const fact: Fact = .{ .predicate = expression.predicate, .terms = terms };
             if (try self.facts.removeFact(fact)) {
-                try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
                 changed = true;
+                if (maintain) {
+                    const copy = try self.allocator.dupe(ValueId, terms);
+                    _ = removed.insert(.{ .predicate = fact.predicate, .terms = copy }, false) catch |err| {
+                        self.allocator.free(copy);
+                        return err;
+                    };
+                } else {
+                    try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
+                }
             }
         }
+        if (maintain and removed.len() > 0) try self.propagateDeletions(&removed);
 
         const propagate = self.closure != null and self.materialization == .clean;
         const batch_start = if (propagate) self.closure.?.len() else 0;
@@ -749,12 +765,207 @@ pub const Jatalog = struct {
                 .arity = fact.terms.len,
             }, {});
         }
-        if (grown.count() == 0) return false;
+        return self.strataBlockedBy(level, &grown);
+    }
+
+    fn strataBlockedBy(
+        self: *Jatalog,
+        level: usize,
+        changed: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+    ) !bool {
+        if (changed.count() == 0) return false;
         const analysis = try self.ensureAnalysis();
         for (self.rules.items) |rule| {
             const rule_level = analysis.strata.get(predicateKey(rule.head)) orelse 0;
             if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
-            if (clausesReadGrownNonPositively(rule.body, &grown)) return true;
+            if (clausesReadGrownNonPositively(rule.body, changed)) return true;
+        }
+        return false;
+    }
+
+    /// Applies a batch of base deletions to the clean closure with
+    /// delete-and-rederive, one stratum at a time: over-delete every fact
+    /// whose derivation used a deleted fact, joining against a snapshot of
+    /// the pre-deletion closure, then reinsert facts that retain an
+    /// alternative proof in the reduced closure. Plain reference counts
+    /// would be unsound here because cyclic derivations support one another
+    /// after their base support disappears. A stratum whose negated or
+    /// aggregated dependencies lost facts is invalidated and recomputed
+    /// through the dirty-stratum rebuild instead.
+    fn propagateDeletions(self: *Jatalog, deleted: *RelationStore) !void {
+        var old_closure = try self.closure.?.clone();
+        defer old_closure.deinit();
+        for (0..deleted.len()) |index| {
+            _ = try self.closure.?.removeFact(deleted.factAt(index));
+        }
+        const analysis = try self.ensureAnalysis();
+        var level: usize = 0;
+        while (level <= analysis.max_level) : (level += 1) {
+            if (try self.deletionBlocked(level, deleted)) {
+                self.markDirty(level);
+                try self.ensureMaterialized();
+                return;
+            }
+            try self.overdeleteLevel(&old_closure, deleted, &analysis.strata, level);
+            try self.rederiveLevel(deleted, &analysis.strata, level);
+        }
+        self.removed_facts += deleted.len();
+    }
+
+    fn deletionBlocked(self: *Jatalog, level: usize, deleted: *const RelationStore) !bool {
+        var shrunk: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+        defer shrunk.deinit(self.allocator);
+        for (0..deleted.len()) |index| {
+            const fact = deleted.factAt(index);
+            try shrunk.put(self.allocator, .{
+                .name = fact.predicate,
+                .arity = fact.terms.len,
+            }, {});
+        }
+        return self.strataBlockedBy(level, &shrunk);
+    }
+
+    /// Over-deletes stratum `level`: every fact derivable by one of the
+    /// stratum's rules from at least one already-deleted fact is removed
+    /// from the closure and queued for rederivation. The remaining body
+    /// occurrences join against the pre-deletion snapshot so derivations
+    /// that used several deleted facts are still found.
+    fn overdeleteLevel(
+        self: *Jatalog,
+        old_closure: *RelationStore,
+        deleted: *RelationStore,
+        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+        level: usize,
+    ) !void {
+        var cursor: usize = 0;
+        while (cursor < deleted.len()) : (cursor += 1) {
+            const victim = deleted.factAt(cursor);
+            for (self.rules.items) |rule| {
+                if ((levels.get(predicateKey(rule.head)) orelse 0) != level) continue;
+                for (rule.body, 0..) |clause, clause_index| {
+                    const expression = switch (clause) {
+                        .relational => |value| value,
+                        else => continue,
+                    };
+                    if (expression.predicate != victim.predicate or
+                        expression.terms.len != victim.terms.len) continue;
+                    try self.overdeleteOccurrence(
+                        old_closure,
+                        deleted,
+                        rule,
+                        clause_index,
+                        victim,
+                    );
+                }
+            }
+        }
+    }
+
+    fn overdeleteOccurrence(
+        self: *Jatalog,
+        old_closure: *RelationStore,
+        deleted: *RelationStore,
+        rule: Rule,
+        clause_index: usize,
+        victim: Fact,
+    ) !void {
+        const expression = rule.body[clause_index].relational;
+        var initial: Binding = .{};
+        defer initial.deinit(self.allocator);
+        if (!try self.unify(victim, expression, &initial)) return;
+        const rest = try self.allocator.alloc(Clause, rule.body.len - 1);
+        defer self.allocator.free(rest);
+        var count: usize = 0;
+        for (rule.body, 0..) |clause, index| {
+            if (index == clause_index) continue;
+            rest[count] = clause;
+            count += 1;
+        }
+        var answers: std.ArrayList(Binding) = .empty;
+        defer {
+            for (answers.items) |*answer| answer.deinit(self.allocator);
+            answers.deinit(self.allocator);
+        }
+        self.matchClauses(rest, old_closure, 0, &initial, &answers, null) catch |err| switch (err) {
+            Error.NumericType, Error.NumericOverflow => return,
+            else => return err,
+        };
+        for (answers.items) |*answer| {
+            const head_fact = try self.deriveFact(rule.head, answer);
+            var keep = false;
+            defer if (!keep) self.allocator.free(head_fact.terms);
+            if (try self.facts.contains(head_fact)) continue;
+            if (try deleted.contains(head_fact)) continue;
+            if (!try self.closure.?.contains(head_fact)) continue;
+            _ = try self.closure.?.removeFact(head_fact);
+            _ = try deleted.insert(head_fact, true);
+            keep = true;
+        }
+    }
+
+    /// Reinserts over-deleted facts of this stratum that retain an
+    /// alternative proof in the reduced closure, repeating until no further
+    /// fact can be rederived so that chains of rederivations settle.
+    fn rederiveLevel(
+        self: *Jatalog,
+        deleted: *RelationStore,
+        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+        level: usize,
+    ) !void {
+        var progress = true;
+        while (progress) {
+            progress = false;
+            var index: usize = 0;
+            while (index < deleted.len()) {
+                const candidate = deleted.factAt(index);
+                const key: PredicateKey = .{
+                    .name = candidate.predicate,
+                    .arity = candidate.terms.len,
+                };
+                if ((levels.get(key) orelse 0) != level or
+                    !try self.hasAlternativeDerivation(candidate))
+                {
+                    index += 1;
+                    continue;
+                }
+                const terms = try self.allocator.dupe(ValueId, candidate.terms);
+                _ = self.closure.?.insert(.{
+                    .predicate = candidate.predicate,
+                    .terms = terms,
+                }, true) catch |err| {
+                    self.allocator.free(terms);
+                    return err;
+                };
+                deleted.removeAt(index);
+                progress = true;
+            }
+        }
+    }
+
+    fn hasAlternativeDerivation(self: *Jatalog, fact: Fact) !bool {
+        for (self.rules.items) |rule| {
+            if (rule.head.predicate != fact.predicate or
+                rule.head.terms.len != fact.terms.len) continue;
+            var bindings: Binding = .{};
+            defer bindings.deinit(self.allocator);
+            if (!try self.unify(fact, rule.head, &bindings)) continue;
+            var answers: std.ArrayList(Binding) = .empty;
+            defer {
+                for (answers.items) |*answer| answer.deinit(self.allocator);
+                answers.deinit(self.allocator);
+            }
+            self.matchClauses(
+                rule.body,
+                &self.closure.?,
+                0,
+                &bindings,
+                &answers,
+                null,
+            ) catch |err| switch (err) {
+                Error.NumericType, Error.NumericOverflow => continue,
+                else => return err,
+            };
+            if (answers.items.len > 0) return true;
         }
         return false;
     }
@@ -3125,7 +3336,7 @@ test "propagation reaching negation or setof falls back to dirty rebuild" {
     try expectClosureMatchesRebuild(&db);
 }
 
-test "batch deletions and mixed batches use the rebuild path correctly" {
+test "batch deletions and mixed batches maintain the closure correctly" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
@@ -3158,6 +3369,180 @@ test "batch deletions and mixed batches use the rebuild path correctly" {
     try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{}, &.{
         input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
     }));
+}
+
+test "deleting the only base support removes the entire unsupported cycle" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(c, a).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    // The full cycle reaches every node from every node.
+    try expectAnswerCount(&db, "path(X, Y)?", 9);
+    const expansions_after_build = db.expansions;
+
+    // After deleting edge(a, b) the cyclically self-supporting facts such
+    // as path(a, a) must all disappear; reference counts alone would keep
+    // them alive. The deletion is incremental: no stratum expansion runs.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(expansions_after_build, db.expansions);
+    try std.testing.expect(db.removed_facts > 0);
+    try expectAnswerCount(&db, "path(a, a)?", 0);
+    try expectAnswerCount(&db, "path(X, Y)?", 3);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "alternative recursive and non-recursive derivations preserve facts" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(a, c). edge(b, d). edge(c, d).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\marked(a).
+        \\special(X) :- marked(X).
+        \\special(X) :- path(X, d).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try expectAnswerCount(&db, "special(b)?", 1);
+
+    // path(a, d) survives the deletion through the c branch of the diamond,
+    // while path(b, d) and with it special(b) lose their only support.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("b"), input.atom("d") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try expectAnswerCount(&db, "special(b)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // special(a) loses its non-recursive derivation but survives through
+    // the recursive path(a, d) alternative.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("marked", &.{input.atom("a")}),
+    }));
+    try expectAnswerCount(&db, "special(a)?", 1);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "adding and removing a fact toggles negation-dependent conclusions" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\item(a). item(b).
+        \\blocked(b).
+        \\allowed(X) :- item(X), not blocked(X).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "allowed(a)?", 1);
+    try expectAnswerCount(&db, "allowed(b)?", 0);
+
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("blocked", &.{input.atom("a")}),
+    }, &.{}));
+    try expectAnswerCount(&db, "allowed(a)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("blocked", &.{input.atom("a")}),
+    }));
+    try expectAnswerCount(&db, "allowed(a)?", 1);
+    try expectAnswerCount(&db, "allowed(b)?", 0);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "projection counts change without prematurely deleting supported tuples" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\holds(a, b1). holds(a, b2).
+        \\present(X) :- holds(X, Y).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "present(a)?", 1);
+    const present_id = db.strings.get("present").?;
+    const support_before = blk: {
+        for (0..db.closure.?.len()) |index| {
+            const fact = db.closure.?.factAt(index);
+            if (fact.predicate == present_id) break :blk db.closure.?.supportAt(index);
+        }
+        return error.MissingFact;
+    };
+    try std.testing.expect(support_before >= 2);
+
+    // Removing one of two supports keeps the tuple with changed support.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("holds", &.{ input.atom("a"), input.atom("b1") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try expectAnswerCount(&db, "present(a)?", 1);
+    const support_after = blk: {
+        for (0..db.closure.?.len()) |index| {
+            const fact = db.closure.?.factAt(index);
+            if (fact.predicate == present_id) break :blk db.closure.?.supportAt(index);
+        }
+        return error.MissingFact;
+    };
+    try std.testing.expect(support_after != support_before);
+    try expectClosureMatchesRebuild(&db);
+
+    // Removing the last support deletes the tuple.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("holds", &.{ input.atom("a"), input.atom("b2") }),
+    }));
+    try expectAnswerCount(&db, "present(a)?", 0);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "random mixed update traces match a clean rebuild after every batch" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\node(a). node(b). node(c). node(d). node(e).
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\isolated(X) :- node(X), not path(a, X).
+        \\summary(S) :- node(a), setof([X, Y], path(X, Y), S).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "summary(S)?", 1);
+
+    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+    var prng = std.Random.DefaultPrng.init(0x5eed5eed5eed5eed);
+    const random = prng.random();
+    for (0..40) |_| {
+        var insert_buffer: [3][2]input.Term = undefined;
+        var inserts: [3]input.Relation = undefined;
+        const insert_count = random.uintLessThan(usize, 3);
+        for (0..insert_count) |slot| {
+            insert_buffer[slot] = .{
+                input.atom(names[random.uintLessThan(usize, names.len)]),
+                input.atom(names[random.uintLessThan(usize, names.len)]),
+            };
+            inserts[slot] = input.fact("edge", &insert_buffer[slot]);
+        }
+        var delete_buffer: [3][2]input.Term = undefined;
+        var deletes: [3]input.Relation = undefined;
+        const delete_count = random.uintLessThan(usize, 3);
+        for (0..delete_count) |slot| {
+            delete_buffer[slot] = .{
+                input.atom(names[random.uintLessThan(usize, names.len)]),
+                input.atom(names[random.uintLessThan(usize, names.len)]),
+            };
+            deletes[slot] = input.fact("edge", &delete_buffer[slot]);
+        }
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try std.testing.expect(db.materialization == .clean);
+        try expectClosureMatchesRebuild(&db);
+    }
 }
 
 fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {

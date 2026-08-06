@@ -121,3 +121,9 @@ check: the repeated-query median stayed at 23.3 us/query (23.0, 23.7, and
 23.3 us) and the aggregation median measured 55.5 us/query (56.9, 54.8, and
 55.5 us), within noise of the M1 measurement despite the per-entry support
 counter added to the relation store.
+
+## 2026-08-06 after M3 (incremental deletion)
+
+Another no-regression check: the aggregation median measured 52.7 us/query
+(52.7, 53.4, and 52.7 us) and the repeated-query median 23.1 us/query
+(23.8, 23.1, and 23.0 us), both within noise of the earlier measurements.
