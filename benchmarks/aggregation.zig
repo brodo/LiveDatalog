@@ -62,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
     {
         var database = try buildDatabase(allocator);
         defer database.deinit();
+        // Pinned so the two workloads isolate maintain versus recompute;
+        // the automatic policy chooses maintenance here on its own.
+        database.setMaintenancePolicy(.incremental);
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..iterations) |index| {
             const from = try std.fmt.bufPrint(&shortcut_from, "n{d}", .{index});

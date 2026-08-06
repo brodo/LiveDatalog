@@ -183,6 +183,44 @@ stratum rebuild when the number of affected groups approaches the total. The
 M6 completion gate is the natural home for both, since it already calls for
 insert, delete, and mixed-update benchmarks.
 
+## 2026-08-06 maintenance cost model
+
+Maintaining and recomputing produce the same database, so the engine now
+chooses between them per update from measured cost. Work is counted in
+candidate facts examined, which is deterministic and machine-independent;
+rebuild cost is learned from dirty-stratum rebuilds and maintenance cost
+from maintained batches, each path is measured once to bootstrap, and every
+sixteenth decision takes the rejected path so both estimates stay fresh.
+
+The `benchmark-maintenance` and `benchmark-projected-aggregate` workloads
+now query after every batch, so work a recompute decision defers is paid
+inside the measured region instead of escaping it. Their numbers are
+therefore not comparable with the earlier records above, which measured
+`applyChanges` alone. Both benchmarks run every policy so the model's choice
+can be checked against ground truth.
+
+| Workload | automatic | incremental | recompute | model chose |
+| --- | --- | --- | --- | --- |
+| insert-only | 647763 | 611103 | 887928 | maintain 37/40 |
+| delete-only | 429802 | 701098 | 392144 | recompute 36/40 |
+| mixed | 485727 | 810201 | 456523 | recompute 37/40 |
+| projected, 150 groups | 10283717 | 9738170 | 23123661 | maintain 281/300 |
+
+Times are ns per batch. The model picks the cheaper path on every workload,
+including two that disagree with each other, and lands within about 6 to 10
+percent of the pinned winner; the remainder is the cost of exploration.
+Neither fixed policy is competitive across all four rows, which is the case
+for having a model at all.
+
+Two measurement notes. Insert-only recomputation looks expensive here
+because recomputing repairs the recursive stratum from scratch, while
+delete-only and mixed favour recomputation because delete-and-rederive pays
+for a closure snapshot and rederivation checks. And an earlier version of
+this model was anchored on the cost of the *initial* full build, which is a
+larger operation than the dirty-stratum rebuild an update triggers; it
+consequently preferred maintenance everywhere. Only rebuilds that repair an
+update are recorded now.
+
 ## 2026-08-06 after M6 (maintenance API and update benchmarks)
 
 Query workload, unchanged protocol: 51.4, 52.9, and 55.2 us/query, median

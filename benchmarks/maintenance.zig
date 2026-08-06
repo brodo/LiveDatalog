@@ -122,9 +122,11 @@ fn runPhase(
     writer: *std.Io.Writer,
     phase: Phase,
     label: []const u8,
+    policy: LiveDatalog.MaintenancePolicy,
 ) !void {
     var database = try buildDatabase(counting.allocator());
     defer database.deinit();
+    database.setMaintenancePolicy(policy);
     const input = LiveDatalog.input;
     const before = database.maintenanceStats();
     const memory_before = counting.current;
@@ -162,19 +164,25 @@ fn runPhase(
                 }
             },
         }
+        // Query after every batch so work a recompute decision defers is
+        // paid inside the measured region rather than escaping it.
+        var result = try database.execute("size(G, N)?");
+        result.deinit();
     }
     const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
     const after = database.maintenanceStats();
 
     try writer.print(
-        "{s}: {d} ns/batch, +{d} derived, -{d} removed, {d} groups, {d} rebuild fallbacks, " ++
-            "{d} closure facts, {d} KiB live, {d} KiB peak\n",
+        "{s}: {d} ns/batch, +{d} derived, -{d} removed, {d} groups, {d} maintain, " ++
+            "{d} recompute, {d} fallbacks, {d} closure facts, {d} KiB live, {d} KiB peak\n",
         .{
             label,
             elapsed / batches,
             after.propagated_facts - before.propagated_facts,
             after.removed_facts - before.removed_facts,
             after.maintained_groups - before.maintained_groups,
+            after.maintain_choices - before.maintain_choices,
+            after.recompute_choices - before.recompute_choices,
             after.rebuild_fallbacks - before.rebuild_fallbacks,
             after.closure_facts,
             (counting.current - memory_before) / 1024,
@@ -190,9 +198,27 @@ pub fn main(init: std.process.Init) !void {
     var file_writer = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &file_writer.interface;
 
-    try runPhase(init.io, &counting, writer, .insert, "insert-only     ");
-    try runPhase(init.io, &counting, writer, .delete, "delete-only     ");
-    try runPhase(init.io, &counting, writer, .mixed, "mixed           ");
-    try runPhase(init.io, &counting, writer, .negated, "negation rebuild");
+    const phases = [_]struct { phase: Phase, label: []const u8 }{
+        .{ .phase = .insert, .label = "insert-only     " },
+        .{ .phase = .delete, .label = "delete-only     " },
+        .{ .phase = .mixed, .label = "mixed           " },
+        .{ .phase = .negated, .label = "negation rebuild" },
+    };
+    const policies = [_]struct { policy: LiveDatalog.MaintenancePolicy, label: []const u8 }{
+        .{ .policy = .automatic, .label = "automatic  " },
+        .{ .policy = .incremental, .label = "incremental" },
+        .{ .policy = .recompute, .label = "recompute  " },
+    };
+    var label_buffer: [64]u8 = undefined;
+    for (phases) |entry| {
+        for (policies) |selected| {
+            const label = try std.fmt.bufPrint(
+                &label_buffer,
+                "{s} {s}",
+                .{ entry.label, selected.label },
+            );
+            try runPhase(init.io, &counting, writer, entry.phase, label, selected.policy);
+        }
+    }
     try writer.flush();
 }

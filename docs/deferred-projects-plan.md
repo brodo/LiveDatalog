@@ -802,8 +802,28 @@ M6 was completed on 2026-08-06, finishing Project M:
   consuming two deleted facts is invisible from either pinning direction
   once both are gone. Eliminating the snapshot needs matching that can read
   the closure together with the pending deletions, which is an evaluator
-  change rather than a local fix. A cost model that chooses between
-  maintenance and recomputation is likewise unspecified by this plan.
+  change rather than a local fix.
+- A maintenance cost model was added after M6, resolving the open question
+  the benchmarks raised. `MaintenancePolicy` selects `automatic` (default),
+  `incremental`, or `recompute`. The automatic policy counts work in
+  candidate facts examined — deterministic and machine-independent — and
+  learns two estimates from the database's own history: the cost of a
+  dirty-stratum rebuild and the cost of maintaining one changed base fact.
+  Each path is measured once to bootstrap, and every sixteenth decision
+  takes the rejected path so neither estimate goes stale.
+  Design notes worth keeping:
+  - Only rebuilds that *repair an update* are recorded. Seeding the estimate
+    from the initial full build made recomputation look permanently
+    expensive, so the model preferred maintenance everywhere.
+  - Insertions and deletions must follow the same decision. They were
+    initially wired separately, so insertions kept maintaining while the
+    model believed it had chosen recomputation, and the closure never went
+    dirty for the rebuild estimate to be learned from.
+  - A decision is only counted when maintenance was possible at all; a dirty
+    closure must be repaired regardless of cost.
+  - Tests that assert a specific mechanism pin the policy, and a differential
+    test runs one trace under all three policies to confirm they agree on
+    base facts and closure. The choice is a cost decision only.
 
 # Project F: query folding
 

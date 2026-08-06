@@ -147,6 +147,24 @@ disappears. `maintenanceStats` reports closure size, facts added and removed
 incrementally, groups recomputed, rebuild fallbacks, and how the views are
 classified.
 
+**Choosing between them.** Maintaining and recomputing produce the same
+database, so which one runs is purely a cost decision. By default the engine
+makes it automatically: it measures both paths in candidate facts examined,
+learns their cost from this database's own history, and takes the cheaper
+one. Pin the choice when you need a specific path:
+
+```zig
+database.setMaintenancePolicy(.incremental); // always maintain
+database.setMaintenancePolicy(.recompute);   // always recompute
+database.setMaintenancePolicy(.automatic);   // default
+```
+
+The measured cost model matters because neither path dominates. On a
+recursive closure where one edge changes a small part of a large relation,
+maintaining is several times faster; on a shallow program whose closure is
+cheap to recompute, recomputing wins. `maintenanceStats` reports how many
+updates went each way and the learned estimates.
+
 **Batching and atomicity.** `applyChanges` applies one batch as a single
 transition with set semantics. It runs on a staged copy and commits only on
 success, so an allocation failure, an invalid descriptor, or a failed

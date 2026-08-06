@@ -15,9 +15,28 @@ const members_per_key = 10;
 const batches = 300;
 
 pub fn main(init: std.process.Init) !void {
+    var output_buffer: [512]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writer(init.io, &output_buffer);
+    const writer = &file_writer.interface;
+    const policies = [_]struct { policy: LiveDatalog.MaintenancePolicy, label: []const u8 }{
+        .{ .policy = .automatic, .label = "automatic  " },
+        .{ .policy = .incremental, .label = "incremental" },
+        .{ .policy = .recompute, .label = "recompute  " },
+    };
+    for (policies) |selected| try runPolicy(init, writer, selected.policy, selected.label);
+    try writer.flush();
+}
+
+fn runPolicy(
+    init: std.process.Init,
+    writer: *std.Io.Writer,
+    policy: LiveDatalog.MaintenancePolicy,
+    label: []const u8,
+) !void {
     const allocator = init.arena.allocator();
     var database = LiveDatalog.Jatalog.init(allocator);
     defer database.deinit();
+    database.setMaintenancePolicy(policy);
 
     const input = LiveDatalog.input;
     var key_buffer: [16]u8 = undefined;
@@ -65,6 +84,10 @@ pub fn main(init: std.process.Init) !void {
                 &.{input.fact("r", &member)},
             );
         }
+        // Query every batch so work a recompute decision defers is paid
+        // inside the measured region rather than escaping it.
+        var observed = try database.execute("v(k0, S)?");
+        observed.deinit();
     }
     const elapsed: u64 = @intCast(start.untilNow(init.io).raw.nanoseconds);
 
@@ -79,11 +102,9 @@ pub fn main(init: std.process.Init) !void {
             return error.UnexpectedAggregate;
     }
 
-    var output_buffer: [256]u8 = undefined;
-    var file_writer = std.Io.File.stdout().writer(init.io, &output_buffer);
-    try file_writer.interface.print(
-        "{d} update batches over {d} projected groups: {d} ns ({d} ns/batch)\n",
-        .{ batches, key_count, elapsed, elapsed / batches },
+    const stats = database.maintenanceStats();
+    try writer.print(
+        "{s}: {d} ns/batch over {d} projected groups, {d} maintain, {d} recompute\n",
+        .{ label, elapsed / batches, key_count, stats.maintain_choices, stats.recompute_choices },
     );
-    try file_writer.interface.flush();
 }

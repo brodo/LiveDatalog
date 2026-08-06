@@ -224,6 +224,30 @@ const DeltaConstraint = struct {
     delta_end: usize,
 };
 
+/// Chooses between maintaining the closure incrementally and recomputing
+/// the affected strata. Both paths produce the same database, so this is
+/// purely a cost decision.
+pub const MaintenancePolicy = enum {
+    /// Estimate both costs from observed work and take the cheaper path.
+    automatic,
+    /// Always maintain incrementally when the closure is clean.
+    incremental,
+    /// Always mark the affected strata dirty and recompute them.
+    recompute,
+};
+
+/// How often the cost model takes the path it currently believes is more
+/// expensive, so that both estimates keep being refreshed.
+const explore_interval: usize = 16;
+
+/// Folds a new observation into a running estimate, halving the weight of
+/// history each time so the model tracks a changing workload within a few
+/// updates while still damping a single unusual batch.
+fn blendWork(current: ?u64, observed: u64) u64 {
+    const previous = current orelse return observed;
+    return (previous +| observed) / 2;
+}
+
 /// How a batch's changed predicates affect one stratum's maintenance.
 const StratumImpact = enum { none, aggregate, rebuild };
 
@@ -595,6 +619,14 @@ pub const MaintenanceStats = struct {
     rebuild_fallbacks: usize,
     /// Aggregate groups recomputed by incremental maintenance.
     maintained_groups: usize,
+    policy: MaintenancePolicy,
+    /// Updates the cost model sent down each path.
+    maintain_choices: usize,
+    recompute_choices: usize,
+    /// Learned cost estimates in candidate facts examined, null until the
+    /// database has observed one of each.
+    rebuild_work: ?u64,
+    maintenance_work_per_fact: ?u64,
     /// Maintained aggregate views whose head retains every outer variable.
     self_maintainable_views: usize,
     /// Maintained aggregate views whose head projects outer variables away
@@ -649,6 +681,16 @@ pub const Jatalog = struct {
     maintained_groups: usize = 0,
     /// Debug mode: verify every maintained closure against a fresh rebuild.
     shadow_verification: bool = false,
+    policy: MaintenancePolicy = .automatic,
+    /// Monotonic count of candidate facts examined, the cost model's unit.
+    work: u64 = 0,
+    /// Observed work of a closure rebuild, and of maintaining one changed
+    /// base fact. Both are learned from this database's own history.
+    rebuild_work: ?u64 = null,
+    maintenance_work_per_fact: ?u64 = null,
+    recompute_choices: usize = 0,
+    maintain_choices: usize = 0,
+    decisions: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -703,6 +745,13 @@ pub const Jatalog = struct {
         result.rebuild_fallbacks = self.rebuild_fallbacks;
         result.maintained_groups = self.maintained_groups;
         result.shadow_verification = self.shadow_verification;
+        result.policy = self.policy;
+        result.work = self.work;
+        result.rebuild_work = self.rebuild_work;
+        result.maintenance_work_per_fact = self.maintenance_work_per_fact;
+        result.recompute_choices = self.recompute_choices;
+        result.maintain_choices = self.maintain_choices;
+        result.decisions = self.decisions;
         errdefer {
             for (result.auxiliary.items) |*view| view.deinit(self.allocator);
             result.auxiliary.deinit(self.allocator);
@@ -744,7 +793,6 @@ pub const Jatalog = struct {
     fn commitRetraction(self: *Jatalog, staging: *Jatalog) !void {
         var committed = try self.clone();
         defer committed.deinit();
-        const maintain = committed.closure != null and committed.materialization == .clean;
         var removed: RelationStore = .init(committed.allocator);
         defer removed.deinit();
         var index = committed.facts.len();
@@ -752,20 +800,29 @@ pub const Jatalog = struct {
             index -= 1;
             const fact = committed.facts.factAt(index);
             if (try staging.facts.contains(fact)) continue;
-            if (maintain) {
-                try copyFactInto(committed.allocator, &removed, fact);
-            } else {
-                try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
-            }
+            try copyFactInto(committed.allocator, &removed, fact);
             committed.facts.removeAt(index);
         }
-        if (maintain and removed.len() > 0) {
+        const delta = removed.len();
+        const can_maintain = committed.closure != null and committed.materialization == .clean;
+        const maintain = can_maintain and committed.shouldMaintain(delta);
+        if (can_maintain and delta > 0) {
+            if (maintain) committed.maintain_choices += 1 else committed.recompute_choices += 1;
+        }
+        if (maintain and delta > 0) {
+            const work_before = committed.work;
             try committed.propagateDeletions(&removed);
             var touched: RelationStore = .init(committed.allocator);
             defer touched.deinit();
             for (0..removed.len()) |position|
                 try copyFactInto(committed.allocator, &touched, removed.factAt(position));
             if (touched.len() > 0) try committed.maintainAggregates(&touched);
+            committed.noteMaintenanceWork(delta, committed.work - work_before);
+        } else {
+            for (0..removed.len()) |position| {
+                const fact = removed.factAt(position);
+                try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+            }
         }
         try committed.verifyShadow();
         self.commit(&committed);
@@ -887,6 +944,54 @@ pub const Jatalog = struct {
         self.shadow_verification = enabled;
     }
 
+    /// Selects how updates bring the closure up to date. The default is
+    /// `.automatic`; pin `.incremental` or `.recompute` when a caller needs
+    /// one specific path regardless of cost.
+    pub fn setMaintenancePolicy(self: *Jatalog, policy: MaintenancePolicy) void {
+        self.policy = policy;
+    }
+
+    /// Decides whether a batch of `delta_facts` base changes is cheaper to
+    /// maintain than to recompute.
+    ///
+    /// Both estimates are learned from this database's own history in units
+    /// of candidate facts examined, which makes the decision deterministic
+    /// and independent of the machine. Rebuild cost is seeded by the first
+    /// materialization; maintenance cost is unknown until one batch has been
+    /// maintained, so the first batch always maintains in order to measure
+    /// it. Scaling the per-fact maintenance estimate by the batch size
+    /// overstates large batches, because maintenance also carries costs that
+    /// do not grow with the batch; that bias favours recomputation for large
+    /// batches, which is the safe direction.
+    fn shouldMaintain(self: *Jatalog, delta_facts: usize) bool {
+        switch (self.policy) {
+            .incremental => return true,
+            .recompute => return false,
+            .automatic => {},
+        }
+        if (delta_facts == 0) return true;
+        self.decisions += 1;
+        // Bootstrap: measure each path once before trusting either estimate.
+        if (self.maintenance_work_per_fact == null) return true;
+        const rebuild_estimate = self.rebuild_work orelse return false;
+        const per_fact = self.maintenance_work_per_fact.?;
+        const cheaper = per_fact *| delta_facts < rebuild_estimate;
+        // Periodically take the rejected path so both estimates stay fresh.
+        // Without this only the winner's estimate is ever updated, and an
+        // initial full build permanently overstates what a dirty-stratum
+        // rebuild would actually cost.
+        if (self.decisions % explore_interval == 0) return !cheaper;
+        return cheaper;
+    }
+
+    fn noteMaintenanceWork(self: *Jatalog, delta_facts: usize, observed: u64) void {
+        if (delta_facts == 0) return;
+        self.maintenance_work_per_fact = blendWork(
+            self.maintenance_work_per_fact,
+            observed / delta_facts,
+        );
+    }
+
     /// Compares the maintained closure against a rebuild performed on a
     /// throwaway copy, so verification never disturbs this database.
     fn verifyShadow(self: *Jatalog) !void {
@@ -908,7 +1013,14 @@ pub const Jatalog = struct {
         deletions: []const input.Relation,
     ) !bool {
         var changed = false;
-        const maintain = self.closure != null and self.materialization == .clean;
+        // The model is only consulted when maintenance is possible at all;
+        // a dirty closure has to be repaired regardless of cost.
+        const can_maintain = self.closure != null and self.materialization == .clean;
+        const maintain = can_maintain and self.shouldMaintain(insertions.len + deletions.len);
+        if (can_maintain) {
+            if (maintain) self.maintain_choices += 1 else self.recompute_choices += 1;
+        }
+        const work_before = self.work;
         var removed: RelationStore = .init(self.allocator);
         defer removed.deinit();
         for (deletions) |relation| {
@@ -939,7 +1051,9 @@ pub const Jatalog = struct {
             for (0..removed.len()) |index| try copyFactInto(self.allocator, &touched, removed.factAt(index));
         }
 
-        const propagate = self.closure != null and self.materialization == .clean;
+        // Insertions follow the same decision as deletions; the closure
+        // state is rechecked because a deletion fallback may have dirtied it.
+        const propagate = maintain and self.closure != null and self.materialization == .clean;
         const batch_start = if (propagate) self.closure.?.len() else 0;
         for (insertions) |relation| {
             const expression = try self.compileRelation(relation.predicate, relation.terms, false);
@@ -954,6 +1068,8 @@ pub const Jatalog = struct {
             }
         }
         if (touched.len() > 0) try self.maintainAggregates(&touched);
+        if (maintain and changed)
+            self.noteMaintenanceWork(insertions.len + deletions.len, self.work - work_before);
         return changed;
     }
 
@@ -2027,6 +2143,11 @@ pub const Jatalog = struct {
             .stratum_expansions = self.expansions,
             .rebuild_fallbacks = self.rebuild_fallbacks,
             .maintained_groups = self.maintained_groups,
+            .policy = self.policy,
+            .maintain_choices = self.maintain_choices,
+            .recompute_choices = self.recompute_choices,
+            .rebuild_work = self.rebuild_work,
+            .maintenance_work_per_fact = self.maintenance_work_per_fact,
             .self_maintainable_views = self_maintainable,
             .projected_views = projected,
             .auxiliary_tuples = auxiliary_tuples,
@@ -2280,11 +2401,18 @@ pub const Jatalog = struct {
             .uninitialized => 0,
             .dirty_from_stratum => |level| level,
         };
+        // Only a dirty-stratum rebuild is the alternative an update chooses
+        // against. The first full build from `uninitialized` is a different
+        // and much larger operation, so recording it would permanently
+        // overstate what recomputation costs.
+        const repairs_update = self.materialization == .dirty_from_stratum;
+        const work_before = self.work;
         const closure = try self.buildClosure(from_level);
         if (self.closure) |*old| old.deinit();
         self.closure = closure;
         self.materialization = .clean;
         try self.rebuildAuxiliaryViews();
+        if (repairs_update) self.rebuild_work = blendWork(self.rebuild_work, self.work - work_before);
     }
 
     fn buildClosure(self: *Jatalog, from_level: usize) !RelationStore {
@@ -2646,7 +2774,12 @@ pub const Jatalog = struct {
             bound[count] = resolved;
             count += 1;
         }
-        return facts.lookup(key, mask, bound[0..count]);
+        const candidates = try facts.lookup(key, mask, bound[0..count]);
+        // Candidate examination dominates both maintenance and rebuild, so
+        // counting candidates is the cost model's unit of work. It is a
+        // deterministic, machine-independent proxy for elapsed time.
+        self.work +|= candidates.len + 1;
+        return candidates;
     }
 
     fn unify(self: *Jatalog, fact: Fact, goal: Expr, bindings: *Binding) !bool {
@@ -4173,6 +4306,8 @@ fn expectClosureMatchesRebuild(db: *Jatalog) !void {
 test "insert-only batches propagate incrementally and match full rebuild" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\edge(n0, n1). edge(n1, n2).
         \\path(X, Y) :- edge(X, Y).
@@ -4246,6 +4381,8 @@ test "duplicate base insertions produce no derived delta" {
 test "propagation reaching negation or setof falls back to dirty rebuild" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\edge(a, b). flag(a). flag(b).
         \\path(X, Y) :- edge(X, Y).
@@ -4446,6 +4583,8 @@ test "projection counts change without prematurely deleting supported tuples" {
 test "random mixed update traces match a clean rebuild after every batch" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\node(a). node(b). node(c). node(d). node(e).
         \\edge(a, b). edge(b, c).
@@ -4747,6 +4886,8 @@ test "multiple and nested aggregates stay correct through the rebuild path" {
 test "random aggregate update traces match a clean rebuild after every batch" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\group(g1). group(g2). group(g3).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
@@ -4942,6 +5083,8 @@ test "a changed aggregate list transfers support to the new tuple" {
 test "projected view counts agree with explicit proof enumeration" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\p(a, 1). r(a, 1).
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
@@ -4999,6 +5142,8 @@ test "projected view counts agree with explicit proof enumeration" {
 test "retraction maintains the closure incrementally" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\edge(a, b). edge(b, c). edge(c, a). edge(x, y).
@@ -5036,6 +5181,8 @@ test "retraction maintains the closure incrementally" {
 test "pattern retraction removes every matching fact incrementally" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\edge(a, b). edge(a, c). edge(a, d). edge(b, e).
@@ -5070,6 +5217,8 @@ test "pattern retraction removes every matching fact incrementally" {
 test "retraction maintains aggregate groups and negation strata" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\group(g1). group(g2). member(g1, a). member(g1, b). member(g2, z).
@@ -5145,9 +5294,166 @@ test "incremental retraction releases every allocation on failure" {
     );
 }
 
+/// Runs one deterministic update trace under a fixed policy and returns the
+/// materialized database for comparison.
+fn runPolicyTrace(db: *Jatalog, policy: MaintenancePolicy) !void {
+    db.setMaintenancePolicy(policy);
+    var setup = try db.execute(
+        \\node(a). node(b). node(c). group(g1). group(g2).
+        \\edge(a, b). member(g1, m1). member(g2, m2).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(G, N) :- collected(G, S), length(S, N).
+        \\isolated(X) :- node(X), not path(a, X).
+    );
+    setup.deinit();
+    try db.materialize();
+
+    const nodes = [_][]const u8{ "a", "b", "c" };
+    const groups = [_][]const u8{ "g1", "g2" };
+    const members = [_][]const u8{ "m1", "m2", "m3" };
+    var prng = std.Random.DefaultPrng.init(0xc05715c05715);
+    const random = prng.random();
+    for (0..40) |step| {
+        var edge_terms: [2]input.Term = .{
+            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
+            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
+        };
+        var member_terms: [2]input.Term = .{
+            input.atom(groups[random.uintLessThan(usize, groups.len)]),
+            input.atom(members[random.uintLessThan(usize, members.len)]),
+        };
+        if (step % 4 == 3) {
+            // Exercise pattern retraction as well as the batch API.
+            _ = try db.retract(&.{input.relation("member", &.{
+                input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                input.variable("any"),
+            })});
+            continue;
+        }
+        var inserts: [2]input.Relation = undefined;
+        var deletes: [2]input.Relation = undefined;
+        var insert_count: usize = 0;
+        var delete_count: usize = 0;
+        if (random.boolean()) {
+            inserts[insert_count] = input.fact("edge", &edge_terms);
+            insert_count += 1;
+        } else {
+            deletes[delete_count] = input.fact("edge", &edge_terms);
+            delete_count += 1;
+        }
+        if (random.boolean()) {
+            inserts[insert_count] = input.fact("member", &member_terms);
+            insert_count += 1;
+        } else {
+            deletes[delete_count] = input.fact("member", &member_terms);
+            delete_count += 1;
+        }
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+    }
+    try db.materialize();
+}
+
+test "the cost model changes the path taken but never the result" {
+    var automatic: Jatalog = .init(std.testing.allocator);
+    defer automatic.deinit();
+    try runPolicyTrace(&automatic, .automatic);
+
+    var incremental: Jatalog = .init(std.testing.allocator);
+    defer incremental.deinit();
+    try runPolicyTrace(&incremental, .incremental);
+
+    var recompute: Jatalog = .init(std.testing.allocator);
+    defer recompute.deinit();
+    try runPolicyTrace(&recompute, .recompute);
+
+    // Every policy must leave the same base facts and the same closure.
+    for ([_]*Jatalog{ &incremental, &recompute }) |other| {
+        try std.testing.expectEqual(automatic.facts.len(), other.facts.len());
+        for (0..automatic.facts.len()) |index|
+            try std.testing.expect(try other.facts.contains(automatic.facts.factAt(index)));
+        try std.testing.expectEqual(automatic.closure.?.len(), other.closure.?.len());
+        for (0..automatic.closure.?.len()) |index|
+            try std.testing.expect(try other.closure.?.contains(automatic.closure.?.factAt(index)));
+    }
+    try expectClosureMatchesRebuild(&automatic);
+
+    // The pinned policies really did take different paths, and the
+    // automatic one made a real decision rather than defaulting.
+    const automatic_stats = automatic.maintenanceStats();
+    try std.testing.expectEqual(@as(usize, 0), incremental.maintenanceStats().recompute_choices);
+    try std.testing.expectEqual(@as(usize, 0), recompute.maintenanceStats().maintain_choices);
+    try std.testing.expect(automatic_stats.maintain_choices > 0);
+    try std.testing.expect(automatic_stats.rebuild_work != null);
+    try std.testing.expect(automatic_stats.maintenance_work_per_fact != null);
+}
+
+test "the cost model learns to prefer the cheaper path per workload" {
+    // A recursive closure over a chain: one new edge derives a handful of
+    // paths, while recomputing re-derives the entire transitive closure.
+    var closure_db: Jatalog = .init(std.testing.allocator);
+    defer closure_db.deinit();
+    var chain_source: std.ArrayList(u8) = .empty;
+    defer chain_source.deinit(std.testing.allocator);
+    for (0..30) |index| {
+        var buffer: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buffer, "edge(n{d}, n{d}). ", .{ index, index + 1 });
+        try chain_source.appendSlice(std.testing.allocator, line);
+    }
+    try chain_source.appendSlice(
+        std.testing.allocator,
+        "path(X, Y) :- edge(X, Y). path(X, Z) :- edge(X, Y), path(Y, Z).",
+    );
+    var chain_setup = try closure_db.execute(chain_source.items);
+    chain_setup.deinit();
+    try closure_db.materialize();
+    for (0..8) |index| {
+        var from: [16]u8 = undefined;
+        var to: [16]u8 = undefined;
+        const source = try std.fmt.bufPrint(&from, "s{d}", .{index});
+        const target = try std.fmt.bufPrint(&to, "n{d}", .{index});
+        const terms: [2]input.Term = .{ input.atom(source), input.atom(target) };
+        _ = try closure_db.applyChanges(&.{input.fact("edge", &terms)}, &.{});
+        // Query between batches so a recompute decision is actually paid and
+        // the closure is clean again when the next decision is made.
+        var query = try closure_db.execute("path(n0, X)?");
+        query.deinit();
+    }
+    const closure_stats = closure_db.maintenanceStats();
+    try std.testing.expect(closure_stats.maintain_choices > closure_stats.recompute_choices);
+    try expectClosureMatchesRebuild(&closure_db);
+
+    // A shallow program whose closure is cheap to recompute: maintenance
+    // has no recursion to save and the model should stop choosing it.
+    var flat_db: Jatalog = .init(std.testing.allocator);
+    defer flat_db.deinit();
+    var flat_setup = try flat_db.execute(
+        \\item(a). item(b). item(c).
+        \\present(X) :- item(X).
+    );
+    flat_setup.deinit();
+    try flat_db.materialize();
+    for (0..8) |index| {
+        var buffer: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&buffer, "i{d}", .{index});
+        const terms: [1]input.Term = .{input.atom(name)};
+        _ = try flat_db.applyChanges(&.{input.fact("item", &terms)}, &.{});
+        var query = try flat_db.execute("present(X)?");
+        query.deinit();
+    }
+    try expectClosureMatchesRebuild(&flat_db);
+    const flat_stats = flat_db.maintenanceStats();
+    try std.testing.expect(flat_stats.recompute_choices > 0);
+}
+
 test "aggregate changes propagate through downstream list functions and arithmetic" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\team(red). team(blue).
@@ -5201,6 +5507,8 @@ test "aggregate changes propagate through downstream list functions and arithmet
 test "materialize rebuild and stats form the explicit maintenance API" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     var setup = try db.execute(
         \\edge(a, b). edge(b, c).
         \\path(X, Y) :- edge(X, Y).
@@ -5295,6 +5603,8 @@ test "materialize rebuild and stats form the explicit maintenance API" {
 test "shadow verification accepts maintained closures and reports corruption" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\edge(a, b). edge(b, c). group(g). member(g, m1).
@@ -5343,6 +5653,8 @@ test "shadow verification accepts maintained closures and reports corruption" {
 test "randomized mixed traces hold under shadow verification" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
     db.setShadowVerification(true);
     var setup = try db.execute(
         \\node(a). node(b). node(c). group(g1). group(g2).

@@ -60,7 +60,9 @@ Every base-fact update takes exactly one of three paths, all of which yield
 the same database a clean rebuild would: incremental insertion propagation
 through positive rules, delete-and-rederive for deletions, or a stratum
 rebuild when the update reaches negation or an aggregate outside the
-maintained class. Retraction — including pattern retraction with variables,
+maintained class. Because maintaining and recomputing differ only in cost, a
+cost model chooses between them per update, estimating both from measured
+work; `MaintenancePolicy` pins the choice when a caller needs one path. Retraction — including pattern retraction with variables,
 which the batch API cannot express — resolves its goals to base facts and
 takes the deletion path. Aggregate group maintenance runs on top of the first two.
 `maintenanceStats` makes the path taken observable, and shadow verification
