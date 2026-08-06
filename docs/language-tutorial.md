@@ -39,7 +39,7 @@ The first two lines are facts. The last line is a query. When a file contains
 multiple statements, the command-line interpreter prints the result of the
 last statement.
 
-## Facts, atoms, and variables
+## Facts, scalars, and variables
 
 A fact records a relationship:
 
@@ -52,8 +52,10 @@ age(alice, 36).
 The name before the parentheses is the **predicate**. The values inside the
 parentheses are its **terms**.
 
-Bare terms such as `alice`, `bob`, and `36` are atoms. A term whose first
-character is uppercase is a variable:
+Bare signed decimal integers such as `36`, `+36`, and `036` are exact `i64`
+integer scalars and share one canonical value. Bare terms such as `alice` and
+`bob` are atom scalars. A term whose first character is uppercase is a
+variable:
 
 ```datalog
 parent(alice, Child)?
@@ -72,6 +74,12 @@ note(bob, 'calls it \'the office\'').
 ```
 
 A backslash escapes a quote or backslash inside a quoted value.
+
+Quoting always constructs an atom, so `'36'` is distinct from integer `36`.
+Bare integers outside the signed 64-bit range return `NumericOverflow`. Decimal
+and exponent-shaped bare literals are reserved for future numeric support and
+currently return `NumericType`; quote them when atom text such as `'1.0'` is
+intended.
 
 ## Queries
 
@@ -194,9 +202,10 @@ person(alice).
 same_person(X) :- person(X), X = alice.
 ```
 
-Equality cannot bind two unbound variables. Numeric-looking atoms compare by
-numeric value for equality, so `1 = 1.0` succeeds. Equality on other atoms and
-structural values uses their actual contents.
+Equality cannot bind two unbound variables. Integer equality is exact and uses
+the same canonical identity as facts, unification, arithmetic checks, and
+`setof`. Numeric comparisons accept integer scalars only; atoms and structural
+values return `NumericType`.
 
 ## Negation
 
@@ -315,7 +324,7 @@ N = A + B
 N = A - B
 ```
 
-Both operands on the right must already be bound integer atoms. Operations use
+Both operands on the right must already be bound integer scalars. Operations use
 checked signed 64-bit arithmetic. Non-integer operands and overflow produce an
 error.
 

@@ -8,7 +8,7 @@ interpreter for running files, piping programs, and exploring data in a REPL.
 
 - Facts, rules, multi-goal queries, and recursive relations
 - Stratified negation and fact retraction
-- Equality, inequality, and numeric comparisons
+- Exact first-class signed 64-bit integers and numeric comparisons
 - Structural lists, deterministic `setof`, and nested aggregates
 - Checked 64-bit integer addition and subtraction
 - Bare and quoted values with escaped quotes
@@ -68,45 +68,44 @@ pub fn main() !void {
     var database = LiveDatalog.Jatalog.init(std.heap.page_allocator);
     defer database.deinit();
 
-    try database.addFact("parent", &.{ "alice", "bob" });
+    const input = LiveDatalog.input;
+    try database.addFact("parent", &.{ input.atom("alice"), input.atom("bob") });
 
-    const parent = try database.expr("parent", &.{ "X", "Y" });
-    const ancestor = try database.expr("ancestor", &.{ "X", "Y" });
-    try database.addRule(ancestor, &.{parent});
+    const x = input.variable("x");
+    const y = input.variable("y");
+    try database.addRule(
+        input.relation("ancestor", &.{ x, y }),
+        &.{input.relation("parent", &.{ x, y })},
+    );
 
-    const goal = try database.expr("ancestor", &.{ "alice", "Who" });
-    defer database.freeExpression(goal);
-    var result = try database.query(&.{goal});
+    var result = try database.query(&.{input.relation(
+        "ancestor",
+        &.{ input.atom("alice"), input.variable("who") },
+    )});
     defer result.deinit();
 
-    const who = result.answers.items[0].get(&database, "Who").?;
+    const who = try result.answers.items[0].getAtom("who");
     std.debug.print("{s}\\n", .{who}); // bob
 }
 ```
 
-Use `execute` to parse and run Datalog source directly. For typed construction:
-
-- `expr` and `not` create caller-owned expressions
-- `clauseFromExpr` classifies an expression as relational, built-in, or negated
-- `setof` creates a structural aggregate goal
-- `query` and `queryClauses` borrow their goals
-- `addRule` and `addRuleClauses` take ownership of their inputs on success
-
-Term strings passed to `expr` and `setof` accept the structural syntax described
-in the language tutorial.
+Use `execute` to parse and run Datalog source directly. The `input` helpers
+construct typed atoms, integers, variables, proper lists, cons cells,
+relations, negation, equality, comparisons, checked arithmetic, and `setof`.
+They allocate nothing and cannot fail. Database operations synchronously
+borrow and compile the descriptors, so stack values and temporary slices are
+safe and remain caller-owned.
 
 ### Ownership
 
-Every `QueryResult` and `ExecutionResult` must be deinitialized. Release an
-expression or clause whose ownership was not transferred with `freeExpression`
-or `freeClause`.
-
-`setof` takes ownership of its body clauses only on success. Similarly,
-`addRule` and `addRuleClauses` take ownership of their head and body values only
-on success. If one of these calls fails, the caller still owns every input.
-
-`Binding.get` returns scalar atoms. Use `Binding.getValue` with `formatValue`
-or `writeValue` for structural values such as lists.
+Every `QueryResult` and `ExecutionResult` must be deinitialized. Results own
+their variable names, atoms, integers, and reachable list structure, and remain
+readable after the database is deinitialized. Use `getAtom`, `getInteger`, or
+`getValue`; generic values support list inspection, `write`, and `formatAlloc`.
+The slice returned by `formatAlloc` belongs to the supplied allocator and must
+be freed by the caller.
+Unknown variables return `UnknownVariable`, while using a scalar getter on the
+wrong kind returns `TypeMismatch`.
 
 ## Development
 

@@ -97,14 +97,14 @@ fn executeAndPrint(io: std.Io, database: *LiveDatalog.Jatalog, source: []const u
         .query => |query_result| {
             if (query_result.answers.items.len == 0) {
                 try writer.writeAll("No.\n");
-            } else if (query_result.answers.items[0].values.count() == 0) {
+            } else if (query_result.answers.items[0].bindings.items.len == 0) {
                 try writer.writeAll("Yes.\n");
             } else {
                 for (query_result.answers.items) |answer| {
-                    for (answer.values.keys(), answer.values.values(), 0..) |variable, value, index| {
+                    for (answer.bindings.items, 0..) |binding, index| {
                         if (index != 0) try writer.writeAll(", ");
-                        try writer.print("{s}: ", .{database.strings.resolve(variable)});
-                        try database.writeValue(writer, value);
+                        try writer.print("{s}: ", .{binding.name});
+                        try binding.value.write(writer);
                     }
                     try writer.writeByte('\n');
                 }

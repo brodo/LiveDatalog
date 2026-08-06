@@ -124,6 +124,11 @@ Phase 1 was completed on 2026-07-30 with these decisions:
   Exhaustive allocation-failure tests cover structural parsing, rule/query
   evaluation, formatting, and teardown.
 
+These embedding and scalar decisions were superseded on 2026-08-06 by the
+first-class integer scalar implementation: typed borrowed descriptors replaced
+caller-owned expression trees, results became self-contained, and integers no
+longer use atom spellings.
+
 ## Phase 2: aggregate syntax, safety, and stratification
 
 ### Scope
@@ -291,6 +296,9 @@ Phase 4 was completed on 2026-07-30 with these decisions:
 - Structural input seeding is used only when ordinary body evaluation cannot
   bind a constructor-bearing head. Non-recursive rules may therefore construct
   new list values in their heads without requiring those values to exist first.
+
+The comparison decision above is historical. Comparisons now use exact `i64`
+scalars; floating-point parsing and comparison remain deferred.
 - A recursive call involving `cons` is admissible only when at least one call
   argument is reached through one or more cons tails of its head argument and
   every other statically structural argument is unchanged or likewise a tail.
@@ -347,6 +355,9 @@ Phase 5 was completed on 2026-07-30 with these decisions:
 - End-to-end tests cover the public aggregate API, CLI output, complete
   query/retraction recomputation, and exhaustive allocation failures through
   typed aggregate construction and evaluation.
+
+The current typed API uses allocation-free borrowed `input.Term` and
+`input.Goal` descriptors with `addFact`, `addRule`, `query`, and `retract`.
 - `zig build benchmark-aggregation -Doptimize=ReleaseFast` is the reproducible
   naive-evaluation workload. The initial 25-node recursive-closure aggregate
   baseline is recorded in `docs/aggregation-performance.md` for later work.
@@ -389,7 +400,5 @@ Each implementation session should end with:
 
 ## Open design questions
 
-- Whether a later numeric migration should replace atom-backed `i64` arithmetic
-  and the legacy `f64` comparison behavior with tagged numeric values.
 - Whether admissibility should eventually prove mutual recursion or support
   multiple decreasing input modes instead of conservatively rejecting them.

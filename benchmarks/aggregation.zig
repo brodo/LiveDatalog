@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..node_count - 1) |index| {
         const left = try std.fmt.bufPrint(&left_buffer, "n{d}", .{index});
         const right = try std.fmt.bufPrint(&right_buffer, "n{d}", .{index + 1});
-        try database.addFact("edge", &.{ left, right });
+        try database.addFact("edge", &.{ LiveDatalog.input.atom(left), LiveDatalog.input.atom(right) });
     }
     var setup = try database.execute(
         \\seed(k).
