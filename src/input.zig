@@ -65,6 +65,11 @@ pub fn relation(predicate: []const u8, terms: []const Term) Goal {
     return .{ .relation = .{ .predicate = predicate, .terms = terms } };
 }
 
+/// Describes one ground fact for the batch-update interface.
+pub fn fact(predicate: []const u8, terms: []const Term) Relation {
+    return .{ .predicate = predicate, .terms = terms };
+}
+
 pub fn not(predicate: []const u8, terms: []const Term) Goal {
     return .{ .negation = .{ .predicate = predicate, .terms = terms } };
 }

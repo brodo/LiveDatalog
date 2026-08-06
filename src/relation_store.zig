@@ -60,6 +60,11 @@ pub const RelationStore = struct {
     const Entry = struct {
         fact: Fact,
         derived: bool,
+        /// Counts insertion attempts for the fact: one for the first
+        /// insertion plus one per duplicate. This is internal support
+        /// bookkeeping for deletion maintenance and is never exposed as a
+        /// Datalog value; deletion phases refine its precision.
+        support: u32,
     };
 
     const Membership = std.HashMapUnmanaged(Fact, u32, FactContext, std.hash_map.default_max_load_percentage);
@@ -131,6 +136,7 @@ pub const RelationStore = struct {
             result.entries.appendAssumeCapacity(.{
                 .fact = .{ .predicate = entry.fact.predicate, .terms = terms },
                 .derived = entry.derived,
+                .support = entry.support,
             });
         }
         return result;
@@ -148,23 +154,43 @@ pub const RelationStore = struct {
         return self.entries.items[index].derived;
     }
 
+    pub fn supportAt(self: *const RelationStore, index: usize) u32 {
+        return self.entries.items[index].support;
+    }
+
     pub fn contains(self: *RelationStore, fact: Fact) !bool {
         const membership = try self.ensureMembership();
         return membership.contains(fact);
     }
 
     /// Inserts a fact with set semantics. On success the store owns
-    /// `fact.terms`, freeing them immediately when the fact is a duplicate,
-    /// and returns whether the fact was added. On error the caller retains
-    /// ownership of `fact.terms` and the store is unchanged.
+    /// `fact.terms`, freeing them immediately when the fact is a duplicate
+    /// (whose support count increments instead), and returns whether the
+    /// fact was added. On error the caller retains ownership of `fact.terms`
+    /// and the store is unchanged.
     pub fn insert(self: *RelationStore, fact: Fact, derived: bool) !bool {
-        if (try self.contains(fact)) {
+        const membership = try self.ensureMembership();
+        if (membership.get(fact)) |existing| {
+            self.entries.items[existing].support += 1;
             self.allocator.free(fact.terms);
             return false;
         }
         const index: u32 = @intCast(self.entries.items.len);
-        try self.entries.append(self.allocator, .{ .fact = fact, .derived = derived });
+        try self.entries.append(self.allocator, .{
+            .fact = fact,
+            .derived = derived,
+            .support = 1,
+        });
         self.noteInserted(index);
+        return true;
+    }
+
+    /// Removes the exact fact when present, preserving entry order, and
+    /// returns whether anything was removed.
+    pub fn removeFact(self: *RelationStore, fact: Fact) !bool {
+        const membership = try self.ensureMembership();
+        const index = membership.get(fact) orelse return false;
+        self.removeAt(index);
         return true;
     }
 
@@ -385,6 +411,28 @@ test "pattern lookups stay consistent across inserts deletes and clear" {
         u32,
         &.{0},
         try store.lookup(.{ .name = 3, .arity = 2 }, 0b11, &.{ 2, 100 }),
+    );
+}
+
+test "support counts duplicates and exact removal keeps indexes consistent" {
+    var store: RelationStore = .init(std.testing.allocator);
+    defer store.deinit();
+    try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 1, &.{ 10, 20 }), false));
+    try std.testing.expect(!try store.insert(try testFact(std.testing.allocator, 1, &.{ 10, 20 }), true));
+    try std.testing.expect(!try store.insert(try testFact(std.testing.allocator, 1, &.{ 10, 20 }), true));
+    try std.testing.expectEqual(@as(u32, 3), store.supportAt(0));
+    try std.testing.expect(!store.isDerived(0));
+
+    try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 1, &.{ 10, 30 }), true));
+    try std.testing.expectEqual(@as(u32, 1), store.supportAt(1));
+
+    try std.testing.expect(!try store.removeFact(.{ .predicate = 1, .terms = @constCast(&[_]ValueId{ 10, 40 }) }));
+    try std.testing.expect(try store.removeFact(.{ .predicate = 1, .terms = @constCast(&[_]ValueId{ 10, 20 }) }));
+    try std.testing.expectEqual(@as(usize, 1), store.len());
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{0},
+        try store.lookup(.{ .name = 1, .arity = 2 }, 0b11, &.{ 10, 30 }),
     );
 }
 

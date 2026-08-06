@@ -113,3 +113,11 @@ The first query materializes the closure once; later queries reuse it, so
 the remaining per-query cost is the staging clone of the database plus
 matching and result construction. Updates mark the first dependent stratum
 dirty and the next evaluation repairs only the affected strata.
+
+## 2026-08-06 after M2 (insertion deltas)
+
+Neither workload uses the batch-update API, so this is a no-regression
+check: the repeated-query median stayed at 23.3 us/query (23.0, 23.7, and
+23.3 us) and the aggregation median measured 55.5 us/query (56.9, 54.8, and
+55.5 us), within noise of the M1 measurement despite the per-entry support
+counter added to the relation store.

@@ -278,6 +278,30 @@ fn noteBodyDependencies(
     };
 }
 
+fn clausesReadGrownNonPositively(
+    body: []const Clause,
+    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+) bool {
+    for (body) |clause| switch (clause) {
+        .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
+        .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, grown)) return true,
+        .relational, .builtin => {},
+    };
+    return false;
+}
+
+fn clausesReadGrownAnywhere(
+    body: []const Clause,
+    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+) bool {
+    for (body) |clause| switch (clause) {
+        .relational, .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
+        .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, grown)) return true,
+        .builtin => {},
+    };
+    return false;
+}
+
 fn predicateKey(expression: Expr) PredicateKey {
     return .{ .name = expression.predicate, .arity = expression.terms.len };
 }
@@ -496,6 +520,9 @@ pub const Jatalog = struct {
     /// Counts stratum expansions; tests use it to prove that repeated
     /// queries perform no rule expansion after the first materialization.
     expansions: usize = 0,
+    /// Counts facts added to the closure by incremental batch propagation,
+    /// distinguishing incrementally added facts from rebuilt facts.
+    propagated_facts: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -543,6 +570,7 @@ pub const Jatalog = struct {
         errdefer if (result.closure) |*closure| closure.deinit();
         result.materialization = self.materialization;
         result.expansions = self.expansions;
+        result.propagated_facts = self.propagated_facts;
         errdefer {
             for (result.rules.items) |rule| freeRule(self.allocator, rule);
             result.rules.deinit(self.allocator);
@@ -633,6 +661,168 @@ pub const Jatalog = struct {
         return changed;
     }
 
+    /// Applies one batch of exact ground base-fact insertions and deletions
+    /// with set semantics: re-inserting an existing fact and deleting an
+    /// absent fact are no-ops. Insertions into a clean materialized closure
+    /// propagate incrementally through positive strata with the semi-naive
+    /// delta engine; when the update reaches negation or `setof`, that
+    /// stratum is marked dirty and rebuilt through the M1 path. Deletions
+    /// always take the dirty-stratum rebuild path. The batch commits
+    /// atomically: any failure leaves the database unchanged. Returns
+    /// whether the base fact set changed.
+    pub fn applyChanges(
+        self: *Jatalog,
+        insertions: []const input.Relation,
+        deletions: []const input.Relation,
+    ) !bool {
+        var staging = try self.clone();
+        defer staging.deinit();
+        const changed = try staging.applyChangesCompiled(insertions, deletions);
+        if (changed) self.commit(&staging);
+        return changed;
+    }
+
+    fn applyChangesCompiled(
+        self: *Jatalog,
+        insertions: []const input.Relation,
+        deletions: []const input.Relation,
+    ) !bool {
+        var changed = false;
+        for (deletions) |relation| {
+            const expression = try self.compileRelation(relation.predicate, relation.terms, false);
+            defer freeExpr(self.allocator, expression);
+            if (!expression.isGround()) return Error.InvalidFact;
+            const terms = try self.allocator.alloc(ValueId, expression.terms.len);
+            defer self.allocator.free(terms);
+            for (expression.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
+            const fact: Fact = .{ .predicate = expression.predicate, .terms = terms };
+            if (try self.facts.removeFact(fact)) {
+                try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
+                changed = true;
+            }
+        }
+
+        const propagate = self.closure != null and self.materialization == .clean;
+        const batch_start = if (propagate) self.closure.?.len() else 0;
+        for (insertions) |relation| {
+            const expression = try self.compileRelation(relation.predicate, relation.terms, false);
+            defer freeExpr(self.allocator, expression);
+            if (try self.applyInsertion(expression, propagate)) changed = true;
+        }
+        if (propagate and self.closure.?.len() > batch_start) {
+            try self.propagateInsertions(batch_start);
+        }
+        return changed;
+    }
+
+    /// Propagates a batch of base insertions already appended to the clean
+    /// closure at `batch_start`, one stratum at a time. A stratum whose
+    /// negated or aggregated dependencies gained facts falls back to the
+    /// dirty-stratum rebuild; strata below it keep their incremental state.
+    fn propagateInsertions(self: *Jatalog, batch_start: usize) !void {
+        const start_len = self.closure.?.len();
+        const analysis = try self.ensureAnalysis();
+        const max_level = analysis.max_level;
+        var level: usize = 0;
+        while (level <= max_level) : (level += 1) {
+            if (try self.propagationBlocked(level, batch_start)) {
+                self.markDirty(level);
+                try self.ensureMaterialized();
+                return;
+            }
+            try self.propagateLevel(&self.closure.?, &analysis.strata, level, batch_start);
+        }
+        self.propagated_facts += self.closure.?.len() - start_len;
+    }
+
+    /// A stratum blocks incremental propagation when one of its rules reads
+    /// a predicate that gained facts during this batch through negation or
+    /// anywhere inside a `setof` body.
+    fn propagationBlocked(self: *Jatalog, level: usize, batch_start: usize) !bool {
+        const closure = &self.closure.?;
+        var grown: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+        defer grown.deinit(self.allocator);
+        for (batch_start..closure.len()) |index| {
+            const fact = closure.factAt(index);
+            try grown.put(self.allocator, .{
+                .name = fact.predicate,
+                .arity = fact.terms.len,
+            }, {});
+        }
+        if (grown.count() == 0) return false;
+        const analysis = try self.ensureAnalysis();
+        for (self.rules.items) |rule| {
+            const rule_level = analysis.strata.get(predicateKey(rule.head)) orelse 0;
+            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            if (clausesReadGrownNonPositively(rule.body, &grown)) return true;
+        }
+        return false;
+    }
+
+    /// Runs semi-naive delta rounds for one stratum during batch
+    /// propagation. Unlike `expandLevel` there is no naive round zero: the
+    /// initial delta is everything appended since the batch began, and every
+    /// relational body occurrence is delta-joined because the batch may have
+    /// grown predicates at any lower stratum.
+    fn propagateLevel(
+        self: *Jatalog,
+        facts: *RelationStore,
+        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+        level: usize,
+        batch_start: usize,
+    ) !void {
+        const ActiveRule = struct {
+            rule: Rule,
+            occurrences: []usize,
+        };
+        var active: std.ArrayList(ActiveRule) = .empty;
+        defer {
+            for (active.items) |entry| self.allocator.free(entry.occurrences);
+            active.deinit(self.allocator);
+        }
+        for (self.rules.items) |rule| {
+            const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
+            if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
+            var occurrences: std.ArrayList(usize) = .empty;
+            errdefer occurrences.deinit(self.allocator);
+            if (rule.seed_argument == null) {
+                for (rule.body, 0..) |clause, clause_index| {
+                    if (clause == .relational)
+                        try occurrences.append(self.allocator, clause_index);
+                }
+            }
+            const owned = try occurrences.toOwnedSlice(self.allocator);
+            active.append(self.allocator, .{
+                .rule = rule,
+                .occurrences = owned,
+            }) catch |err| {
+                self.allocator.free(owned);
+                return err;
+            };
+        }
+
+        var delta_start = batch_start;
+        var value_mark = self.values.values.items.len;
+        while (true) {
+            const delta_end = facts.len();
+            const values_grew = self.values.values.items.len != value_mark;
+            if (delta_end == delta_start and !values_grew) break;
+            value_mark = self.values.values.items.len;
+            for (active.items) |entry| {
+                if (entry.rule.seed_argument != null) {
+                    try self.applyRule(facts, entry.rule, null);
+                } else for (entry.occurrences) |occurrence| {
+                    try self.applyRule(facts, entry.rule, .{
+                        .clause_index = occurrence,
+                        .delta_start = delta_start,
+                        .delta_end = delta_end,
+                    });
+                }
+            }
+            delta_start = delta_end;
+        }
+    }
+
     fn compileRelation(
         self: *Jatalog,
         predicate: []const u8,
@@ -706,6 +896,13 @@ pub const Jatalog = struct {
     }
 
     fn addFactExpr(self: *Jatalog, value: Expr) !void {
+        _ = try self.applyInsertion(value, false);
+    }
+
+    /// Inserts one ground base fact. When `propagate` is set the fact also
+    /// joins the clean closure for incremental propagation; otherwise the
+    /// first dependent stratum is marked dirty for the lazy rebuild path.
+    fn applyInsertion(self: *Jatalog, value: Expr, propagate: bool) !bool {
         if (!value.isGround() or value.negated) return Error.InvalidFact;
         const terms = try self.allocator.alloc(ValueId, value.terms.len);
         var terms_owned = true;
@@ -715,7 +912,17 @@ pub const Jatalog = struct {
         const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
         const added = try self.facts.insert(fact, false);
         terms_owned = false;
-        if (added) try self.markBaseChanged(key);
+        if (!added) return false;
+        if (propagate) {
+            const copy = try self.allocator.dupe(ValueId, terms);
+            _ = self.closure.?.insert(.{ .predicate = fact.predicate, .terms = copy }, false) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
+        } else {
+            try self.markBaseChanged(key);
+        }
+        return true;
     }
 
     /// Adds a rule whose body may contain aggregate clauses. On success the
@@ -2792,6 +2999,195 @@ test "materialization lifecycle releases every allocation on failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         materializationAllocationScenario,
+        .{},
+    );
+}
+
+/// Compares the database's materialized closure against a fresh naive
+/// rebuild from its current base facts and rules.
+fn expectClosureMatchesRebuild(db: *Jatalog) !void {
+    var staging = try db.clone();
+    defer staging.deinit();
+    var rebuilt = try staging.facts.clone();
+    defer rebuilt.deinit();
+    try staging.expandNaive(&rebuilt);
+    const closure = &db.closure.?;
+    try std.testing.expectEqual(rebuilt.len(), closure.len());
+    for (0..rebuilt.len()) |index|
+        try std.testing.expect(try closure.contains(rebuilt.factAt(index)));
+}
+
+test "insert-only batches propagate incrementally and match full rebuild" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(n0, n1). edge(n1, n2).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(n0, n2)?", 1);
+    const expansions_after_build = db.expansions;
+
+    // Each batch extends the chain; the closure stays clean and matches a
+    // full rebuild after every batch without any stratum expansion.
+    var name_buffer: [16]u8 = undefined;
+    var next_buffer: [16]u8 = undefined;
+    for (2..6) |index| {
+        const from = try std.fmt.bufPrint(&name_buffer, "n{d}", .{index});
+        const to = try std.fmt.bufPrint(&next_buffer, "n{d}", .{index + 1});
+        try std.testing.expect(try db.applyChanges(&.{
+            input.fact("edge", &.{ input.atom(from), input.atom(to) }),
+        }, &.{}));
+        try std.testing.expect(db.materialization == .clean);
+        try expectClosureMatchesRebuild(&db);
+    }
+    try std.testing.expectEqual(expansions_after_build, db.expansions);
+    try std.testing.expect(db.propagated_facts > 0);
+    try expectAnswerCount(&db, "path(n0, n6)?", 1);
+    try expectAnswerCount(&db, "path(X, Y)?", 21);
+}
+
+test "one inserted edge propagates each recursive consequence exactly once" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(c, d).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(X, Y)?", 6);
+
+    // Inserting edge(d, e) derives exactly the four new paths a-e, b-e,
+    // c-e, and d-e; each is propagated and counted exactly once.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
+    }, &.{}));
+    try std.testing.expectEqual(@as(usize, 4), db.propagated_facts);
+    try expectAnswerCount(&db, "path(X, Y)?", 10);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "duplicate base insertions produce no derived delta" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(a, b)?", 1);
+    const closure_len = db.closure.?.len();
+    const propagated = db.propagated_facts;
+
+    try std.testing.expect(!try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }, &.{}));
+    try std.testing.expectEqual(closure_len, db.closure.?.len());
+    try std.testing.expectEqual(propagated, db.propagated_facts);
+    try std.testing.expect(db.materialization == .clean);
+}
+
+test "propagation reaching negation or setof falls back to dirty rebuild" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). flag(a). flag(b).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\note(X) :- flag(X), not path(a, X).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "note(X)?", 1);
+    const expansions_after_build = db.expansions;
+
+    // flag is only read positively, so its insertion propagates through the
+    // negation stratum without any rebuild.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("flag", &.{input.atom("c")}),
+    }, &.{}));
+    try std.testing.expectEqual(expansions_after_build, db.expansions);
+    try std.testing.expect(db.materialization == .clean);
+    try expectAnswerCount(&db, "note(c)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // An edge insertion grows path, which the negation reads, so the
+    // negation stratum rebuilds while the positive stratum stays
+    // incremental.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("b"), input.atom("c") }),
+    }, &.{}));
+    try std.testing.expectEqual(expansions_after_build + 1, db.expansions);
+    try std.testing.expect(db.materialization == .clean);
+    try expectAnswerCount(&db, "note(c)?", 0);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "batch deletions and mixed batches use the rebuild path correctly" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(a, c)?", 1);
+
+    // Deleting an absent fact alone is a no-op that commits nothing.
+    try std.testing.expect(!try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("x"), input.atom("y") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+
+    // A mixed batch deletes one edge and inserts another as one transition.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
+    }, &.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }));
+    try expectAnswerCount(&db, "path(a, c)?", 0);
+    try expectAnswerCount(&db, "path(b, d)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{
+        input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
+    }, &.{}));
+    try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
+    }));
+}
+
+fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    var first = try db.execute("path(a, c)?");
+    first.deinit();
+    _ = try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
+    }, &.{});
+    _ = try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
+    }, &.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    });
+    var second = try db.execute("path(b, e)?");
+    defer second.deinit();
+    if (second.query.answers.items.len != 1) return error.UnexpectedAnswer;
+}
+
+test "batch updates roll back completely on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        batchUpdateAllocationScenario,
         .{},
     );
 }

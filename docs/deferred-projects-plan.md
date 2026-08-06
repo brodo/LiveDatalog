@@ -495,6 +495,35 @@ M1 was completed on 2026-08-06 with these decisions:
 - Failures during propagation roll back the complete batch.
 - Instrumentation distinguishes incrementally added facts from rebuilt facts.
 
+### Completed decisions
+
+M2 was completed on 2026-08-06 with these decisions:
+
+- `applyChanges(insertions, deletions)` is the batch API, taking exact
+  ground `input.Relation` descriptors (built with the new `input.fact`
+  helper) with set semantics. The batch runs on staging and commits only
+  when something changed, so failures roll back completely and a fully
+  no-op batch leaves no trace.
+- Insertions into a clean materialized closure append to both the base
+  store and the closure, then propagate stratum by stratum with the
+  semi-naive delta engine: no naive round zero, the initial delta is the
+  batch's index range, and every relational body occurrence is delta-joined
+  because a batch may grow predicates at any lower stratum. Statement-level
+  `addFact` keeps the M1 dirty-marking path.
+- A stratum blocks propagation only when one of its rules reads a
+  *grown* predicate through negation or anywhere inside a `setof` body;
+  negation over unchanged predicates propagates incrementally. A blocked
+  stratum is marked dirty and rebuilt through the M1 path, keeping the
+  incrementally updated strata below it.
+- Deletions always take the dirty-stratum rebuild path in M2, and a batch
+  containing an effective deletion disables propagation for its insertions.
+- Relation-store entries now carry a `support` counter (first insertion
+  plus one per duplicate attempt) as internal scaffolding for M3 deletion
+  work; it is never exposed as a Datalog value. The `propagated_facts`
+  counter distinguishes incrementally added facts from rebuilt facts, and a
+  test pins that one edge insertion into a three-edge chain propagates
+  exactly the four new derived paths.
+
 ## M3: deletion, recursion, and stratified negation
 
 ### Scope

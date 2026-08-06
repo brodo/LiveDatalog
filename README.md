@@ -97,6 +97,21 @@ They allocate nothing and cannot fail. Database operations synchronously
 borrow and compile the descriptors, so stack values and temporary slices are
 safe and remain caller-owned.
 
+`applyChanges` applies one batch of ground fact insertions and deletions
+atomically with set semantics, using `input.fact` descriptors:
+
+```zig
+const changed = try database.applyChanges(&.{
+    input.fact("edge", &.{ input.atom("b"), input.atom("c") }),
+}, &.{
+    input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+});
+```
+
+Insertions into a materialized database propagate incrementally through
+positive rules; deletions and updates that reach negation or `setof`
+rebuild the affected strata on the next query.
+
 Floats follow the finite-value policy from
 [ADR 0001](docs/adr/0001-finite-f64-scalars.md): compiling `input.float`
 reports `NumericType` for NaN and `NumericOverflow` for an infinity, and an
