@@ -3,9 +3,13 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 pub const input = @import("input.zig");
 const input_compiler = @import("input_compiler.zig");
+const relation_store = @import("relation_store.zig");
 
 const Id = u64;
 const ValueId = u64;
+const Fact = relation_store.Fact;
+const PredicateKey = relation_store.PredicateKey;
+const RelationStore = relation_store.RelationStore;
 pub const Error = error{
     InvalidFact,
     InvalidRule,
@@ -219,16 +223,6 @@ const Clause = union(enum) {
     aggregate: Aggregate,
 };
 
-const Fact = struct {
-    predicate: Id,
-    terms: []ValueId,
-};
-
-const PredicateKey = struct {
-    name: Id,
-    arity: usize,
-};
-
 fn predicateKey(expression: Expr) PredicateKey {
     return .{ .name = expression.predicate, .arity = expression.terms.len };
 }
@@ -435,7 +429,7 @@ pub const Jatalog = struct {
     strings: StringTable,
     scalars: scalar.Store,
     values: ValueTable,
-    facts: std.ArrayList(Fact) = .empty,
+    facts: RelationStore,
     rules: std.ArrayList(Rule) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
@@ -444,12 +438,12 @@ pub const Jatalog = struct {
             .strings = .init(allocator),
             .scalars = .init(allocator),
             .values = .init(allocator),
+            .facts = .init(allocator),
         };
     }
 
     pub fn deinit(self: *Jatalog) void {
-        for (self.facts.items) |fact| self.allocator.free(fact.terms);
-        self.facts.deinit(self.allocator);
+        self.facts.deinit();
         for (self.rules.items) |rule| {
             freeExpr(self.allocator, rule.head);
             for (rule.body) |clause| freeClauseTree(self.allocator, clause);
@@ -468,26 +462,15 @@ pub const Jatalog = struct {
             .strings = try self.strings.clone(),
             .scalars = undefined,
             .values = undefined,
+            .facts = undefined,
         };
         errdefer result.strings.deinit();
         result.scalars = try self.scalars.clone();
         errdefer result.scalars.deinit();
         result.values = try self.values.clone();
         errdefer result.values.deinit();
-        errdefer {
-            for (result.facts.items) |fact| self.allocator.free(fact.terms);
-            result.facts.deinit(self.allocator);
-        }
-        for (self.facts.items) |fact| {
-            const terms = try self.allocator.dupe(ValueId, fact.terms);
-            result.facts.append(self.allocator, .{
-                .predicate = fact.predicate,
-                .terms = terms,
-            }) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
-        }
+        result.facts = try self.facts.clone();
+        errdefer result.facts.deinit();
         errdefer {
             for (result.rules.items) |rule| freeRule(self.allocator, rule);
             result.rules.deinit(self.allocator);
@@ -508,15 +491,14 @@ pub const Jatalog = struct {
         staging.* = previous;
     }
 
-    fn commitRetraction(self: *Jatalog, staging: *const Jatalog) !void {
+    fn commitRetraction(self: *Jatalog, staging: *Jatalog) !void {
         var committed = try self.clone();
         defer committed.deinit();
-        var index = committed.facts.items.len;
+        var index = committed.facts.len();
         while (index > 0) {
             index -= 1;
-            if (containsFact(staging.facts.items, committed.facts.items[index])) continue;
-            committed.allocator.free(committed.facts.items[index].terms);
-            _ = committed.facts.orderedRemove(index);
+            if (try staging.facts.contains(committed.facts.factAt(index))) continue;
+            committed.facts.removeAt(index);
         }
         self.commit(&committed);
     }
@@ -653,11 +635,7 @@ pub const Jatalog = struct {
         errdefer self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
         const fact: Fact = .{ .predicate = value.predicate, .terms = terms };
-        if (containsFact(self.facts.items, fact)) {
-            self.allocator.free(terms);
-            return;
-        }
-        try self.facts.append(self.allocator, fact);
+        _ = try self.facts.insert(fact, false);
     }
 
     /// Adds a rule whose body may contain aggregate clauses. On success the
@@ -713,8 +691,8 @@ pub const Jatalog = struct {
             try self.validateClause(clause, &bound, &outer_variables, Error.InvalidQuery);
         for (goals) |clause| try self.internGroundStructuresInClause(clause);
 
-        var expanded = try self.cloneFacts();
-        defer deinitFacts(self.allocator, &expanded);
+        var expanded = try self.facts.clone();
+        defer expanded.deinit();
         try self.expand(&expanded);
 
         var internal_answers: std.ArrayList(Binding) = .empty;
@@ -724,7 +702,7 @@ pub const Jatalog = struct {
         }
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
-        try self.matchClauses(ordered, expanded.items, 0, &initial, &internal_answers);
+        try self.matchClauses(ordered, &expanded, 0, &initial, &internal_answers);
         return internal_answers;
     }
 
@@ -778,23 +756,7 @@ pub const Jatalog = struct {
         return parser.executeAll();
     }
 
-    fn cloneFacts(self: *Jatalog) !std.ArrayList(Fact) {
-        var result: std.ArrayList(Fact) = .empty;
-        errdefer deinitFacts(self.allocator, &result);
-        for (self.facts.items) |fact| {
-            const terms = try self.allocator.dupe(ValueId, fact.terms);
-            result.append(self.allocator, .{
-                .predicate = fact.predicate,
-                .terms = terms,
-            }) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
-        }
-        return result;
-    }
-
-    fn expand(self: *Jatalog, facts: *std.ArrayList(Fact)) !void {
+    fn expand(self: *Jatalog, facts: *RelationStore) !void {
         var levels = try self.computeStrata();
         defer levels.deinit(self.allocator);
         var max_level: usize = 0;
@@ -802,7 +764,7 @@ pub const Jatalog = struct {
 
         for (0..max_level + 1) |level| {
             while (true) {
-                const fact_count_before = facts.items.len;
+                const fact_count_before = facts.len();
                 const value_count_before = self.values.values.items.len;
                 for (self.rules.items) |rule| {
                     const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
@@ -825,7 +787,7 @@ pub const Jatalog = struct {
                             if (seeded) {
                                 self.matchClauses(
                                     rule.body,
-                                    facts.items,
+                                    facts,
                                     0,
                                     &initial,
                                     &answers,
@@ -838,21 +800,17 @@ pub const Jatalog = struct {
                     } else {
                         var initial: Binding = .{};
                         defer initial.deinit(self.allocator);
-                        try self.matchClauses(rule.body, facts.items, 0, &initial, &answers);
+                        try self.matchClauses(rule.body, facts, 0, &initial, &answers);
                     }
                     for (answers.items) |*answer| {
                         const derived = try self.deriveFact(rule.head, answer);
-                        if (containsFact(facts.items, derived)) {
+                        _ = facts.insert(derived, true) catch |err| {
                             self.allocator.free(derived.terms);
-                        } else {
-                            facts.append(self.allocator, derived) catch |err| {
-                                self.allocator.free(derived.terms);
-                                return err;
-                            };
-                        }
+                            return err;
+                        };
                     }
                 }
-                if (facts.items.len == fact_count_before and
+                if (facts.len() == fact_count_before and
                     self.values.values.items.len == value_count_before) break;
             }
         }
@@ -916,7 +874,7 @@ pub const Jatalog = struct {
     fn matchClauses(
         self: *Jatalog,
         clauses: []const Clause,
-        facts: []const Fact,
+        facts: *RelationStore,
         index: usize,
         bindings: *const Binding,
         answers: *std.ArrayList(Binding),
@@ -984,22 +942,47 @@ pub const Jatalog = struct {
             return;
         }
         if (expression.negated) {
-            for (facts) |fact| {
-                if (fact.predicate != expression.predicate or fact.terms.len != expression.terms.len) continue;
+            for (try self.lookupCandidates(facts, expression, bindings)) |candidate| {
                 var next = try bindings.clone(self.allocator);
                 defer next.deinit(self.allocator);
-                if (try self.unify(fact, expression, &next)) return;
+                if (try self.unify(facts.factAt(candidate), expression, &next)) return;
             }
             try self.matchClauses(clauses, facts, index + 1, bindings, answers);
             return;
         }
-        for (facts) |fact| {
-            if (fact.predicate != expression.predicate or fact.terms.len != expression.terms.len) continue;
+        for (try self.lookupCandidates(facts, expression, bindings)) |candidate| {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
-            if (try self.unify(fact, expression, &next))
+            if (try self.unify(facts.factAt(candidate), expression, &next))
                 try self.matchClauses(clauses, facts, index + 1, &next, answers);
         }
+    }
+
+    /// Resolves the goal's ground positions under the current bindings and
+    /// asks the store for candidate facts, in insertion order, through its
+    /// single lookup interface. Candidates are a superset of the matches;
+    /// callers unify each candidate exactly.
+    fn lookupCandidates(
+        self: *Jatalog,
+        facts: *RelationStore,
+        goal: Expr,
+        bindings: *const Binding,
+    ) ![]const u32 {
+        const key: PredicateKey = .{ .name = goal.predicate, .arity = goal.terms.len };
+        var mask: u64 = 0;
+        var bound: [64]ValueId = undefined;
+        var count: usize = 0;
+        for (goal.terms, 0..) |term, position| {
+            if (position >= 64) break;
+            const resolved = self.termToValue(term, bindings) catch |err| switch (err) {
+                Error.UnboundVariable => continue,
+                else => return err,
+            };
+            mask |= @as(u64, 1) << @intCast(position);
+            bound[count] = resolved;
+            count += 1;
+        }
+        return facts.lookup(key, mask, bound[0..count]);
     }
 
     fn unify(self: *Jatalog, fact: Fact, goal: Expr, bindings: *Binding) !bool {
@@ -1413,31 +1396,30 @@ pub const Jatalog = struct {
             for (answers.items) |*answer| answer.deinit(self.allocator);
             answers.deinit(self.allocator);
         }
-        var changed = false;
-        var index = self.facts.items.len;
-        while (index > 0) {
-            index -= 1;
-            const fact = self.facts.items[index];
-            var remove = false;
-            for (answers.items) |*answer| {
-                for (goals) |clause| {
-                    const goal = switch (clause) {
-                        .relational => |expression| expression,
-                        else => continue,
-                    };
-                    if (goal.predicate != fact.predicate or goal.terms.len != fact.terms.len) continue;
+        var to_remove: std.ArrayList(usize) = .empty;
+        defer to_remove.deinit(self.allocator);
+        var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer seen.deinit(self.allocator);
+        for (answers.items) |*answer| {
+            for (goals) |clause| {
+                const goal = switch (clause) {
+                    .relational => |expression| expression,
+                    else => continue,
+                };
+                for (try self.lookupCandidates(&self.facts, goal, answer)) |candidate| {
+                    if (seen.contains(candidate)) continue;
                     var matched = try answer.clone(self.allocator);
                     defer matched.deinit(self.allocator);
-                    if (try self.unify(fact, goal, &matched)) remove = true;
+                    if (try self.unify(self.facts.factAt(candidate), goal, &matched)) {
+                        try seen.put(self.allocator, candidate, {});
+                        try to_remove.append(self.allocator, candidate);
+                    }
                 }
             }
-            if (remove) {
-                self.allocator.free(fact.terms);
-                _ = self.facts.orderedRemove(index);
-                changed = true;
-            }
         }
-        return changed;
+        std.mem.sort(usize, to_remove.items, {}, std.sort.desc(usize));
+        for (to_remove.items) |index| self.facts.removeAt(index);
+        return to_remove.items.len > 0;
     }
 
     fn writeValue(self: *const Jatalog, writer: *std.Io.Writer, value: ValueId) !void {
@@ -1768,20 +1750,6 @@ fn isTailDescendant(ancestor: Term, candidate: Term) bool {
         if (termEqual(current, candidate)) return true;
     }
     return false;
-}
-
-fn factsEqual(a: Fact, b: Fact) bool {
-    return a.predicate == b.predicate and std.mem.eql(Id, a.terms, b.terms);
-}
-
-fn containsFact(facts: []const Fact, needle: Fact) bool {
-    for (facts) |fact| if (factsEqual(fact, needle)) return true;
-    return false;
-}
-
-fn deinitFacts(allocator: std.mem.Allocator, facts: *std.ArrayList(Fact)) void {
-    for (facts.items) |fact| allocator.free(fact.terms);
-    facts.deinit(allocator);
 }
 
 const Parser = struct {
@@ -2192,6 +2160,66 @@ test "a parse error after a query releases the previous result" {
         \\p(a). p(X)?
         \\bad(X) :- q(X), X <>.
     ));
+}
+
+test {
+    _ = relation_store;
+}
+
+test "indexed lookups match every structural binding pattern deterministically" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(a, c).
+        \\holds([1, 2], a). holds([1, [2, 3]], b). holds(cons(1, 2), c). holds([], d).
+        \\p(a). p(a, b).
+    );
+    setup.deinit();
+
+    // Bound-position patterns over atoms.
+    try expectAnswerCount(&db, "edge(a, X)?", 2);
+    try expectAnswerCount(&db, "edge(X, Y)?", 3);
+    try expectAnswerCount(&db, "edge(a, b)?", 1);
+    try expectAnswerCount(&db, "edge(c, X)?", 0);
+
+    // Answers arrive in fact insertion order.
+    var ordered = try db.execute("edge(X, c)?");
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ordered.query.answers.items.len);
+    try std.testing.expectEqualStrings("b", try ordered.query.answers.items[0].getAtom("X"));
+    try std.testing.expectEqualStrings("a", try ordered.query.answers.items[1].getAtom("X"));
+
+    // Bound structural values: proper, nested, improper, and empty lists.
+    var proper = try db.execute("holds([1, 2], X)?");
+    defer proper.deinit();
+    try std.testing.expectEqualStrings("a", try proper.query.answers.items[0].getAtom("X"));
+    var nested = try db.execute("holds([1, [2, 3]], X)?");
+    defer nested.deinit();
+    try std.testing.expectEqualStrings("b", try nested.query.answers.items[0].getAtom("X"));
+    var improper = try db.execute("holds(cons(1, 2), X)?");
+    defer improper.deinit();
+    try std.testing.expectEqualStrings("c", try improper.query.answers.items[0].getAtom("X"));
+    var empty = try db.execute("holds([], X)?");
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("d", try empty.query.answers.items[0].getAtom("X"));
+
+    // A structural value bound through the second position.
+    var reverse = try db.execute("holds(X, c)?");
+    defer reverse.deinit();
+    try expectBindingValue(&db, &reverse.query.answers.items[0], "X", "cons(1, 2)");
+
+    // A partially ground structure is unbound for indexing and still unifies.
+    try expectAnswerCount(&db, "holds([1, T], X)?", 2);
+
+    // One predicate name at two arities never shares matches.
+    try expectAnswerCount(&db, "p(X)?", 1);
+    try expectAnswerCount(&db, "p(X, Y)?", 1);
+
+    // Retraction through the same lookup interface removes exactly one fact.
+    var retract = try db.execute("edge(a, X)~");
+    defer retract.deinit();
+    try expectAnswerCount(&db, "edge(X, Y)?", 1);
+    try expectAnswerCount(&db, "edge(b, c)?", 1);
 }
 
 fn expectBindingValue(
@@ -3349,7 +3377,7 @@ test "non-finite typed floats fail compilation transactionally" {
     defer db.deinit();
     try db.addFact("kept", &.{input.integer(1)});
     const scalar_count = db.scalars.values.items.len;
-    const fact_count = db.facts.items.len;
+    const fact_count = db.facts.len();
 
     try std.testing.expectError(
         Error.NumericType,
@@ -3377,7 +3405,7 @@ test "non-finite typed floats fail compilation transactionally" {
     );
 
     try std.testing.expectEqual(scalar_count, db.scalars.values.items.len);
-    try std.testing.expectEqual(fact_count, db.facts.items.len);
+    try std.testing.expectEqual(fact_count, db.facts.len());
     try std.testing.expectEqual(@as(usize, 0), db.rules.items.len);
     try expectAnswerCount(&db, "kept(1)?", 1);
     try expectAnswerCount(&db, "bad(X)?", 0);

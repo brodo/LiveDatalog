@@ -57,3 +57,17 @@ the 2026-07-30 baseline.
 
 Project S is complete; the median remains within run-to-run noise of the
 2026-07-30 baseline.
+
+## 2026-08-06 after P1 (relation store and indexes)
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.0
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 1.984, 1.987, 1.995, 2.022, and 2.010 ms
+- median: **1.995 ms/query**
+
+Routing evaluation through the indexed `RelationStore` reduced the median
+from 6.117 ms to 1.995 ms per query (about 3.1x) because recursive-closure
+joins now probe lazily built bound-position indexes instead of scanning the
+full fact list. Queries still rebuild all derived facts; persistent
+materialization is deferred to project M.

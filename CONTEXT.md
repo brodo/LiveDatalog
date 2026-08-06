@@ -31,3 +31,13 @@ Canonical ground values have a deterministic total order: numbers in numeric
 order, atoms in lexical byte order, `nil`, then cons values lexicographically
 by head and tail. The total order reports equality exactly when scalar identity
 is equal.
+
+### Relation store
+
+The indexed owner of ground facts (`relation_store.zig`). Its
+insertion-ordered entry list is the source of truth; exact membership, per
+predicate/arity buckets, and lazily created bound-position pattern indexes
+are rebuildable caches over it. Pattern indexes are candidate prefilters:
+evaluation unifies every candidate, so indexing can never change which facts
+match, only how quickly candidates are found. Base and derived facts share
+one store per evaluation but stay distinguishable through a per-entry flag.

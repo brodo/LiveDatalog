@@ -295,6 +295,29 @@ materialization changes query behavior.
 Stop when evaluation still rebuilds per query but no semantic path depends on
 directly scanning a raw fact slice.
 
+### Completed decisions
+
+P1 was completed on 2026-08-06 with these decisions:
+
+- `relation_store.zig` owns `Fact`, `PredicateKey`, and `RelationStore`. The
+  insertion-ordered entry list is the source of truth and keeps answer order
+  deterministic; exact membership, per-predicate/arity buckets, and
+  bound-position pattern indexes are lazily built caches over it. A cache that
+  cannot absorb an insert is destroyed and rebuilt on next use, so caches are
+  always either consistent or absent; removal drops all caches.
+- Pattern indexes are candidate prefilters keyed by a hash of the projected
+  bound values. Evaluation always unifies every candidate, so hash collisions
+  and positions past 64 can only add candidates, never hide matches.
+  Bound positions are resolved through `termToValue` under the current
+  bindings, so ground structural terms index by canonical value identity.
+- Positive matching, negation probes, aggregate bodies (via recursion),
+  duplicate checks in `addFact` and `expand`, retraction matching, and
+  retraction commits all route through `insert`/`contains`/`lookup`. Query
+  evaluation clones the base store and `expand` inserts derived facts marked
+  with a per-entry `derived` flag, keeping the partitions distinguishable.
+- The aggregation benchmark median improved from 6.117 ms to 1.995 ms per
+  query (about 3.1x).
+
 ## P2: semi-naive positive recursion
 
 ### Scope
