@@ -13,6 +13,11 @@ recursive transitive closure (300 `reachable` tuples), and collects every
 runs ten identical summary queries. Each query intentionally rebuilds all
 derived facts because persistent or incremental materialization is deferred.
 
+Since M6 the same executable also runs two update workloads that toggle one
+shortcut edge between queries, once with incremental maintenance and once
+with a full rebuild after every change. Historical medians below refer to the
+first workload, whose protocol is unchanged.
+
 ## 2026-07-30 baseline
 
 - Zig 0.16.0, `ReleaseFast`
@@ -177,6 +182,53 @@ with the pending deletions, and skip incremental maintenance in favour of a
 stratum rebuild when the number of affected groups approaches the total. The
 M6 completion gate is the natural home for both, since it already calls for
 insert, delete, and mixed-update benchmarks.
+
+## 2026-08-06 after M6 (maintenance API and update benchmarks)
+
+Query workload, unchanged protocol: 51.4, 52.9, and 55.2 us/query, median
+**52.9 us/query**, within noise of M5.
+
+### 25-node baseline, one edge changed between queries
+
+| Path | ns/change |
+| --- | --- |
+| incremental maintenance | 453795, 461720, 537262 |
+| full rebuild after each change | 902745, 923920, 1439758 |
+
+Incremental maintenance is about **2x faster than full rebuild** here, with
+zero rebuild fallbacks reported. This is the workload shape incremental
+maintenance suits: a large recursive closure where one edge changes a
+comparatively small part of it.
+
+### Insert, delete, mixed, and negation workloads
+
+`zig build benchmark-maintenance -Doptimize=ReleaseFast` builds a 40-node
+chain plus 40 aggregate groups of 8 members and reports per batch, for each
+update category, the time, the delta sizes, the number of aggregate groups
+recomputed, the rebuild fallbacks, and memory measured with a counting
+allocator.
+
+| Workload | ns/batch | derived | removed | groups | fallbacks | live KiB | peak KiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| insert-only | 511994 | 81 | 80 | 40 | 0 | 74 | 420 |
+| delete-only | 615869 | 68 | 120 | 40 | 0 | 51 | 366 |
+| mixed | 710954 | 76 | 120 | 40 | 0 | 57 | 381 |
+| negation rebuild | 246286 | 0 | 0 | 0 | 20 | 27 | 408 |
+
+The `negation rebuild` row updates a predicate read under negation, which is
+the documented category that cannot be maintained incrementally. It is
+*faster* than the incrementally maintained rows, which is consistent with the
+projected-aggregate comparison above: on databases of this size the fixed
+per-batch overhead of maintenance — chiefly the staged copy of the database
+and the closure snapshot taken for over-deletion — exceeds the cost of
+recomputing a stratum. Peak memory is dominated by that staging copy in every
+category.
+
+Taken together, the three measurements say incremental maintenance wins when
+one change touches a small fraction of a large derived relation, and loses to
+recomputation when the derived relation is small or the change touches most
+of it. Choosing between them automatically needs a cost model, which no phase
+of this project specifies.
 
 ## 2026-08-06 after M5 (projected views and CReaM counts)
 

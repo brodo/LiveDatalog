@@ -753,6 +753,49 @@ M5 was completed on 2026-08-06 with these decisions:
 - No update category silently falls outside the documented incremental or
   rebuild path.
 
+### Completed decisions
+
+M6 was completed on 2026-08-06, finishing Project M:
+
+- The public maintenance API is `materialize`, `rebuild`, `applyChanges`,
+  `maintenanceStats`, and `setShadowVerification`. `addFact`, `execute`, and
+  `retract` are unchanged and interoperate with the batch API; a legacy
+  retraction leaves the closure dirty, so a following batch rebuilds rather
+  than propagating until the closure is materialized again.
+- Maintenance stays lazy by default — an update marks strata and the next
+  query repairs them — with `materialize` as the eager trigger and `rebuild`
+  as the always-available reference path. Both run on staging and commit
+  atomically.
+- Shadow verification compares the maintained closure against a fresh
+  rebuild *before* the batch commits, so `MaintenanceMismatch` leaves the
+  database untouched. It runs on a throwaway copy and never pollutes the
+  database being verified.
+- Aggregate changes reach downstream strata through the existing deletion
+  and insertion cascades; no separate propagation layer was needed.
+  Downstream structural recursion recomputes inside its own stratum, because
+  seed rules are evaluated naively within the stratum they belong to, which
+  is the scoped fallback the phase asks for.
+- `MaintenanceStats` gained `rebuild_fallbacks` and `maintained_groups`, so
+  every update category is observable: incremental insertion, incremental
+  deletion, aggregate group maintenance, or rebuild fallback.
+- Benchmarks: `benchmark-maintenance` reports time, delta sizes, groups
+  touched, rebuild fallbacks, and memory for insert, delete, mixed, and
+  negation-blocked workloads; the 25-node baseline gained edge-change
+  workloads comparing incremental maintenance against full rebuild.
+- Measured honestly, incremental maintenance is about 2x faster than rebuild
+  on the 25-node closure workload, and *slower* than rebuild on small
+  aggregate-heavy databases, where fixed per-batch overhead dominates. See
+  [`aggregation-performance.md`](aggregation-performance.md).
+- Deliberately not done: removing the whole-closure snapshot that
+  `propagateDeletions` takes. Deferring removal so over-deletion can join
+  against the live closure does not work, because over-deletion at stratum L
+  needs the pre-deletion state of strata at or below L, and a derivation
+  consuming two deleted facts is invisible from either pinning direction
+  once both are gone. Eliminating the snapshot needs matching that can read
+  the closure together with the pending deletions, which is an evaluator
+  change rather than a local fix. A cost model that chooses between
+  maintenance and recomputation is likewise unspecified by this plan.
+
 # Project F: query folding
 
 Query folding is a planner feature, not a transparent evaluator optimization.

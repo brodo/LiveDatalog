@@ -108,17 +108,51 @@ const changed = try database.applyChanges(&.{
 });
 ```
 
-Insertions into a materialized database propagate incrementally through
-positive rules, and deletions use delete-and-rederive, so facts with an
-alternative proof survive while unsupported recursive consequences —
-including cyclically self-supporting ones — disappear. A rule with a single
-unnested `setof` maintains only the groups an update touched. When such a
-rule's head projects an outer variable away, several groups can derive the
-same tuple, so derivation counts decide when it appears and disappears.
-Updates that reach negation, or an aggregate outside that class, recompute
-the affected strata. Every path is checked against a full rebuild.
-`maintenanceStats` reports closure size, incremental work, and how the
-maintained views are classified.
+### Maintenance
+
+LiveDatalog keeps a materialized closure of all derived facts and updates it
+incrementally.
+
+**Eager versus lazy.** Materialization is lazy: an update marks the affected
+strata and the next query repairs them. `materialize` forces that work to
+happen now, and `rebuild` discards the closure and recomputes everything from
+the base facts. A database with no rules never allocates derived state.
+
+```zig
+try database.materialize(); // bring the closure up to date now
+try database.rebuild();     // recompute it from scratch
+const stats = database.maintenanceStats();
+```
+
+**Update paths.** Every update takes one of three documented paths:
+
+- insertions propagate through positive rules with semi-naive deltas;
+- deletions use delete-and-rederive, so a fact with an alternative proof
+  survives while unsupported recursive consequences — including cyclically
+  self-supporting ones — disappear;
+- updates reaching negation, or an aggregate outside the maintained class of
+  one unnested `setof` per rule, recompute the affected strata.
+
+A maintained aggregate rule recomputes only the groups an update touched.
+When its head projects an outer variable away, several groups can derive the
+same tuple, so derivation counts decide when that tuple appears and
+disappears. `maintenanceStats` reports closure size, facts added and removed
+incrementally, groups recomputed, rebuild fallbacks, and how the views are
+classified.
+
+**Batching and atomicity.** `applyChanges` applies one batch as a single
+transition with set semantics. It runs on a staged copy and commits only on
+success, so an allocation failure, an invalid descriptor, or a failed
+verification leaves the database exactly as it was. `addFact`, `execute`,
+and `retract` remain available and interoperate with the batch API.
+
+**Ownership.** Input descriptors are borrowed for the duration of a call and
+never retained. Query results own their data and outlive the database.
+
+**Debugging.** `setShadowVerification(true)` makes every maintained closure
+be compared against a fresh rebuild before the change commits, reporting a
+disagreement as `MaintenanceMismatch`. It roughly doubles update cost and is
+meant for tests.
 
 Floats follow the finite-value policy from
 [ADR 0001](docs/adr/0001-finite-f64-scalars.md): compiling `input.float`
@@ -171,6 +205,10 @@ zig build benchmark-materialization -Doptimize=ReleaseFast
 
 ```sh
 zig build benchmark-projected-aggregate -Doptimize=ReleaseFast
+```
+
+```sh
+zig build benchmark-maintenance -Doptimize=ReleaseFast
 ```
 
 See [Aggregation performance](docs/aggregation-performance.md) for the workload

@@ -54,6 +54,16 @@ maintained value is the rule's head tuple for that binding. Group existence
 therefore comes from the outer goals: a group whose last member disappears
 still yields `[]`, while removing the group key removes the tuple.
 
+### Update path
+
+Every base-fact update takes exactly one of three paths, all of which yield
+the same database a clean rebuild would: incremental insertion propagation
+through positive rules, delete-and-rederive for deletions, or a stratum
+rebuild when the update reaches negation or an aggregate outside the
+maintained class. Aggregate group maintenance runs on top of the first two.
+`maintenanceStats` makes the path taken observable, and shadow verification
+checks the result against a rebuild before committing.
+
 ### Projected view
 
 A maintained aggregate rule whose head omits some outer variable, so several

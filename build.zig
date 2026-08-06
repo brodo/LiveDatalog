@@ -164,6 +164,21 @@ pub fn build(b: *std.Build) void {
     );
     projected_benchmark_step.dependOn(&b.addRunArtifact(projected_benchmark_exe).step);
 
+    const maintenance_benchmark_exe = b.addExecutable(.{
+        .name = "maintenance-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/maintenance.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const maintenance_benchmark_step = b.step(
+        "benchmark-maintenance",
+        "Run insert, delete, and mixed update workloads with maintenance statistics",
+    );
+    maintenance_benchmark_step.dependOn(&b.addRunArtifact(maintenance_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

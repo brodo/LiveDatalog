@@ -24,6 +24,9 @@ pub const Error = error{
     NotAdmissible,
     UnknownVariable,
     TypeMismatch,
+    /// Shadow verification found the maintained closure disagreeing with a
+    /// fresh rebuild. Only reachable with `setShadowVerification(true)`.
+    MaintenanceMismatch,
 };
 
 /// Interns predicate and variable symbols used by a database. IDs are
@@ -583,9 +586,15 @@ pub const QueryResult = struct {
 
 pub const MaintenanceStats = struct {
     closure_facts: usize,
+    /// Facts added to the closure by incremental insertion propagation.
     propagated_facts: usize,
+    /// Facts removed from the closure by delete-and-rederive.
     removed_facts: usize,
     stratum_expansions: usize,
+    /// Updates that abandoned incremental maintenance for a stratum rebuild.
+    rebuild_fallbacks: usize,
+    /// Aggregate groups recomputed by incremental maintenance.
+    maintained_groups: usize,
     /// Maintained aggregate views whose head retains every outer variable.
     self_maintainable_views: usize,
     /// Maintained aggregate views whose head projects outer variables away
@@ -633,6 +642,13 @@ pub const Jatalog = struct {
     /// Counts facts removed from the closure by incremental
     /// delete-and-rederive, net of rederived facts.
     removed_facts: usize = 0,
+    /// Counts updates that abandoned incremental maintenance for a
+    /// stratum rebuild.
+    rebuild_fallbacks: usize = 0,
+    /// Counts aggregate groups recomputed by incremental maintenance.
+    maintained_groups: usize = 0,
+    /// Debug mode: verify every maintained closure against a fresh rebuild.
+    shadow_verification: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -684,6 +700,9 @@ pub const Jatalog = struct {
         result.expansions = self.expansions;
         result.propagated_facts = self.propagated_facts;
         result.removed_facts = self.removed_facts;
+        result.rebuild_fallbacks = self.rebuild_fallbacks;
+        result.maintained_groups = self.maintained_groups;
+        result.shadow_verification = self.shadow_verification;
         errdefer {
             for (result.auxiliary.items) |*view| view.deinit(self.allocator);
             result.auxiliary.deinit(self.allocator);
@@ -802,8 +821,62 @@ pub const Jatalog = struct {
         var staging = try self.clone();
         defer staging.deinit();
         const changed = try staging.applyChangesCompiled(insertions, deletions);
+        try staging.verifyShadow();
         if (changed) self.commit(&staging);
         return changed;
+    }
+
+    /// Brings the derived closure up to date now instead of at the next
+    /// query. Maintenance is otherwise lazy: an update marks the affected
+    /// strata and the next evaluation repairs them. Calling this on a
+    /// database without rules is a no-op and allocates nothing.
+    pub fn materialize(self: *Jatalog) !void {
+        var staging = try self.clone();
+        defer staging.deinit();
+        try staging.ensureMaterialized();
+        try staging.verifyShadow();
+        self.commit(&staging);
+    }
+
+    /// Discards the derived closure and every auxiliary view and recomputes
+    /// them from the current base facts and rules. This is the reference
+    /// path incremental maintenance is checked against; it is always
+    /// available and always correct, at the cost of full recomputation.
+    pub fn rebuild(self: *Jatalog) !void {
+        var staging = try self.clone();
+        defer staging.deinit();
+        if (staging.closure) |*closure| {
+            closure.deinit();
+            staging.closure = null;
+        }
+        staging.dropAuxiliaryViews();
+        staging.materialization = .uninitialized;
+        try staging.ensureMaterialized();
+        self.commit(&staging);
+    }
+
+    /// Enables or disables shadow verification. When enabled, every
+    /// maintained closure is compared against a fresh rebuild from the same
+    /// base facts before the change is committed, and a disagreement is
+    /// reported as `MaintenanceMismatch` with the database unchanged. This
+    /// roughly doubles update cost and is intended for tests and debugging.
+    pub fn setShadowVerification(self: *Jatalog, enabled: bool) void {
+        self.shadow_verification = enabled;
+    }
+
+    /// Compares the maintained closure against a rebuild performed on a
+    /// throwaway copy, so verification never disturbs this database.
+    fn verifyShadow(self: *Jatalog) !void {
+        if (!self.shadow_verification) return;
+        const closure = if (self.closure) |*value| value else return;
+        var staging = try self.clone();
+        defer staging.deinit();
+        var reference = try staging.facts.clone();
+        defer reference.deinit();
+        try staging.expandNaive(&reference);
+        if (reference.len() != closure.len()) return Error.MaintenanceMismatch;
+        for (0..reference.len()) |index|
+            if (!try closure.contains(reference.factAt(index))) return Error.MaintenanceMismatch;
     }
 
     fn applyChangesCompiled(
@@ -872,6 +945,7 @@ pub const Jatalog = struct {
         var level: usize = 0;
         while (level <= max_level) : (level += 1) {
             if (try self.propagationBlocked(level, batch_start)) {
+                self.rebuild_fallbacks += 1;
                 self.markDirty(level);
                 try self.ensureMaterialized();
                 return;
@@ -948,6 +1022,7 @@ pub const Jatalog = struct {
         while (true) {
             round += 1;
             if (round > round_cap) {
+                self.rebuild_fallbacks += 1;
                 self.markDirty(0);
                 return self.ensureMaterialized();
             }
@@ -1071,6 +1146,7 @@ pub const Jatalog = struct {
             }
         }
 
+        self.maintained_groups += groups.items.len;
         for (groups.items) |*group| {
             if (view) |projected| {
                 try self.maintainProjectedGroup(rule, projected, group, removals, additions);
@@ -1433,6 +1509,7 @@ pub const Jatalog = struct {
         var level: usize = 0;
         while (level <= analysis.max_level) : (level += 1) {
             if (try self.deletionBlocked(level, deleted)) {
+                self.rebuild_fallbacks += 1;
                 self.markDirty(level);
                 try self.ensureMaterialized();
                 return;
@@ -1925,6 +2002,8 @@ pub const Jatalog = struct {
             .propagated_facts = self.propagated_facts,
             .removed_facts = self.removed_facts,
             .stratum_expansions = self.expansions,
+            .rebuild_fallbacks = self.rebuild_fallbacks,
+            .maintained_groups = self.maintained_groups,
             .self_maintainable_views = self_maintainable,
             .projected_views = projected,
             .auxiliary_tuples = auxiliary_tuples,
@@ -4891,6 +4970,250 @@ test "projected view counts agree with explicit proof enumeration" {
             }
             try std.testing.expectEqual(expected, try derivationCountOf(&db, "v", key));
         }
+    }
+}
+
+test "aggregate changes propagate through downstream list functions and arithmetic" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\team(red). team(blue).
+        \\roster(T, S) :- team(T), setof(P, plays(T, P), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(T, N) :- roster(T, S), length(S, N).
+        \\headcount(T, N) :- size(T, M), N = M + 1.
+        \\staffed(T) :- size(T, N), N > 1.
+    );
+    setup.deinit();
+    try db.materialize();
+
+    // Empty rosters flow through length, arithmetic, and the comparison.
+    var initial = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
+    initial.deinit();
+    try expectAnswerCount(&db, "staffed(T)?", 0);
+
+    // Growing one group must reach every downstream stratum.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("plays", &.{ input.atom("red"), input.atom("ann") }),
+        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+    }, &.{}));
+    var grown = try db.execute("size(red, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
+    grown.deinit();
+    var counted = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 3), try counted.query.answers.items[0].getInteger("N"));
+    counted.deinit();
+    try expectAnswerCount(&db, "staffed(red)?", 1);
+    try expectAnswerCount(&db, "staffed(blue)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // Shrinking it retracts the downstream conclusions again.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+    }));
+    var shrunk = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try shrunk.query.answers.items[0].getInteger("N"));
+    shrunk.deinit();
+    try expectAnswerCount(&db, "staffed(T)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // A downstream structural-recursive component recomputes within its own
+    // stratum rather than forcing a whole-closure rebuild.
+    const stats = db.maintenanceStats();
+    try std.testing.expect(stats.maintained_groups > 0);
+}
+
+test "materialize rebuild and stats form the explicit maintenance API" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\group(g). member(g, m1).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+
+    // Maintenance is lazy until asked: nothing is materialized yet.
+    try std.testing.expect(db.closure == null);
+    try std.testing.expectEqual(@as(usize, 0), db.maintenanceStats().closure_facts);
+
+    try db.materialize();
+    try std.testing.expect(db.materialization == .clean);
+    const after_materialize = db.maintenanceStats();
+    try std.testing.expect(after_materialize.closure_facts > 0);
+    try std.testing.expectEqual(@as(usize, 0), after_materialize.rebuild_fallbacks);
+
+    // materialize is idempotent and performs no further expansion.
+    try db.materialize();
+    try std.testing.expectEqual(
+        after_materialize.stratum_expansions,
+        db.maintenanceStats().stratum_expansions,
+    );
+
+    // rebuild recomputes from base facts and reproduces the same closure.
+    try db.rebuild();
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(after_materialize.closure_facts, db.maintenanceStats().closure_facts);
+    try expectClosureMatchesRebuild(&db);
+    try expectAnswerCount(&db, "path(a, c)?", 1);
+
+    // The legacy entry points keep working alongside the batch API.
+    try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
+    try expectAnswerCount(&db, "path(a, d)?", 1);
+    var executed = try db.execute("edge(d, e).");
+    executed.deinit();
+    try expectAnswerCount(&db, "path(a, e)?", 1);
+    try std.testing.expect(try db.retract(&.{
+        input.relation("edge", &.{ input.atom("d"), input.atom("e") }),
+    }));
+    try expectAnswerCount(&db, "path(a, e)?", 0);
+
+    // A legacy retraction leaves the closure dirty, so incremental
+    // propagation resumes only once it is materialized again.
+    try db.materialize();
+
+    // An inserted edge derives new path facts through the delta engine.
+    const before_edge = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
+    }, &.{}));
+    try expectAnswerCount(&db, "path(a, e)?", 1);
+    try std.testing.expect(db.maintenanceStats().propagated_facts > before_edge.propagated_facts);
+
+    // An inserted member recomputes exactly the affected aggregate group.
+    const before_member = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
+    }, &.{}));
+    var collected = try db.execute("collected(g, S)?");
+    try expectBindingValue(&db, &collected.query.answers.items[0], "S", "[m1, m2]");
+    collected.deinit();
+    try std.testing.expect(db.maintenanceStats().maintained_groups > before_member.maintained_groups);
+    try expectClosureMatchesRebuild(&db);
+
+    const before_delete = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("b"), input.atom("c") }),
+    }));
+    try expectAnswerCount(&db, "path(a, c)?", 0);
+    try std.testing.expect(db.maintenanceStats().removed_facts > before_delete.removed_facts);
+    try expectClosureMatchesRebuild(&db);
+
+    // Every update category is accounted for by one of the documented
+    // paths: incremental propagation, delete-and-rederive, or rebuild.
+    const stats = db.maintenanceStats();
+    try std.testing.expect(stats.propagated_facts > 0);
+    try std.testing.expect(stats.removed_facts > 0);
+    try std.testing.expectEqual(@as(usize, 1), stats.self_maintainable_views);
+}
+
+test "shadow verification accepts maintained closures and reports corruption" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). group(g). member(g, m1).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\reachable(X) :- path(a, X).
+        \\unreachable(X) :- edge(X, Y), not reachable(X).
+    );
+    setup.deinit();
+    try db.materialize();
+
+    // Insertions, deletions, and aggregate changes all pass verification.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
+        input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
+    }, &.{}));
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }));
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }, &.{
+        input.fact("member", &.{ input.atom("g"), input.atom("m1") }),
+    }));
+    try expectClosureMatchesRebuild(&db);
+
+    // A closure corrupted behind the maintenance engine's back is caught:
+    // this path tuple has no derivation from any base fact.
+    const terms = try std.testing.allocator.alloc(ValueId, 2);
+    var terms_owned = true;
+    defer if (terms_owned) std.testing.allocator.free(terms);
+    terms[0] = try db.values.intern(.{ .scalar = try db.scalars.internAtom("phantom1") });
+    terms[1] = try db.values.intern(.{ .scalar = try db.scalars.internAtom("phantom2") });
+    const added = try db.closure.?.insert(.{
+        .predicate = db.strings.get("path").?,
+        .terms = terms,
+    }, true);
+    terms_owned = false;
+    try std.testing.expect(added);
+    try std.testing.expectError(Error.MaintenanceMismatch, db.applyChanges(&.{
+        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
+    }, &.{}));
+}
+
+test "randomized mixed traces hold under shadow verification" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\node(a). node(b). node(c). group(g1). group(g2).
+        \\edge(a, b).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(G, N) :- collected(G, S), length(S, N).
+        \\quiet(G) :- group(G), not member(G, m1).
+    );
+    setup.deinit();
+    try db.materialize();
+
+    const nodes = [_][]const u8{ "a", "b", "c" };
+    const groups = [_][]const u8{ "g1", "g2" };
+    const members = [_][]const u8{ "m1", "m2" };
+    var prng = std.Random.DefaultPrng.init(0x5ade0e5ade0e);
+    const random = prng.random();
+    for (0..30) |_| {
+        var edge_terms: [2]input.Term = .{
+            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
+            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
+        };
+        var member_terms: [2]input.Term = .{
+            input.atom(groups[random.uintLessThan(usize, groups.len)]),
+            input.atom(members[random.uintLessThan(usize, members.len)]),
+        };
+        const insert_edge = random.boolean();
+        var inserts: [2]input.Relation = undefined;
+        var deletes: [2]input.Relation = undefined;
+        var insert_count: usize = 0;
+        var delete_count: usize = 0;
+        if (insert_edge) {
+            inserts[insert_count] = input.fact("edge", &edge_terms);
+            insert_count += 1;
+        } else {
+            deletes[delete_count] = input.fact("edge", &edge_terms);
+            delete_count += 1;
+        }
+        if (random.boolean()) {
+            inserts[insert_count] = input.fact("member", &member_terms);
+            insert_count += 1;
+        } else {
+            deletes[delete_count] = input.fact("member", &member_terms);
+            delete_count += 1;
+        }
+        // Shadow verification asserts rebuild equality inside the call.
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try expectClosureMatchesRebuild(&db);
     }
 }
 
