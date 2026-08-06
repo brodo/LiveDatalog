@@ -133,6 +133,10 @@ const InputBuilder = struct {
         return .{ .scalar = try self.database.scalars.internInteger(integer) };
     }
 
+    pub fn floatTerm(self: *InputBuilder, float: f64) !Term { // ziglint-ignore: Z012
+        return .{ .scalar = try self.database.scalars.internFloat(float) };
+    }
+
     pub fn variableTerm(self: *InputBuilder, name: []const u8) !Term { // ziglint-ignore: Z012
         return .{ .variable = try self.database.strings.intern(name) };
     }
@@ -284,6 +288,13 @@ pub const ResultValue = struct {
         };
     }
 
+    pub fn getFloat(self: ResultValue) Error!f64 {
+        return switch (self.node.*) {
+            .float => |value| value,
+            else => Error.TypeMismatch,
+        };
+    }
+
     pub fn head(self: ResultValue) Error!ResultValue {
         return switch (self.node.*) {
             .cons => |pair| .{ .node = pair.head },
@@ -387,6 +398,10 @@ pub const Answer = struct {
 
     pub fn getInteger(self: *const Answer, variable: []const u8) Error!i64 {
         return (try self.getValue(variable)).getInteger();
+    }
+
+    pub fn getFloat(self: *const Answer, variable: []const u8) Error!f64 {
+        return (try self.getValue(variable)).getFloat();
     }
 };
 
@@ -3286,6 +3301,114 @@ test "source and typed mixed numeric operations produce identical answers" {
     try std.testing.expectEqualStrings("3.5", typed_shifted);
 }
 
+test "typed float descriptors canonicalize and getters never coerce" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try db.addFact("measure", &.{ input.atom("a"), input.float(2.5) });
+    try db.addFact("measure", &.{ input.atom("b"), input.float(1.0) });
+    try db.addFact("measure", &.{ input.atom("c"), input.float(-0.0) });
+    try db.addFact("items", &.{input.list(&.{ input.float(0.5), input.integer(2) })});
+
+    var fractional = try db.query(&.{
+        input.relation("measure", &.{ input.atom("a"), input.variable("v") }),
+    });
+    defer fractional.deinit();
+    const value = try fractional.answers.items[0].getValue("v");
+    try std.testing.expectEqual(ResultValue.Kind.float, value.kind());
+    try std.testing.expectEqual(@as(f64, 2.5), try fractional.answers.items[0].getFloat("v"));
+    try std.testing.expectError(Error.TypeMismatch, fractional.answers.items[0].getInteger("v"));
+    try std.testing.expectError(Error.TypeMismatch, fractional.answers.items[0].getAtom("v"));
+    try std.testing.expectError(Error.UnknownVariable, fractional.answers.items[0].getFloat("missing"));
+
+    // Integral typed floats canonicalize to integers, so the float getter
+    // reports TypeMismatch and the integer getter succeeds.
+    var canonical = try db.query(&.{
+        input.relation("measure", &.{ input.atom("b"), input.variable("v") }),
+    });
+    defer canonical.deinit();
+    try std.testing.expectEqual(@as(i64, 1), try canonical.answers.items[0].getInteger("v"));
+    try std.testing.expectError(Error.TypeMismatch, canonical.answers.items[0].getFloat("v"));
+
+    // Identity across construction paths: source literals match typed facts.
+    try expectAnswerCount(&db, "measure(a, 2.5)?", 1);
+    try expectAnswerCount(&db, "measure(b, 1)?", 1);
+    try expectAnswerCount(&db, "measure(c, 0)?", 1);
+    try expectAnswerCount(&db, "items([0.5, 2])?", 1);
+
+    // Typed retraction matches a fact added from source, and vice versa.
+    var added = try db.execute("measure(d, 3.5).");
+    added.deinit();
+    try std.testing.expect(try db.retract(&.{
+        input.relation("measure", &.{ input.atom("d"), input.float(3.5) }),
+    }));
+    try expectAnswerCount(&db, "measure(d, X)?", 0);
+}
+
+test "non-finite typed floats fail compilation transactionally" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try db.addFact("kept", &.{input.integer(1)});
+    const scalar_count = db.scalars.values.items.len;
+    const fact_count = db.facts.items.len;
+
+    try std.testing.expectError(
+        Error.NumericType,
+        db.addFact("bad", &.{input.float(std.math.nan(f64))}),
+    );
+    try std.testing.expectError(
+        Error.NumericOverflow,
+        db.addFact("bad", &.{input.float(std.math.inf(f64))}),
+    );
+    try std.testing.expectError(
+        Error.NumericOverflow,
+        db.addFact("bad", &.{input.float(-std.math.inf(f64))}),
+    );
+    try std.testing.expectError(
+        Error.NumericOverflow,
+        db.query(&.{input.relation("kept", &.{input.float(std.math.inf(f64))})}),
+    );
+    const v = input.variable("v");
+    try std.testing.expectError(
+        Error.NumericType,
+        db.addRule(
+            input.relation("derived", &.{v}),
+            &.{input.equal(v, input.float(std.math.nan(f64)))},
+        ),
+    );
+
+    try std.testing.expectEqual(scalar_count, db.scalars.values.items.len);
+    try std.testing.expectEqual(fact_count, db.facts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), db.rules.items.len);
+    try expectAnswerCount(&db, "kept(1)?", 1);
+    try expectAnswerCount(&db, "bad(X)?", 0);
+}
+
+fn typedFloatAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try db.addFact("measure", &.{ input.atom("a"), input.float(2.5) });
+    try db.addFact("measure", &.{ input.atom("b"), input.float(1.0) });
+    var result = try db.query(&.{
+        input.relation("measure", &.{ input.variable("x"), input.variable("v") }),
+        input.compare(.less_than, input.variable("v"), input.integer(3)),
+        input.add(input.variable("s"), input.variable("v"), input.float(0.25)),
+    });
+    result.deinit();
+    db.addFact("bad", &.{input.float(std.math.inf(f64))}) catch |err| switch (err) {
+        error.NumericOverflow => return,
+        else => return err,
+    };
+    return error.ExpectedNumericOverflow;
+}
+
+test "typed float input releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        typedFloatAllocationScenario,
+        .{},
+    );
+}
+
 test "integer identity is exact above 2^53 and recursive inside lists" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -3461,10 +3584,14 @@ test "query results own names scalars and structures after database destruction"
     var db: Jatalog = .init(std.testing.allocator);
     var result = blk: {
         try db.addFact("answer", &.{input.list(&.{ input.atom("x"), input.integer(42) })});
-        try db.addFact("scalars", &.{ input.atom("atom"), input.integer(7) });
+        try db.addFact("scalars", &.{ input.atom("atom"), input.integer(7), input.float(2.5) });
         const query_result = try db.query(&.{
             input.relation("answer", &.{input.variable("value")}),
-            input.relation("scalars", &.{ input.variable("atom"), input.variable("integer") }),
+            input.relation("scalars", &.{
+                input.variable("atom"),
+                input.variable("integer"),
+                input.variable("float"),
+            }),
         });
         db.deinit();
         break :blk query_result;
@@ -3479,8 +3606,11 @@ test "query results own names scalars and structures after database destruction"
     try std.testing.expectError(Error.UnknownVariable, result.answers.items[0].getInteger("missing"));
     try std.testing.expectEqualStrings("atom", try result.answers.items[0].getAtom("atom"));
     try std.testing.expectEqual(@as(i64, 7), try result.answers.items[0].getInteger("integer"));
+    try std.testing.expectEqual(@as(f64, 2.5), try result.answers.items[0].getFloat("float"));
     try std.testing.expectError(Error.TypeMismatch, result.answers.items[0].getInteger("atom"));
     try std.testing.expectError(Error.TypeMismatch, result.answers.items[0].getAtom("integer"));
+    try std.testing.expectError(Error.TypeMismatch, result.answers.items[0].getFloat("integer"));
+    try std.testing.expectError(Error.TypeMismatch, result.answers.items[0].getInteger("float"));
     try std.testing.expectEqualStrings("x", try (try value.head()).getAtom());
     try std.testing.expectEqual(@as(i64, 42), try (try (try value.tail()).head()).getInteger());
 }
@@ -3496,6 +3626,17 @@ test "novel typed queries release all query-local storage" {
         var name_buffer: [32]u8 = undefined;
         const novel = try std.fmt.bufPrint(&name_buffer, "novel_{d}", .{index});
         var result = try db.query(&.{input.relation("missing", &.{input.atom(novel)})});
+        try std.testing.expectEqual(@as(usize, 0), result.answers.items.len);
+        result.deinit();
+        try std.testing.expectEqual(
+            persistent_bytes,
+            tracking.allocated_bytes - tracking.freed_bytes,
+        );
+    }
+
+    for (0..100) |index| {
+        const novel = @as(f64, @floatFromInt(index)) + 0.5;
+        var result = try db.query(&.{input.relation("missing", &.{input.float(novel)})});
         try std.testing.expectEqual(@as(usize, 0), result.answers.items.len);
         result.deinit();
         try std.testing.expectEqual(

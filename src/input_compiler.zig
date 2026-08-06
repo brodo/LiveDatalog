@@ -30,7 +30,7 @@ const Validator = struct {
 
     fn term(self: *Validator, descriptor: input.Term) !void {
         switch (descriptor) {
-            .atom, .integer => {},
+            .atom, .integer, .float => {},
             .variable => |name| if (name.len == 0) return error.InvalidTerm,
             .list => |items| {
                 if (items.len == 0) return;
@@ -125,6 +125,7 @@ fn compileTermInner(
     return switch (descriptor) {
         .atom => |atom| builder.atomTerm(atom),
         .integer => |integer| builder.integerTerm(integer),
+        .float => |float| builder.floatTerm(float),
         .variable => |name| if (name.len == 0) error.InvalidTerm else builder.variableTerm(name),
         .list => |items| blk: {
             var result = builder.nilTerm();

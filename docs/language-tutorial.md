@@ -84,6 +84,12 @@ such as `1e400`, returns `NumericOverflow`. Quote numeric-looking text when an
 atom such as `'1.0'` is intended: a malformed bare numeric token such as `1e`
 or `1.2.3` is an `InvalidSyntax` error, never an atom.
 
+Floats print deterministically with shortest round-trip digits: plain decimal
+such as `0.5` for non-integral magnitudes between `0.001` and `1e16`, and
+scientific notation such as `5e-324` otherwise. Every printed float reads back
+as the same canonical value, and floats canonicalized to integers print as
+integers.
+
 ## Queries
 
 A query ends with `?`. Ground queries contain no variables and answer a

@@ -3,6 +3,7 @@
 pub const Term = union(enum) {
     atom: []const u8,
     integer: i64,
+    float: f64,
     variable: []const u8,
     list: []const Term,
     cons: *const Cons,
@@ -42,6 +43,10 @@ pub fn atom(value: []const u8) Term {
 
 pub fn integer(value: i64) Term {
     return .{ .integer = value };
+}
+
+pub fn float(value: f64) Term {
+    return .{ .float = value };
 }
 
 pub fn variable(name: []const u8) Term {

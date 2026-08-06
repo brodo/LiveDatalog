@@ -180,8 +180,8 @@ pub fn build(b: *std.Build) void {
     const run_cli_test = b.addRunArtifact(exe);
     run_cli_test.addFileArg(b.path("examples/aggregation.dl"));
     run_cli_test.expectStdOutEqual(
-        \\X: alice, N: 1
-        \\X: bob, N: 0
+        \\X: alice, N: 1, L: 2
+        \\X: bob, N: 0, L: 2
         \\
     );
 

@@ -8,6 +8,11 @@ const help_text =
     \\% Fact
     \\predicate(atom, value).
     \\
+    \\% Numbers: exact i64 integers and finite f64 floats.
+    \\% 1, 1.0, and 1e0 are one value; quoted '1.0' is an atom.
+    \\age(alice, 36).
+    \\height(alice, 1.75).
+    \\
     \\% Rule
     \\derived(X) :- source(X), condition(X).
     \\

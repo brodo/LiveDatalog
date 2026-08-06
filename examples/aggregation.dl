@@ -9,4 +9,7 @@ length([], 0).
 length(H!T, N) :- length(T, M), N = M + 1.
 
 numchildren(X, N) :- children(X, S), length(S, N).
-numchildren(X, N)?
+
+% Mixed numeric identity: the float literal 2.0 is the integer 2.
+limit(2.0).
+numchildren(X, N), limit(L), N < L?

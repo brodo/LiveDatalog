@@ -8,9 +8,10 @@ interpreter for running files, piping programs, and exploring data in a REPL.
 
 - Facts, rules, multi-goal queries, and recursive relations
 - Stratified negation and fact retraction
-- Exact first-class signed 64-bit integers and numeric comparisons
+- Exact signed 64-bit integers and finite `f64` floats with one canonical
+  numeric identity (`1` and `1.0` are the same value)
 - Structural lists, deterministic `setof`, and nested aggregates
-- Checked 64-bit integer addition and subtraction
+- Checked integer arithmetic and mixed floating-point addition and subtraction
 - Bare and quoted values with escaped quotes
 - Line and block comments
 - A command-line interpreter and an embeddable Zig API
@@ -90,22 +91,32 @@ pub fn main() !void {
 ```
 
 Use `execute` to parse and run Datalog source directly. The `input` helpers
-construct typed atoms, integers, variables, proper lists, cons cells,
+construct typed atoms, integers, floats, variables, proper lists, cons cells,
 relations, negation, equality, comparisons, checked arithmetic, and `setof`.
 They allocate nothing and cannot fail. Database operations synchronously
 borrow and compile the descriptors, so stack values and temporary slices are
 safe and remain caller-owned.
 
+Floats follow the finite-value policy from
+[ADR 0001](docs/adr/0001-finite-f64-scalars.md): compiling `input.float`
+reports `NumericType` for NaN and `NumericOverflow` for an infinity, and an
+integral in-range value such as `input.float(1.0)` canonicalizes to the
+integer scalar `1`. Non-integral floats format deterministically with
+shortest round-trip digits, such as `0.5` and `5e-324`.
+
 ### Ownership
 
 Every `QueryResult` and `ExecutionResult` must be deinitialized. Results own
-their variable names, atoms, integers, and reachable list structure, and remain
-readable after the database is deinitialized. Use `getAtom`, `getInteger`, or
-`getValue`; generic values support list inspection, `write`, and `formatAlloc`.
-The slice returned by `formatAlloc` belongs to the supplied allocator and must
-be freed by the caller.
+their variable names, atoms, integers, floats, and reachable list structure,
+and remain readable after the database is deinitialized. Use `getAtom`,
+`getInteger`, `getFloat`, or `getValue`; generic values support list
+inspection, `write`, and `formatAlloc`. The slice returned by `formatAlloc`
+belongs to the supplied allocator and must be freed by the caller.
 Unknown variables return `UnknownVariable`, while using a scalar getter on the
-wrong kind returns `TypeMismatch`.
+wrong kind returns `TypeMismatch`. Getters never coerce between numeric
+kinds: a float that canonicalized to an integer when it was stored, such as
+`1.0`, is retrieved with `getInteger`, and `getFloat` returns only values
+that remained floats, such as `2.5`.
 
 ## Development
 

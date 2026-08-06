@@ -238,6 +238,27 @@ mixed ordering had already landed with S1 (see the S1 decisions and
 - `zig build test` and the ReleaseFast aggregation workload pass, with any
   performance change recorded.
 
+### Completed decisions
+
+S3 was completed on 2026-08-06, finishing Project S:
+
+- `input.float` is an allocation-free descriptor like the other scalar
+  helpers. Non-finite values fail during compilation inside `internFloat`
+  (NaN as `NumericType`, infinities as `NumericOverflow`) under the existing
+  per-operation staging, so failed typed input rolls back completely.
+- `ResultValue.getFloat` and `Answer.getFloat` mirror the integer getters
+  with distinct `UnknownVariable` and `TypeMismatch` errors and no numeric
+  coercion. Because canonicalization happens at intern time, an integral
+  float stored through any path is retrieved with `getInteger`; `getFloat`
+  returns only values that remained floats. `ResultValue.Kind` gained a
+  `float` case (already public since S1).
+- Result nodes copy floats by value, so query results with floats stay
+  readable after database deinitialization like atoms and integers.
+- The CLI example now exercises mixed numeric identity (`limit(2.0)`
+  compared against integer list lengths), and the build's expected-output
+  drift test covers it. README, tutorial, and REPL help describe the policy,
+  identity, construction, access, and formatting.
+
 # Project P: indexed and semi-naive evaluation
 
 This project provides the storage operations needed by both incremental

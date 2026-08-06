@@ -46,3 +46,14 @@ classification is not measurable on this benchmark.
 
 The workload performs no arithmetic; the median is within run-to-run noise of
 the 2026-07-30 baseline.
+
+## 2026-08-06 after S3 (typed floats and owned results)
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.0
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 6.277, 6.093, 6.110, 6.117, and 6.234 ms
+- median: **6.117 ms/query**
+
+Project S is complete; the median remains within run-to-run noise of the
+2026-07-30 baseline.
