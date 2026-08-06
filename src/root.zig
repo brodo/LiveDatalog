@@ -886,13 +886,19 @@ pub const Jatalog = struct {
 
     /// Applies one batch of exact ground base-fact insertions and deletions
     /// with set semantics: re-inserting an existing fact and deleting an
-    /// absent fact are no-ops. Insertions into a clean materialized closure
-    /// propagate incrementally through positive strata with the semi-naive
-    /// delta engine; when the update reaches negation or `setof`, that
-    /// stratum is marked dirty and rebuilt through the M1 path. Deletions
-    /// always take the dirty-stratum rebuild path. The batch commits
-    /// atomically: any failure leaves the database unchanged. Returns
-    /// whether the base fact set changed.
+    /// absent fact are no-ops.
+    ///
+    /// Against a clean materialized closure the batch may be maintained
+    /// incrementally — insertions through the semi-naive delta engine,
+    /// deletions through delete-and-rederive, followed by aggregate group
+    /// maintenance — or the affected strata may be marked dirty and
+    /// recomputed. Both produce the same database, so the choice is the cost
+    /// model's unless `setMaintenancePolicy` pins it. Maintenance that
+    /// reaches negation or an aggregate outside the maintainable class
+    /// abandons the incremental path for a dirty-stratum rebuild.
+    ///
+    /// The batch commits atomically: any failure leaves the database
+    /// unchanged. Returns whether the base fact set changed.
     pub fn applyChanges(
         self: *Jatalog,
         insertions: []const input.Relation,
