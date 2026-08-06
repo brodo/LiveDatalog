@@ -136,6 +136,48 @@ repeated-query median 22.5 us/query (22.2, 22.5, and 22.7 us). The M4 work
 changes update cost rather than query cost; a dedicated update benchmark
 belongs with the M6 maintenance-statistics work.
 
+## 2026-08-06 projected aggregate view updates: M3 versus M5
+
+`zig build benchmark-projected-aggregate -Doptimize=ReleaseFast` applies
+update batches to the projected view `v(X, S) :- p(X, Z), setof(Y, r(X, Y),
+S)`, where each of 150 keys has 20 `p` derivations and 10 `r` members. The
+first pass over the keys grows each group's member set and drops one of its
+derivations; the second restores both. Only `applyChanges` is timed, and
+every group is verified afterwards.
+
+The same benchmark source was run against the M3 commit (`decdab3`, before
+aggregate maintenance existed, where any change under a `setof` rebuilt the
+whole stratum) in a git worktree, and against M5.
+
+| Groups | M3 rebuild | M5 maintenance | Winner |
+| --- | --- | --- | --- |
+| 30 | 1.480 ms/batch | 1.963 ms/batch | M3, 1.33x |
+| 75 | 3.960 ms/batch | 4.378 ms/batch | M3, 1.11x |
+| 150 | 10.222 ms/batch | 8.797 ms/batch | M5, 1.16x |
+
+- Zig 0.16.0, `ReleaseFast`, arm64, macOS 26.5.0
+- 150-group samples, M5: 8.891, 8.797, and 8.759 ms; median **8.797 ms**
+- 150-group samples, M3: 10.684, 10.223, and 10.222 ms; median **10.222 ms**
+- 30-group samples, M5: 1.963, 1.956, 1.955, 1.965, and 1.976 ms
+- 30-group samples, M3: 1.471, 1.472, 1.487, 1.480, and 1.562 ms
+
+Reading the result honestly: incremental aggregate maintenance is not
+uniformly faster than rebuilding the stratum. Rebuild cost grows with the
+number of groups, while maintenance cost is dominated by fixed per-batch
+overhead — most visibly the full closure snapshot `propagateDeletions`
+clones so over-deletion can join against pre-deletion state, which happens
+once for the batch and again for each maintenance round that removes a head
+tuple. Below roughly 100 groups that overhead exceeds the cost of simply
+recomputing every group, and rebuild wins; above it, touching one group
+instead of all of them wins and the gap keeps widening.
+
+Two follow-ups this measurement suggests, neither done here: avoid the
+whole-closure snapshot by letting matching consult the live closure together
+with the pending deletions, and skip incremental maintenance in favour of a
+stratum rebuild when the number of affected groups approaches the total. The
+M6 completion gate is the natural home for both, since it already calls for
+insert, delete, and mixed-update benchmarks.
+
 ## 2026-08-06 after M5 (projected views and CReaM counts)
 
 Still query-only, so another no-regression check: the aggregation median

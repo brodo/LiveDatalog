@@ -149,6 +149,21 @@ pub fn build(b: *std.Build) void {
     );
     materialization_benchmark_step.dependOn(&b.addRunArtifact(materialization_benchmark_exe).step);
 
+    const projected_benchmark_exe = b.addExecutable(.{
+        .name = "projected-aggregate-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/projected_aggregate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const projected_benchmark_step = b.step(
+        "benchmark-projected-aggregate",
+        "Run the projected aggregate view update workload",
+    );
+    projected_benchmark_step.dependOn(&b.addRunArtifact(projected_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

@@ -717,6 +717,15 @@ M5 was completed on 2026-08-06 with these decisions:
 - Chapter 5 Examples 5.2.1 and 5.3.1 are executable regression tests,
   including the `v_c` counts of 2 and 1 and the two-step deletion that keeps
   and then drops `v(a, [1, 2])`.
+- A `benchmark-projected-aggregate` update workload compares M5 against the
+  M3 rebuild path. Incremental aggregate maintenance is *not* uniformly
+  faster: rebuild wins below roughly 100 groups and maintenance wins above
+  it, because maintenance carries fixed per-batch overhead while rebuild
+  cost scales with the group count. See
+  [`aggregation-performance.md`](aggregation-performance.md) for the numbers
+  and the two follow-ups it suggests, both deferred to M6: avoiding the
+  whole-closure snapshot taken for over-deletion, and falling back to a
+  stratum rebuild when the affected groups approach the total.
 
 ## M6: downstream list functions and maintenance API
 

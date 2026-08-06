@@ -1079,7 +1079,7 @@ pub const Jatalog = struct {
             }
         }
         if (view) |projected|
-            try self.sweepVanishedGroups(rule, clause_index, projected, removals);
+            try self.sweepVanishedGroups(rule, clause_index, projected, touched, removals);
     }
 
     /// Maintains one group of a projected view through its derivation
@@ -1175,23 +1175,28 @@ pub const Jatalog = struct {
 
     /// Retracts auxiliary tuples whose group no longer has any solution of
     /// the rule's outer goals, deleting the head tuple on a one-to-zero
-    /// derivation-count transition.
+    /// derivation-count transition. Only groups a changed outer-goal fact
+    /// can reach are examined: a group can vanish only when an outer fact
+    /// disappears, so batches that touch just the aggregate's members do no
+    /// sweeping at all.
     fn sweepVanishedGroups(
         self: *Jatalog,
         rule: Rule,
         clause_index: usize,
         view: *AuxiliaryView,
+        touched: *RelationStore,
         removals: *RelationStore,
     ) !void {
         const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
         defer self.allocator.free(outer);
         const outer_count = fillOuterClauses(rule, clause_index, outer);
 
-        var index = view.tuples.len();
-        while (index > 0) {
-            index -= 1;
-            if (index >= view.tuples.len()) continue;
-            const tuple = view.tuples.factAt(index);
+        var candidates: RelationStore = .init(self.allocator);
+        defer candidates.deinit();
+        try self.collectSweepCandidates(rule, view, outer[0..outer_count], touched, &candidates);
+
+        for (0..candidates.len()) |index| {
+            const tuple = candidates.factAt(index);
             var seed: Binding = .{};
             defer seed.deinit(self.allocator);
             // The group is identified by its projected values together with
@@ -1220,11 +1225,62 @@ pub const Jatalog = struct {
                 else => return err,
             };
             if (solutions.items.len > 0) continue;
-            const head = try self.allocator.dupe(ValueId, view.headTerms(tuple));
-            defer self.allocator.free(head);
+            const head = view.headTerms(tuple);
             const before = try self.derivationCount(view, head);
-            view.tuples.removeAt(index);
+            if (!try view.tuples.removeFact(tuple)) continue;
             if (before == 1) try self.recordHeadRemoval(rule, head, removals);
+        }
+    }
+
+    /// Auxiliary tuples a changed outer-goal fact could have invalidated,
+    /// found by binding the fact against each outer goal and looking up the
+    /// auxiliary columns that binding determines.
+    fn collectSweepCandidates(
+        self: *Jatalog,
+        rule: Rule,
+        view: *AuxiliaryView,
+        outer: []const Clause,
+        touched: *RelationStore,
+        candidates: *RelationStore,
+    ) !void {
+        for (0..touched.len()) |index| {
+            const fact = touched.factAt(index);
+            for (outer) |clause| {
+                const expression = switch (clause) {
+                    .relational => |value| value,
+                    else => continue,
+                };
+                if (expression.predicate != fact.predicate or
+                    expression.terms.len != fact.terms.len) continue;
+                var binding: Binding = .{};
+                defer binding.deinit(self.allocator);
+                if (!try self.unify(fact, expression, &binding)) continue;
+
+                var mask: u64 = 0;
+                var bound: [64]ValueId = undefined;
+                var count: usize = 0;
+                for (view.projected, 0..) |variable, position| {
+                    const value = binding.values.get(variable) orelse continue;
+                    mask |= @as(u64, 1) << @intCast(position);
+                    bound[count] = value;
+                    count += 1;
+                }
+                for (rule.head.terms, 0..) |term, position| {
+                    const variable = switch (term) {
+                        .variable => |name| name,
+                        else => continue,
+                    };
+                    const value = binding.values.get(variable) orelse continue;
+                    mask |= @as(u64, 1) << @intCast(view.projected.len + position);
+                    bound[count] = value;
+                    count += 1;
+                }
+                for (try view.tuples.lookup(view.key(), mask, bound[0..count])) |candidate| {
+                    const tuple = view.tuples.factAt(candidate);
+                    if (try candidates.contains(tuple)) continue;
+                    try copyFactInto(self.allocator, candidates, tuple);
+                }
+            }
         }
     }
 

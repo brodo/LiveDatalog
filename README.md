@@ -169,5 +169,9 @@ zig build benchmark-aggregation -Doptimize=ReleaseFast
 zig build benchmark-materialization -Doptimize=ReleaseFast
 ```
 
+```sh
+zig build benchmark-projected-aggregate -Doptimize=ReleaseFast
+```
+
 See [Aggregation performance](docs/aggregation-performance.md) for the workload
 and recorded measurements.
