@@ -221,6 +221,28 @@ const DeltaConstraint = struct {
     delta_end: usize,
 };
 
+const Materialization = union(enum) {
+    uninitialized,
+    clean,
+    dirty_from_stratum: usize,
+};
+
+/// Rule analysis cached after validation: the stratum mapping plus, for each
+/// predicate read anywhere in a rule body, the lowest head stratum that
+/// depends on it. Invalidated whenever the rule set changes.
+const Analysis = struct {
+    strata: std.array_hash_map.Auto(PredicateKey, usize),
+    first_dependent: std.array_hash_map.Auto(PredicateKey, usize),
+    max_level: usize,
+    has_seed_rules: bool,
+
+    fn deinit(self: *Analysis, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
+        self.strata.deinit(allocator);
+        self.first_dependent.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 const Aggregate = struct {
     template: Term,
     body: []Clause,
@@ -233,6 +255,28 @@ const Clause = union(enum) {
     negated: Expr,
     aggregate: Aggregate,
 };
+
+fn noteBodyDependencies(
+    allocator: std.mem.Allocator,
+    body: []const Clause,
+    head_level: usize,
+    first_dependent: *std.array_hash_map.Auto(PredicateKey, usize),
+) !void {
+    for (body) |clause| switch (clause) {
+        .relational, .negated => |expression| {
+            const entry = try first_dependent.getOrPut(allocator, predicateKey(expression));
+            if (!entry.found_existing or entry.value_ptr.* > head_level)
+                entry.value_ptr.* = head_level;
+        },
+        .builtin => {},
+        .aggregate => |aggregate| try noteBodyDependencies(
+            allocator,
+            aggregate.body,
+            head_level,
+            first_dependent,
+        ),
+    };
+}
 
 fn predicateKey(expression: Expr) PredicateKey {
     return .{ .name = expression.predicate, .arity = expression.terms.len };
@@ -443,6 +487,15 @@ pub const Jatalog = struct {
     facts: RelationStore,
     rules: std.ArrayList(Rule) = .empty,
     next_rule_id: u32 = 0,
+    /// Persistent derived closure: the base facts plus every derived fact,
+    /// exposed to evaluation as one unified read view. Null until the first
+    /// evaluation on a database with rules.
+    closure: ?RelationStore = null,
+    materialization: Materialization = .uninitialized,
+    analysis: ?Analysis = null,
+    /// Counts stratum expansions; tests use it to prove that repeated
+    /// queries perform no rule expansion after the first materialization.
+    expansions: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -455,6 +508,8 @@ pub const Jatalog = struct {
     }
 
     pub fn deinit(self: *Jatalog) void {
+        if (self.closure) |*closure| closure.deinit();
+        if (self.analysis) |*analysis| analysis.deinit(self.allocator);
         self.facts.deinit();
         for (self.rules.items) |rule| {
             freeExpr(self.allocator, rule.head);
@@ -484,6 +539,10 @@ pub const Jatalog = struct {
         errdefer result.values.deinit();
         result.facts = try self.facts.clone();
         errdefer result.facts.deinit();
+        if (self.closure) |*closure| result.closure = try closure.clone();
+        errdefer if (result.closure) |*closure| closure.deinit();
+        result.materialization = self.materialization;
+        result.expansions = self.expansions;
         errdefer {
             for (result.rules.items) |rule| freeRule(self.allocator, rule);
             result.rules.deinit(self.allocator);
@@ -510,7 +569,9 @@ pub const Jatalog = struct {
         var index = committed.facts.len();
         while (index > 0) {
             index -= 1;
-            if (try staging.facts.contains(committed.facts.factAt(index))) continue;
+            const fact = committed.facts.factAt(index);
+            if (try staging.facts.contains(fact)) continue;
+            try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
             committed.facts.removeAt(index);
         }
         self.commit(&committed);
@@ -547,6 +608,7 @@ pub const Jatalog = struct {
     }
 
     pub fn query(self: *Jatalog, goals: []const input.Goal) !QueryResult {
+        try self.ensureMaterialized();
         var staging = try self.clone();
         defer staging.deinit();
         const compiled = try staging.compileGoals(goals);
@@ -558,6 +620,7 @@ pub const Jatalog = struct {
     }
 
     pub fn retract(self: *Jatalog, goals: []const input.Goal) !bool {
+        try self.ensureMaterialized();
         var staging = try self.clone();
         defer staging.deinit();
         const compiled = try staging.compileGoals(goals);
@@ -645,10 +708,14 @@ pub const Jatalog = struct {
     fn addFactExpr(self: *Jatalog, value: Expr) !void {
         if (!value.isGround() or value.negated) return Error.InvalidFact;
         const terms = try self.allocator.alloc(ValueId, value.terms.len);
-        errdefer self.allocator.free(terms);
+        var terms_owned = true;
+        errdefer if (terms_owned) self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
         const fact: Fact = .{ .predicate = value.predicate, .terms = terms };
-        _ = try self.facts.insert(fact, false);
+        const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
+        const added = try self.facts.insert(fact, false);
+        terms_owned = false;
+        if (added) try self.markBaseChanged(key);
     }
 
     /// Adds a rule whose body may contain aggregate clauses. On success the
@@ -674,6 +741,13 @@ pub const Jatalog = struct {
             _ = self.rules.pop();
             return err;
         };
+        self.invalidateAnalysis();
+        if (self.closure != null) {
+            // Lazy rebuild policy for rule additions: invalidate from the new
+            // head's stratum now, rebuild at the next evaluation.
+            const analysis = try self.ensureAnalysis();
+            self.markDirty(analysis.strata.get(predicateKey(head)) orelse 0);
+        }
     }
 
     fn classifyExpr(self: *const Jatalog, expression: Expr) Clause {
@@ -705,11 +779,19 @@ pub const Jatalog = struct {
         defer self.allocator.free(ordered);
         for (ordered) |clause|
             try self.validateClause(clause, &bound, &outer_variables, Error.InvalidQuery);
-        for (goals) |clause| try self.internGroundStructuresInClause(clause);
 
-        var expanded = try self.facts.clone();
-        defer expanded.deinit();
-        try self.expand(&expanded);
+        try self.ensureMaterialized();
+        const values_before = self.values.values.items.len;
+        for (goals) |clause| try self.internGroundStructuresInClause(clause);
+        if (self.values.values.items.len != values_before) {
+            // Novel ground query structures must join the seed set of
+            // admissible structural recursion, so derive their consequences
+            // on this database's own (discardable) closure.
+            if (self.closure) |*closure| {
+                if ((try self.ensureAnalysis()).has_seed_rules)
+                    try self.expandFrom(closure, 0);
+            }
+        }
 
         var internal_answers: std.ArrayList(Binding) = .empty;
         errdefer {
@@ -718,7 +800,7 @@ pub const Jatalog = struct {
         }
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
-        try self.matchClauses(ordered, &expanded, 0, &initial, &internal_answers, null);
+        try self.matchClauses(ordered, self.closureStore(), 0, &initial, &internal_answers, null);
         return internal_answers;
     }
 
@@ -772,13 +854,111 @@ pub const Jatalog = struct {
         return parser.executeAll();
     }
 
-    fn expand(self: *Jatalog, facts: *RelationStore) !void {
-        var levels = try self.computeStrata();
-        defer levels.deinit(self.allocator);
-        var max_level: usize = 0;
-        for (levels.values()) |level| max_level = @max(max_level, level);
+    fn closureStore(self: *Jatalog) *RelationStore {
+        if (self.closure) |*closure| return closure;
+        return &self.facts;
+    }
 
-        for (0..max_level + 1) |level| try self.expandLevel(facts, &levels, level);
+    fn invalidateAnalysis(self: *Jatalog) void {
+        if (self.analysis) |*analysis| analysis.deinit(self.allocator);
+        self.analysis = null;
+    }
+
+    fn ensureAnalysis(self: *Jatalog) !*const Analysis {
+        if (self.analysis == null) {
+            var strata = try self.computeStrata();
+            errdefer strata.deinit(self.allocator);
+            var max_level: usize = 0;
+            for (strata.values()) |level| max_level = @max(max_level, level);
+            var first_dependent: std.array_hash_map.Auto(PredicateKey, usize) = .empty;
+            errdefer first_dependent.deinit(self.allocator);
+            var has_seed_rules = false;
+            for (self.rules.items) |rule| {
+                if (rule.seed_argument != null) has_seed_rules = true;
+                const head_level = strata.get(predicateKey(rule.head)) orelse 0;
+                try noteBodyDependencies(self.allocator, rule.body, head_level, &first_dependent);
+            }
+            self.analysis = .{
+                .strata = strata,
+                .first_dependent = first_dependent,
+                .max_level = max_level,
+                .has_seed_rules = has_seed_rules,
+            };
+        }
+        return &self.analysis.?;
+    }
+
+    fn markDirty(self: *Jatalog, level: usize) void {
+        switch (self.materialization) {
+            .uninitialized => {},
+            .clean => self.materialization = .{ .dirty_from_stratum = level },
+            .dirty_from_stratum => |existing| self.materialization = .{
+                .dirty_from_stratum = @min(existing, level),
+            },
+        }
+    }
+
+    /// Marks the first stratum that depends on a changed base predicate as
+    /// dirty. A predicate no rule reads dirties the level past the last
+    /// stratum, so the rebuild refreshes only the closure's base partition.
+    fn markBaseChanged(self: *Jatalog, key: PredicateKey) !void {
+        if (self.closure == null) return;
+        const analysis = try self.ensureAnalysis();
+        self.markDirty(analysis.first_dependent.get(key) orelse analysis.max_level + 1);
+    }
+
+    /// Builds or refreshes the persistent closure. Materialization is lazy:
+    /// a database whose rule set is empty never allocates derived-state
+    /// machinery, and a dirty closure is rebuilt from its first dirty
+    /// stratum, reusing the derived facts of every stratum below it. On
+    /// failure the previous closure and state remain installed; values
+    /// interned by the aborted expansion stay in the value table and are
+    /// reclaimed at deinit.
+    fn ensureMaterialized(self: *Jatalog) !void {
+        if (self.rules.items.len == 0) return;
+        const from_level: usize = switch (self.materialization) {
+            .clean => return,
+            .uninitialized => 0,
+            .dirty_from_stratum => |level| level,
+        };
+        const closure = try self.buildClosure(from_level);
+        if (self.closure) |*old| old.deinit();
+        self.closure = closure;
+        self.materialization = .clean;
+    }
+
+    fn buildClosure(self: *Jatalog, from_level: usize) !RelationStore {
+        var closure = try self.facts.clone();
+        errdefer closure.deinit();
+        if (from_level > 0) {
+            const analysis = try self.ensureAnalysis();
+            if (self.closure) |*old| {
+                for (0..old.len()) |index| {
+                    if (!old.isDerived(index)) continue;
+                    const fact = old.factAt(index);
+                    const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
+                    if ((analysis.strata.get(key) orelse 0) >= from_level) continue;
+                    const terms = try self.allocator.dupe(ValueId, fact.terms);
+                    _ = closure.insert(.{ .predicate = fact.predicate, .terms = terms }, true) catch |err| {
+                        self.allocator.free(terms);
+                        return err;
+                    };
+                }
+            }
+        }
+        try self.expandFrom(&closure, from_level);
+        return closure;
+    }
+
+    fn expand(self: *Jatalog, facts: *RelationStore) !void {
+        try self.expandFrom(facts, 0);
+    }
+
+    fn expandFrom(self: *Jatalog, facts: *RelationStore, first_level: usize) !void {
+        const analysis = try self.ensureAnalysis();
+        if (first_level > analysis.max_level) return;
+        for (first_level..analysis.max_level + 1) |level|
+            try self.expandLevel(facts, &analysis.strata, level);
     }
 
     /// Reference naive fixpoint kept as the semantic oracle for the
@@ -818,6 +998,7 @@ pub const Jatalog = struct {
         levels: *const std.array_hash_map.Auto(PredicateKey, usize),
         level: usize,
     ) !void {
+        self.expansions += 1;
         const ActiveRule = struct {
             rule: Rule,
             growing_occurrences: []usize,
@@ -1541,7 +1722,11 @@ pub const Jatalog = struct {
             }
         }
         std.mem.sort(usize, to_remove.items, {}, std.sort.desc(usize));
-        for (to_remove.items) |index| self.facts.removeAt(index);
+        for (to_remove.items) |index| {
+            const fact = self.facts.factAt(index);
+            try self.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+            self.facts.removeAt(index);
+        }
         return to_remove.items.len > 0;
     }
 
@@ -1888,6 +2073,13 @@ const Parser = struct {
             if (self.index == self.source.len) return last orelse .none;
             if (last) |*result| result.deinit();
             last = null;
+            // Materialize the committed database before cloning statement
+            // staging for evaluations, so the staged copy shares the
+            // closure's value identifiers and evaluation never expands.
+            switch (self.peekStatementKind()) {
+                .query, .retraction => try self.jatalog.ensureMaterialized(),
+                .assertion, .end => {},
+            }
             var staging = try self.jatalog.clone();
             defer staging.deinit();
             var statement_parser = self.*;
@@ -1901,6 +2093,49 @@ const Parser = struct {
             }
             last = statement_result;
         }
+    }
+
+    const StatementKind = enum { assertion, query, retraction, end };
+
+    /// Classifies the next statement by scanning for its terminator without
+    /// interning anything, mirroring the tokenizer's comment, quote, and
+    /// digit-dot-digit rules.
+    fn peekStatementKind(self: *const Parser) StatementKind {
+        var index = self.index;
+        while (index < self.source.len) : (index += 1) {
+            const byte = self.source[index];
+            if (byte == '%' or (byte == '/' and index + 1 < self.source.len and
+                self.source[index + 1] == '/'))
+            {
+                while (index < self.source.len and self.source[index] != '\n') index += 1;
+                continue;
+            }
+            if (byte == '/' and index + 1 < self.source.len and self.source[index + 1] == '*') {
+                const end = std.mem.indexOfPos(u8, self.source, index + 2, "*/") orelse
+                    return .end;
+                index = end + 1;
+                continue;
+            }
+            if (byte == '\'' or byte == '"') {
+                index += 1;
+                while (index < self.source.len and self.source[index] != byte) {
+                    if (self.source[index] == '\\') index += 1;
+                    index += 1;
+                }
+                if (index == self.source.len) return .end;
+                continue;
+            }
+            if (byte == '?') return .query;
+            if (byte == '~') return .retraction;
+            if (byte == '.') {
+                const digit_before = index > self.index and
+                    std.ascii.isDigit(self.source[index - 1]);
+                const digit_after = index + 1 < self.source.len and
+                    std.ascii.isDigit(self.source[index + 1]);
+                if (!(digit_before and digit_after)) return .assertion;
+            }
+        }
+        return .end;
     }
 
     fn executeStatement(self: *Parser) !ExecutionResult {
@@ -2392,6 +2627,173 @@ test "multiple recursive body occurrences miss no derivations" {
     // only exists by combining two derived paths.
     try expectAnswerCount(&db, "path(n1, n5)?", 1);
     try expectAnswerCount(&db, "path(X, Y)?", 10);
+}
+
+test "repeated queries reuse the persistent closure without expansion" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(c, d).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try std.testing.expectEqual(@as(usize, 0), db.expansions);
+
+    try expectAnswerCount(&db, "path(a, X)?", 3);
+    const after_first = db.expansions;
+    try std.testing.expect(after_first > 0);
+    try std.testing.expect(db.materialization == .clean);
+
+    for (0..3) |_| try expectAnswerCount(&db, "path(a, X)?", 3);
+    var typed = try db.query(&.{input.relation("path", &.{
+        input.atom("a"),
+        input.variable("target"),
+    })});
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 3), typed.answers.items.len);
+    try std.testing.expectEqual(after_first, db.expansions);
+}
+
+test "persistent closure equals a fresh naive rebuild" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\person(alice). person(bob). parent(alice, bob).
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\blocked(c).
+        \\open(X) :- path(a, X), not blocked(X).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "numchildren(alice, 1)?", 1);
+    try std.testing.expect(db.materialization == .clean);
+
+    var staging = try db.clone();
+    defer staging.deinit();
+    var reference = try staging.facts.clone();
+    defer reference.deinit();
+    try staging.expandNaive(&reference);
+    try std.testing.expectEqual(reference.len(), db.closure.?.len());
+    for (0..reference.len()) |index|
+        try std.testing.expect(try db.closure.?.contains(reference.factAt(index)));
+}
+
+test "base updates and rule additions rebuild the closure correctly" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "path(a, c)?", 1);
+
+    // A base insertion marks the closure dirty and the next query repairs it.
+    var inserted = try db.execute("edge(c, d).");
+    inserted.deinit();
+    try std.testing.expect(db.materialization == .dirty_from_stratum);
+    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try std.testing.expect(db.materialization == .clean);
+
+    // Retraction removes derived consequences through the dirty rebuild.
+    var retracted = try db.execute("edge(a, b)~");
+    retracted.deinit();
+    try expectAnswerCount(&db, "path(a, c)?", 0);
+    try expectAnswerCount(&db, "path(b, d)?", 1);
+
+    // Typed updates take the same paths.
+    try db.addFact("edge", &.{ input.atom("d"), input.atom("e") });
+    try expectAnswerCount(&db, "path(b, e)?", 1);
+    try std.testing.expect(try db.retract(&.{
+        input.relation("edge", &.{ input.atom("d"), input.atom("e") }),
+    }));
+    try expectAnswerCount(&db, "path(b, e)?", 0);
+
+    // Rule addition invalidates from the new head's stratum.
+    var extended = try db.execute("reach(X) :- path(b, X).");
+    extended.deinit();
+    try std.testing.expect(db.materialization == .dirty_from_stratum);
+    try expectAnswerCount(&db, "reach(d)?", 1);
+}
+
+test "dirty stratum rebuild skips clean lower strata" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). flag(a).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\note(X) :- flag(X), not path(a, X).
+    );
+    setup.deinit();
+    // First materialization runs both strata.
+    try expectAnswerCount(&db, "note(a)?", 1);
+    const full_build = db.expansions;
+    try std.testing.expectEqual(@as(usize, 2), full_build);
+
+    // Only the negation stratum reads flag, so its update rebuilds one level.
+    var flagged = try db.execute("flag(c).");
+    flagged.deinit();
+    try expectAnswerCount(&db, "note(X)?", 1);
+    try std.testing.expectEqual(full_build + 1, db.expansions);
+
+    // An edge update dirties the recursive stratum and rebuilds both levels.
+    var edged = try db.execute("edge(c, d).");
+    edged.deinit();
+    try expectAnswerCount(&db, "note(X)?", 1);
+    try std.testing.expectEqual(full_build + 3, db.expansions);
+}
+
+test "a database without rules allocates no derived machinery" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try db.addFact("kept", &.{input.integer(1)});
+    try expectAnswerCount(&db, "kept(1)?", 1);
+    var typed = try db.query(&.{input.relation("kept", &.{input.variable("n")})});
+    defer typed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), typed.answers.items.len);
+    try std.testing.expect(db.closure == null);
+    try std.testing.expect(db.materialization == .uninitialized);
+    try std.testing.expect(db.analysis == null);
+    try std.testing.expectEqual(@as(usize, 0), db.expansions);
+}
+
+fn materializationAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
+    );
+    setup.deinit();
+    var first = try db.execute("summary(S)?");
+    first.deinit();
+    var inserted = try db.execute("edge(c, d).");
+    inserted.deinit();
+    var second = try db.execute("path(a, d)?");
+    second.deinit();
+    var retracted = try db.execute("edge(c, d)~");
+    retracted.deinit();
+    var third = try db.execute("path(a, d)?");
+    defer third.deinit();
+    if (third.query.answers.items.len != 0) return error.UnexpectedAnswer;
+}
+
+test "materialization lifecycle releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        materializationAllocationScenario,
+        .{},
+    );
 }
 
 test "duplicate derivations create no duplicate facts or endless rounds" {

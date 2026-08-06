@@ -436,6 +436,42 @@ fallback beyond the dissertation's simplest non-recursive examples.
 Stop with persistent materialization but rebuild-based updates. This establishes
 the state model before deltas make it more complicated.
 
+### Completed decisions
+
+M1 was completed on 2026-08-06 with these decisions:
+
+- The committed database owns `closure` (a relation store holding the base
+  facts plus every derived fact as one unified read view), a
+  `materialization` state (`uninitialized`, `clean`, or
+  `dirty_from_stratum`), and a cached `Analysis` (stratum mapping plus the
+  first dependent stratum of every predicate read in a rule body). All three
+  stay null/uninitialized until the first evaluation on a database with
+  rules.
+- Materialization is lazy at the next evaluation, and rebuilds are partial:
+  `buildClosure(from)` clones the current base facts, retains derived facts
+  of strata below `from` from the old closure, and re-expands the rest with
+  the same semi-naive evaluator used by the reference rebuild. Base changes
+  dirty the first dependent stratum of the changed predicate (or the level
+  past the last stratum when no rule reads it, refreshing only the base
+  partition). Rule additions validate first, then invalidate from the new
+  head's stratum under the new analysis — lazy rebuild is the documented
+  policy.
+- Queries and retractions materialize the committed database *before*
+  cloning statement staging, so the staged copy shares the closure's value
+  identifiers and evaluation never expands. The parser classifies each
+  statement by a terminator peek so bulk fact loads never trigger rebuilds;
+  atomicity keeps the staging-and-commit pattern unchanged. On
+  materialization failure the previous closure stays installed; values
+  interned by the aborted expansion remain until deinit (documented, not
+  observable through query results).
+- Ground query structures that are new to the value table still join the
+  seed set of admissible structural recursion: the staged database expands
+  its own discardable closure copy for that query only, keeping query-local
+  derivations out of persistent state.
+- A new `benchmark-materialization` workload (20 repeated queries over 14
+  rules) dropped from a 5.262 ms/query pre-M1 median to 23.3 us/query, and
+  the aggregation workload median improved from 0.910 ms to 52.1 us.
+
 ## M2: insertion deltas for positive rules
 
 ### Scope

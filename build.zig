@@ -134,6 +134,21 @@ pub fn build(b: *std.Build) void {
     const benchmark_step = b.step("benchmark-aggregation", "Run the aggregation baseline workload");
     benchmark_step.dependOn(&b.addRunArtifact(benchmark_exe).step);
 
+    const materialization_benchmark_exe = b.addExecutable(.{
+        .name = "materialization-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/materialization.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const materialization_benchmark_step = b.step(
+        "benchmark-materialization",
+        "Run the repeated-query rule workload",
+    );
+    materialization_benchmark_step.dependOn(&b.addRunArtifact(materialization_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

@@ -136,10 +136,14 @@ zig build test-fmt
 zig build lint
 ```
 
-Run the reproducible aggregation workload with:
+Run the reproducible benchmark workloads with:
 
 ```sh
 zig build benchmark-aggregation -Doptimize=ReleaseFast
+```
+
+```sh
+zig build benchmark-materialization -Doptimize=ReleaseFast
 ```
 
 See [Aggregation performance](docs/aggregation-performance.md) for the workload

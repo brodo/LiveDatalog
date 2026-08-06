@@ -32,6 +32,18 @@ order, atoms in lexical byte order, `nil`, then cons values lexicographically
 by head and tail. The total order reports equality exactly when scalar identity
 is equal.
 
+### Materialization
+
+The persistent derived closure. A database with rules materializes lazily at
+the first evaluation: the closure store holds base plus derived facts as one
+read view, and a tri-state (`uninitialized`, `clean`, `dirty_from_stratum`)
+tracks validity. Base updates dirty the first stratum that reads the changed
+predicate; rule additions invalidate from the new head's stratum; rebuilds
+reuse derived facts below the dirty stratum. Query-local literals and
+structures never enter the persistent closure — statements evaluate on
+staging clones, and novel ground structures expand a discardable closure
+copy.
+
 ### Relation store
 
 The indexed owner of ground facts (`relation_store.zig`). Its
