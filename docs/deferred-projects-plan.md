@@ -759,9 +759,15 @@ M6 was completed on 2026-08-06, finishing Project M:
 
 - The public maintenance API is `materialize`, `rebuild`, `applyChanges`,
   `maintenanceStats`, and `setShadowVerification`. `addFact`, `execute`, and
-  `retract` are unchanged and interoperate with the batch API; a legacy
-  retraction leaves the closure dirty, so a following batch rebuilds rather
-  than propagating until the closure is materialized again.
+  `retract` are unchanged and interoperate with the batch API. `retract` is
+  not superseded by `applyChanges`: it deletes every base fact matching a
+  goal, including goals with variables and joins, which exact-fact batch
+  deletion cannot express. It does still mark the affected strata dirty
+  rather than running delete-and-rederive, so a batch issued immediately
+  after a retraction rebuilds instead of propagating until the closure is
+  materialized again. Routing pattern retraction through the incremental
+  deletion engine — resolving its goals to exact facts and handing those to
+  `propagateDeletions` — was outside every phase's scope and remains open.
 - Maintenance stays lazy by default — an update marks strata and the next
   query repairs them — with `materialize` as the eager trigger and `rebuild`
   as the always-available reference path. Both run on staging and commit

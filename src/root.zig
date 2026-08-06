@@ -5062,7 +5062,9 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     try expectClosureMatchesRebuild(&db);
     try expectAnswerCount(&db, "path(a, c)?", 1);
 
-    // The legacy entry points keep working alongside the batch API.
+    // The single-statement entry points keep working alongside the batch
+    // API. Pattern retraction is not a subset of it: it deletes every base
+    // fact matching a goal, which exact-fact batch deletion cannot express.
     try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
     try expectAnswerCount(&db, "path(a, d)?", 1);
     var executed = try db.execute("edge(d, e).");
@@ -5073,8 +5075,9 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     }));
     try expectAnswerCount(&db, "path(a, e)?", 0);
 
-    // A legacy retraction leaves the closure dirty, so incremental
-    // propagation resumes only once it is materialized again.
+    // Retraction marks the affected strata dirty instead of running
+    // delete-and-rederive, so incremental propagation resumes only once the
+    // closure is materialized again.
     try db.materialize();
 
     // An inserted edge derives new path facts through the delta engine.
