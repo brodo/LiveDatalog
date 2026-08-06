@@ -24,3 +24,14 @@ derived facts because persistent or incremental materialization is deferred.
 This is a comparison baseline, not a cross-machine performance promise. Future
 measurements should retain the workload and warm-up behavior, report all five
 samples, and compare medians on the same host and toolchain where possible.
+
+## 2026-08-06 after S1 (finite `f64` scalars)
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.0
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 6.064, 6.026, 6.095, 6.065, and 6.093 ms
+- median: **6.065 ms/query**
+
+The workload contains no float literals; the change to bare-literal
+classification is not measurable on this benchmark.

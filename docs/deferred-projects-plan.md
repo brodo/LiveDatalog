@@ -123,6 +123,32 @@ representation-specific scalar IDs.
 - The selected non-finite and arithmetic-overflow errors are stable public
   behavior and allocation safe.
 
+### Completed decisions
+
+S1 was completed on 2026-08-06 with these decisions, recorded in
+[ADR 0001](adr/0001-finite-f64-scalars.md):
+
+- Only finite `f64` values are scalars. NaN reports `NumericType`, infinities
+  report `NumericOverflow`. Literals round to nearest; overflow beyond the
+  finite range is `NumericOverflow`, and gradual underflow (including rounding
+  to zero) is accepted.
+- Canonicalization happens at intern time in `scalar.Store.internFloat`: an
+  integral float exactly representable as `i64`, including both zero signs,
+  interns as the equal integer scalar. Stored floats are therefore non-integral
+  or have magnitude at least 2^63, which makes float equality plain value
+  equality.
+- Floats format with shortest round-trip digits: plain decimal for
+  non-integral magnitudes in `[1e-3, 1e16)`, scientific notation otherwise.
+  Every spelling reparses to the same canonical scalar identity.
+- Malformed numeric-leading bare tokens (`1e`, `1.2.3`, `12abc`) now report
+  `InvalidSyntax` instead of silently parsing as atoms, and digit-leading
+  atoms always format quoted.
+- Exact mixed integer/float ordering landed early (S2 scope) because the total
+  ground order and `setof` sorting need it as soon as floats exist: the float
+  is floored to an exact `i64` rather than rounding the integer through `f64`.
+  Comparison builtins accept mixed numerics; `+` and `-` remain integer-only
+  (`NumericType` on a float operand) until S2.
+
 ## S2: canonical mixed numeric semantics
 
 ### Scope

@@ -245,6 +245,7 @@ const Binding = struct {
 const ResultNode = union(enum) {
     atom: []u8,
     integer: i64,
+    float: f64,
     nil,
     cons: *ResultCons,
 };
@@ -257,12 +258,13 @@ const ResultCons = struct {
 pub const ResultValue = struct {
     node: *const ResultNode,
 
-    pub const Kind = enum { atom, integer, nil, cons };
+    pub const Kind = enum { atom, integer, float, nil, cons };
 
     pub fn kind(self: ResultValue) Kind {
         return switch (self.node.*) {
             .atom => .atom,
             .integer => .integer,
+            .float => .float,
             .nil => .nil,
             .cons => .cons,
         };
@@ -309,6 +311,7 @@ pub const ResultValue = struct {
                 try scalar.writeAtom(writer, value);
             },
             .integer => |value| try writer.print("{d}", .{value}),
+            .float => |value| try scalar.writeFloat(writer, value),
             .nil => try writer.writeAll("[]"),
             .cons => |pair| if (isProperResultList(self.node)) {
                 try writer.writeByte('[');
@@ -344,7 +347,7 @@ fn isProperResultList(root: *const ResultNode) bool {
 fn freeResultNode(allocator: std.mem.Allocator, node: *ResultNode) void {
     switch (node.*) {
         .atom => |atom| allocator.free(atom),
-        .integer, .nil => {},
+        .integer, .float, .nil => {},
         .cons => |pair| {
             freeResultNode(allocator, pair.head);
             freeResultNode(allocator, pair.tail);
@@ -740,6 +743,7 @@ pub const Jatalog = struct {
             .scalar => |scalar_id| switch (self.scalars.get(scalar_id)) {
                 .atom => |atom| .{ .atom = try self.allocator.dupe(u8, atom) },
                 .integer => |integer| .{ .integer = integer },
+                .float => |float| .{ .float = float },
             },
             .nil => .nil,
             .cons => |value_pair| blk: {
@@ -1953,7 +1957,7 @@ const Parser = struct {
         const predicate = switch (first) {
             .scalar => |scalar_id| switch (self.jatalog.scalars.get(scalar_id)) {
                 .atom => |atom| try self.jatalog.strings.intern(atom),
-                .integer => return Error.InvalidSyntax,
+                .integer, .float => return Error.InvalidSyntax,
             },
             else => return Error.InvalidSyntax,
         };
@@ -2560,6 +2564,31 @@ test "aggregate parser errors release all partial clause trees" {
     );
 }
 
+fn floatAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\measure(a, 2.5). measure(b, 1e-3). measure(c, 4.0).
+        \\small(X) :- measure(X, V), V < 3.
+        \\setof([X, V], measure(X, V), S)?
+    );
+    result.deinit();
+    var overflow = db.execute("measure(d, 1e400).") catch |err| switch (err) {
+        Error.NumericOverflow => return,
+        else => return err,
+    };
+    overflow.deinit();
+    return error.ExpectedNumericOverflow;
+}
+
+test "float parsing evaluation and overflow release every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        floatAllocationScenario,
+        .{},
+    );
+}
+
 test "recursive list length and sum use checked integer arithmetic" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -2903,13 +2932,9 @@ test "public source interface canonicalizes the complete i64 domain" {
     try std.testing.expectError(Error.NumericOverflow, db.execute("number(-9223372036854775809)."));
 }
 
-test "reserved numeric syntax and quoted numeric atoms remain distinct" {
+test "quoted numeric atoms remain distinct from numeric scalars" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(Error.NumericType, db.execute("value(1.0)."));
-    try std.testing.expectError(Error.NumericType, db.execute("value(1e3)."));
-    try std.testing.expectError(Error.NumericType, db.execute("value(-2.5e-2)."));
-
     var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
     defer result.deinit();
     try expectBindingValue(&db, &result.query.answers.items[0], "S", "[1, '1', '1.0']");
@@ -2918,15 +2943,132 @@ test "reserved numeric syntax and quoted numeric atoms remain distinct" {
     defer inequality.deinit();
     try std.testing.expectEqual(@as(usize, 0), inequality.query.answers.items.len);
 
-    var nested = try db.execute("nested([1]). nested(['1']). nested([1])?");
+    var quoted_float = try db.execute("1000 = '1e3'?");
+    defer quoted_float.deinit();
+    try std.testing.expectEqual(@as(usize, 0), quoted_float.query.answers.items.len);
+
+    var nested = try db.execute("nested([1]). nested(['1']). nested([1.0]). nested([1])?");
     defer nested.deinit();
     try std.testing.expectEqual(@as(usize, 1), nested.query.answers.items.len);
+
+    var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
+    defer quoted_setof.deinit();
+    try expectBindingValue(&db, &quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
 
     var arithmetic = try db.execute("01 = +0 + 1?");
     defer arithmetic.deinit();
     try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
 
     try std.testing.expectError(Error.NumericType, db.execute("value(X), X < 2?"));
+}
+
+test "float literals parse and integral values canonicalize to integers" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\value(2.5). value(0.5). value(-0.025). value(1.0).
+        \\value(1). value(1e0). value(1e3). value(-0.0).
+        \\value(0). value(1e-999).
+        \\setof(X, value(X), S)?
+    );
+    defer result.deinit();
+    try expectBindingValue(
+        &db,
+        &result.query.answers.items[0],
+        "S",
+        "[-0.025, 0, 0.5, 1, 2.5, 1000]",
+    );
+
+    var canonical = try db.execute("nested([1.0]). nested([1])?");
+    defer canonical.deinit();
+    try std.testing.expectEqual(@as(usize, 1), canonical.query.answers.items.len);
+
+    var integral = try db.execute("value(X), X = 1e0?");
+    defer integral.deinit();
+    try std.testing.expectEqual(@as(usize, 1), integral.query.answers.items.len);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try integral.query.answers.items[0].getInteger("X"),
+    );
+}
+
+test "float extremes format deterministically and round-trip" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\extreme(5e-324). extreme(2.2250738585072014e-308).
+        \\extreme(1.7976931348623157e308). extreme(-1.7976931348623157e308).
+        \\extreme(1e300).
+        \\setof(X, extreme(X), S)?
+    );
+    defer result.deinit();
+    try expectBindingValue(
+        &db,
+        &result.query.answers.items[0],
+        "S",
+        "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
+            "1.7976931348623157e308]",
+    );
+
+    for ([_][]const u8{
+        "extreme(5e-324)?",
+        "extreme(2.2250738585072014e-308)?",
+        "extreme(1.7976931348623157e308)?",
+        "extreme(-1.7976931348623157e308)?",
+        "extreme(1e300)?",
+    }) |query| {
+        var ground = try db.execute(query);
+        defer ground.deinit();
+        try std.testing.expectEqual(@as(usize, 1), ground.query.answers.items.len);
+    }
+
+    var formatted = try db.execute("half(0.5). half(X)?");
+    defer formatted.deinit();
+    const value = try formatted.query.answers.items[0].getValue("X");
+    const spelled = try value.formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(spelled);
+    try std.testing.expectEqualStrings("0.5", spelled);
+    try std.testing.expectEqual(ResultValue.Kind.float, value.kind());
+    try std.testing.expectError(Error.TypeMismatch, value.getInteger());
+}
+
+test "non-finite and malformed numeric source reports stable errors" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(1e400)."));
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(-1e400)."));
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(2e308)."));
+
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e+)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.2.3)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(12abc)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.)."));
+
+    var absent = try db.execute("value(X)?");
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent.query.answers.items.len);
+}
+
+test "mixed numeric comparison and query-local float literals" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var less = try db.execute("1.5 < 2?");
+    defer less.deinit();
+    try std.testing.expectEqual(@as(usize, 1), less.query.answers.items.len);
+
+    var greater = try db.execute("2 < 1.5?");
+    defer greater.deinit();
+    try std.testing.expectEqual(@as(usize, 0), greater.query.answers.items.len);
+
+    const scalar_count = db.scalars.values.items.len;
+    var bound = try db.execute("X = 2.5?");
+    const spelled = try (try bound.query.answers.items[0].getValue("X"))
+        .formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(spelled);
+    try std.testing.expectEqualStrings("2.5", spelled);
+    bound.deinit();
+    try std.testing.expectEqual(scalar_count, db.scalars.values.items.len);
 }
 
 test "integer identity is exact above 2^53 and recursive inside lists" {

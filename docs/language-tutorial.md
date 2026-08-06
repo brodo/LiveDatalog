@@ -77,9 +77,12 @@ A backslash escapes a quote or backslash inside a quoted value.
 
 Quoting always constructs an atom, so `'36'` is distinct from integer `36`.
 Bare integers outside the signed 64-bit range return `NumericOverflow`. Decimal
-and exponent-shaped bare literals are reserved for future numeric support and
-currently return `NumericType`; quote them when atom text such as `'1.0'` is
-intended.
+and exponent-shaped bare literals such as `2.5` and `1e-3` are finite `f64`
+scalars. An integral float such as `1.0` or `1e3` is canonicalized to the equal
+integer, so `1` and `1.0` are the same value; a literal too large for `f64`,
+such as `1e400`, returns `NumericOverflow`. Quote numeric-looking text when an
+atom such as `'1.0'` is intended: a malformed bare numeric token such as `1e`
+or `1.2.3` is an `InvalidSyntax` error, never an atom.
 
 ## Queries
 
