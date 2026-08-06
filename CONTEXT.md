@@ -44,6 +44,16 @@ structures never enter the persistent closure — statements evaluate on
 staging clones, and novel ground structures expand a discardable closure
 copy.
 
+### Aggregate group
+
+The maintained unit of a rule containing one unnested `setof`. Because
+aggregates are evaluated during rule matching rather than stored as their
+own relation, a group is identified by the binding of the rule's outer
+goals — the variables occurring in the outer clauses or the head — and its
+maintained value is the rule's head tuple for that binding. Group existence
+therefore comes from the outer goals: a group whose last member disappears
+still yields `[]`, while removing the group key removes the tuple.
+
 ### Relation store
 
 The indexed owner of ground facts (`relation_store.zig`). Its

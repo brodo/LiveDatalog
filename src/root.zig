@@ -221,6 +221,45 @@ const DeltaConstraint = struct {
     delta_end: usize,
 };
 
+/// How a batch's changed predicates affect one stratum's maintenance.
+const StratumImpact = enum { none, aggregate, rebuild };
+
+/// Returns the body index of the single unnested `setof` occurrence a rule
+/// can have maintained incrementally, or null when the rule falls outside
+/// the maintainable class and needs the rebuild fallback: no aggregate,
+/// several aggregates, a nested aggregate, or seeded structural recursion.
+fn maintainableAggregateIndex(rule: Rule) ?usize {
+    if (rule.seed_argument != null) return null;
+    var found: ?usize = null;
+    for (rule.body, 0..) |clause, index| {
+        const aggregate = switch (clause) {
+            .aggregate => |value| value,
+            else => continue,
+        };
+        if (found != null) return null;
+        for (aggregate.body) |inner| if (inner == .aggregate) return null;
+        found = index;
+    }
+    return found;
+}
+
+fn copyFactInto(allocator: std.mem.Allocator, store: *RelationStore, fact: Fact) !void {
+    const terms = try allocator.dupe(ValueId, fact.terms);
+    _ = store.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
+        allocator.free(terms);
+        return err;
+    };
+}
+
+fn bindingsEqual(left: *const Binding, right: *const Binding) bool {
+    if (left.values.count() != right.values.count()) return false;
+    for (left.values.keys(), left.values.values()) |variable, value| {
+        const other = right.values.get(variable) orelse return false;
+        if (other != value) return false;
+    }
+    return true;
+}
+
 const Materialization = union(enum) {
     uninitialized,
     clean,
@@ -716,7 +755,12 @@ pub const Jatalog = struct {
                 }
             }
         }
-        if (maintain and removed.len() > 0) try self.propagateDeletions(&removed);
+        var touched: RelationStore = .init(self.allocator);
+        defer touched.deinit();
+        if (maintain and removed.len() > 0) {
+            try self.propagateDeletions(&removed);
+            for (0..removed.len()) |index| try copyFactInto(self.allocator, &touched, removed.factAt(index));
+        }
 
         const propagate = self.closure != null and self.materialization == .clean;
         const batch_start = if (propagate) self.closure.?.len() else 0;
@@ -727,7 +771,12 @@ pub const Jatalog = struct {
         }
         if (propagate and self.closure.?.len() > batch_start) {
             try self.propagateInsertions(batch_start);
+            if (self.materialization == .clean) {
+                for (batch_start..self.closure.?.len()) |index|
+                    try copyFactInto(self.allocator, &touched, self.closure.?.factAt(index));
+            }
         }
+        if (touched.len() > 0) try self.maintainAggregates(&touched);
         return changed;
     }
 
@@ -753,7 +802,7 @@ pub const Jatalog = struct {
 
     /// A stratum blocks incremental propagation when one of its rules reads
     /// a predicate that gained facts during this batch through negation or
-    /// anywhere inside a `setof` body.
+    /// through an aggregate this phase cannot maintain.
     fn propagationBlocked(self: *Jatalog, level: usize, batch_start: usize) !bool {
         const closure = &self.closure.?;
         var grown: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
@@ -773,14 +822,278 @@ pub const Jatalog = struct {
         level: usize,
         changed: *const std.AutoHashMapUnmanaged(PredicateKey, void),
     ) !bool {
-        if (changed.count() == 0) return false;
+        return try self.stratumImpact(level, changed) == .rebuild;
+    }
+
+    /// Classifies how a batch's changed predicates affect one stratum:
+    /// negation over a changed predicate always needs the rebuild path, an
+    /// aggregate over a changed predicate needs it only when the rule is
+    /// outside the maintainable class, and everything else is handled by
+    /// the ordinary delta and delete-and-rederive engines.
+    fn stratumImpact(
+        self: *Jatalog,
+        level: usize,
+        changed: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+    ) !StratumImpact {
+        if (changed.count() == 0) return .none;
         const analysis = try self.ensureAnalysis();
+        var impact: StratumImpact = .none;
         for (self.rules.items) |rule| {
             const rule_level = analysis.strata.get(predicateKey(rule.head)) orelse 0;
             if (rule_level != level and (rule.seed_argument == null or rule_level > level)) continue;
-            if (clausesReadGrownNonPositively(rule.body, changed)) return true;
+            for (rule.body) |clause| switch (clause) {
+                .negated => |expression| if (changed.contains(predicateKey(expression))) return .rebuild,
+                .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, changed)) {
+                    if (maintainableAggregateIndex(rule) == null) return .rebuild;
+                    impact = .aggregate;
+                },
+                .relational, .builtin => {},
+            };
         }
-        return false;
+        return impact;
+    }
+
+    /// Maintains rules containing one unnested `setof` after a batch changed
+    /// the aggregate's inner relations. Only groups reachable from a changed
+    /// inner fact are recomputed. A group whose canonical list changed emits
+    /// its stale head tuples as deletions and its recomputed tuple as an
+    /// insertion, which then cascade through the ordinary deletion and
+    /// insertion maintenance. Rounds repeat while aggregate results keep
+    /// changing, with a bounded fallback to a full rebuild.
+    fn maintainAggregates(self: *Jatalog, touched: *RelationStore) !void {
+        if (self.closure == null or self.materialization != .clean) return;
+        const round_cap = (try self.ensureAnalysis()).max_level + 4;
+        var round: usize = 0;
+        while (true) {
+            round += 1;
+            if (round > round_cap) {
+                self.markDirty(0);
+                return self.ensureMaterialized();
+            }
+            var removals: RelationStore = .init(self.allocator);
+            defer removals.deinit();
+            var additions: std.ArrayList(Fact) = .empty;
+            defer {
+                for (additions.items) |fact| self.allocator.free(fact.terms);
+                additions.deinit(self.allocator);
+            }
+            var changed: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+            defer changed.deinit(self.allocator);
+            for (0..touched.len()) |index| {
+                const fact = touched.factAt(index);
+                try changed.put(self.allocator, .{
+                    .name = fact.predicate,
+                    .arity = fact.terms.len,
+                }, {});
+            }
+            for (self.rules.items) |rule| {
+                const clause_index = maintainableAggregateIndex(rule) orelse continue;
+                if (!clausesReadGrownAnywhere(rule.body[clause_index].aggregate.body, &changed)) continue;
+                try self.maintainAggregateRule(rule, clause_index, touched, &removals, &additions);
+            }
+            if (removals.len() == 0 and additions.items.len == 0) return;
+
+            touched.clear();
+            if (removals.len() > 0) {
+                try self.propagateDeletions(&removals);
+                for (0..removals.len()) |index| {
+                    const fact = removals.factAt(index);
+                    const terms = try self.allocator.dupe(ValueId, fact.terms);
+                    _ = touched.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
+                        self.allocator.free(terms);
+                        return err;
+                    };
+                }
+            }
+            if (self.materialization != .clean) return;
+            const batch_start = self.closure.?.len();
+            for (additions.items) |fact| {
+                if (try self.closure.?.contains(fact)) continue;
+                const terms = try self.allocator.dupe(ValueId, fact.terms);
+                _ = self.closure.?.insert(.{ .predicate = fact.predicate, .terms = terms }, true) catch |err| {
+                    self.allocator.free(terms);
+                    return err;
+                };
+            }
+            if (self.closure.?.len() > batch_start) {
+                try self.propagateInsertions(batch_start);
+                if (self.materialization != .clean) return;
+                for (batch_start..self.closure.?.len()) |index| {
+                    const fact = self.closure.?.factAt(index);
+                    const terms = try self.allocator.dupe(ValueId, fact.terms);
+                    _ = touched.insert(.{ .predicate = fact.predicate, .terms = terms }, false) catch |err| {
+                        self.allocator.free(terms);
+                        return err;
+                    };
+                }
+            }
+        }
+    }
+
+    fn maintainAggregateRule(
+        self: *Jatalog,
+        rule: Rule,
+        clause_index: usize,
+        touched: *RelationStore,
+        removals: *RelationStore,
+        additions: *std.ArrayList(Fact),
+    ) !void {
+        const aggregate = rule.body[clause_index].aggregate;
+        const outer = try self.allocator.alloc(Clause, rule.body.len - 1);
+        defer self.allocator.free(outer);
+        var outer_count: usize = 0;
+        for (rule.body, 0..) |clause, index| {
+            if (index == clause_index) continue;
+            outer[outer_count] = clause;
+            outer_count += 1;
+        }
+
+        // Only variables the outer goals or the head can constrain identify a
+        // group; variables local to the aggregate body must stay free.
+        var scope: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        defer scope.deinit(self.allocator);
+        for (outer[0..outer_count]) |clause|
+            try collectClauseSurfaceVariables(self.allocator, clause, &scope);
+        for (rule.head.terms) |term| try collectTermVariables(self.allocator, term, &scope);
+
+        var groups: std.ArrayList(Binding) = .empty;
+        defer {
+            for (groups.items) |*group| group.deinit(self.allocator);
+            groups.deinit(self.allocator);
+        }
+        for (0..touched.len()) |index| {
+            const fact = touched.factAt(index);
+            for (aggregate.body) |inner| {
+                const expression = switch (inner) {
+                    .relational => |value| value,
+                    else => continue,
+                };
+                if (expression.predicate != fact.predicate or
+                    expression.terms.len != fact.terms.len) continue;
+                var seed: Binding = .{};
+                defer seed.deinit(self.allocator);
+                if (!try self.unify(fact, expression, &seed)) continue;
+                var restricted: Binding = .{};
+                defer restricted.deinit(self.allocator);
+                for (seed.values.keys(), seed.values.values()) |variable, value| {
+                    if (scope.contains(variable))
+                        try restricted.values.put(self.allocator, variable, value);
+                }
+                try self.collectAggregateGroups(outer[0..outer_count], &restricted, &groups);
+            }
+        }
+
+        for (groups.items) |*group| try self.maintainAggregateGroup(
+            rule,
+            group,
+            removals,
+            additions,
+        );
+    }
+
+    fn collectAggregateGroups(
+        self: *Jatalog,
+        outer: []const Clause,
+        seed: *const Binding,
+        groups: *std.ArrayList(Binding),
+    ) !void {
+        var solutions: std.ArrayList(Binding) = .empty;
+        defer {
+            for (solutions.items) |*solution| solution.deinit(self.allocator);
+            solutions.deinit(self.allocator);
+        }
+        self.matchClauses(
+            outer,
+            &self.closure.?,
+            0,
+            seed,
+            &solutions,
+            null,
+        ) catch |err| switch (err) {
+            Error.NumericType, Error.NumericOverflow => return,
+            else => return err,
+        };
+        for (solutions.items) |*solution| {
+            var duplicate = false;
+            for (groups.items) |*existing| {
+                if (bindingsEqual(existing, solution)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            var copy = try solution.clone(self.allocator);
+            groups.append(self.allocator, copy) catch |err| {
+                copy.deinit(self.allocator);
+                return err;
+            };
+        }
+    }
+
+    /// Recomputes one group: the head tuples currently stored for it become
+    /// deletions unless the recomputation still derives them, and newly
+    /// derived tuples become insertions.
+    fn maintainAggregateGroup(
+        self: *Jatalog,
+        rule: Rule,
+        group: *const Binding,
+        removals: *RelationStore,
+        additions: *std.ArrayList(Fact),
+    ) !void {
+        var derived: RelationStore = .init(self.allocator);
+        defer derived.deinit();
+        var answers: std.ArrayList(Binding) = .empty;
+        defer {
+            for (answers.items) |*answer| answer.deinit(self.allocator);
+            answers.deinit(self.allocator);
+        }
+        self.matchClauses(
+            rule.body,
+            &self.closure.?,
+            0,
+            group,
+            &answers,
+            null,
+        ) catch |err| switch (err) {
+            Error.NumericType, Error.NumericOverflow => return,
+            else => return err,
+        };
+        for (answers.items) |*answer| {
+            const fact = try self.deriveFact(rule.head, answer);
+            _ = derived.insert(fact, true) catch |err| {
+                self.allocator.free(fact.terms);
+                return err;
+            };
+        }
+
+        // Stale stored tuples for this group: head matches under the group
+        // binding but the recomputation no longer derives them.
+        for (try self.lookupCandidates(&self.closure.?, rule.head, group)) |candidate| {
+            const stored = self.closure.?.factAt(candidate);
+            var matched = try group.clone(self.allocator);
+            defer matched.deinit(self.allocator);
+            if (!try self.unify(stored, rule.head, &matched)) continue;
+            if (try derived.contains(stored)) continue;
+            if (try removals.contains(stored)) continue;
+            const terms = try self.allocator.dupe(ValueId, stored.terms);
+            _ = removals.insert(.{ .predicate = stored.predicate, .terms = terms }, true) catch |err| {
+                self.allocator.free(terms);
+                return err;
+            };
+        }
+
+        for (0..derived.len()) |index| {
+            const fact = derived.factAt(index);
+            if (try self.closure.?.contains(fact)) continue;
+            const terms = try self.allocator.dupe(ValueId, fact.terms);
+            additions.append(self.allocator, .{
+                .predicate = fact.predicate,
+                .terms = terms,
+            }) catch |err| {
+                self.allocator.free(terms);
+                return err;
+            };
+        }
     }
 
     /// Applies a batch of base deletions to the clean closure with
@@ -3543,6 +3856,341 @@ test "random mixed update traces match a clean rebuild after every batch" {
         try std.testing.expect(db.materialization == .clean);
         try expectClosureMatchesRebuild(&db);
     }
+}
+
+test "aggregate groups are maintained incrementally across member changes" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2).
+        \\member(g1, b). member(g1, a). member(g2, z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a, b]");
+    initial.deinit();
+    const expansions_after_build = db.expansions;
+
+    // Member insertion updates only the affected group, with no rebuild.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("c") }),
+    }, &.{}));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(expansions_after_build, db.expansions);
+    var inserted = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&db, &inserted.query.answers.items[0], "S", "[a, b, c]");
+    inserted.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // The untouched group keeps its list and there is exactly one tuple
+    // per group after the change.
+    var untouched = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&db, &untouched.query.answers.items[0], "S", "[z]");
+    untouched.deinit();
+    try expectAnswerCount(&db, "collected(G, S)?", 2);
+
+    // Member deletion shrinks the list.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+    }));
+    var deleted = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&db, &deleted.query.answers.items[0], "S", "[b, c]");
+    deleted.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting the last member leaves the enumerated group with an empty
+    // list, because its outer goal still derives the group.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g2"), input.atom("z") }),
+    }));
+    var emptied = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&db, &emptied.query.answers.items[0], "S", "[]");
+    emptied.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting the group key removes the tuple entirely.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("group", &.{input.atom("g2")}),
+    }));
+    try expectAnswerCount(&db, "collected(g2, S)?", 0);
+    try expectAnswerCount(&db, "collected(G, S)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // Restoring the group key brings back an empty group.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("group", &.{input.atom("g2")}),
+    }, &.{}));
+    var restored = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&db, &restored.query.answers.items[0], "S", "[]");
+    restored.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "duplicate member derivations do not disturb a maintained group" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g). direct(g, a). mirrored(g, a). direct(g, b).
+        \\member(G, X) :- direct(G, X).
+        \\member(G, X) :- mirrored(G, X).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("collected(g, S)?");
+    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a, b]");
+    initial.deinit();
+
+    // Removing one of two derivations of member(g, a) keeps the member.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("mirrored", &.{ input.atom("g"), input.atom("a") }),
+    }));
+    var kept = try db.execute("collected(g, S)?");
+    try expectBindingValue(&db, &kept.query.answers.items[0], "S", "[a, b]");
+    kept.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Removing the last derivation drops it from the list.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("direct", &.{ input.atom("g"), input.atom("a") }),
+    }));
+    var dropped = try db.execute("collected(g, S)?");
+    try expectBindingValue(&db, &dropped.query.answers.items[0], "S", "[b]");
+    dropped.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "canonical aggregate lists are independent of update order" {
+    const orders = [_][3][]const u8{
+        .{ "c", "a", "b" },
+        .{ "b", "c", "a" },
+        .{ "a", "b", "c" },
+    };
+    for (orders) |order| {
+        var db: Jatalog = .init(std.testing.allocator);
+        defer db.deinit();
+        var setup = try db.execute(
+            \\group(g).
+            \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        );
+        setup.deinit();
+        var empty = try db.execute("collected(g, S)?");
+        try expectBindingValue(&db, &empty.query.answers.items[0], "S", "[]");
+        empty.deinit();
+
+        for (order) |name| {
+            _ = try db.applyChanges(&.{
+                input.fact("member", &.{ input.atom("g"), input.atom(name) }),
+            }, &.{});
+        }
+        var result = try db.execute("collected(g, S)?");
+        try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a, b, c]");
+        result.deinit();
+        try expectClosureMatchesRebuild(&db);
+    }
+}
+
+test "bag emulation retains equal values with distinct discriminators" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g). reading(g, r1, 5). reading(g, r2, 5). reading(g, r3, 7).
+        \\bag(G, S) :- group(G), setof([V, D], reading(G, D, V), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &db,
+        &initial.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r2], [7, r3]]",
+    );
+    initial.deinit();
+
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("reading", &.{ input.atom("g"), input.atom("r4"), input.integer(5) }),
+    }, &.{}));
+    var added = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &db,
+        &added.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r2], [5, r4], [7, r3]]",
+    );
+    added.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Removing one duplicate value keeps the others.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("reading", &.{ input.atom("g"), input.atom("r2"), input.integer(5) }),
+    }));
+    var removed = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &db,
+        &removed.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r4], [7, r3]]",
+    );
+    removed.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "maintained aggregates feed downstream strata and recursive consumers" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\person(alice). person(bob).
+        \\parent(alice, bob).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+    );
+    setup.deinit();
+    var initial = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
+    initial.deinit();
+
+    // A new child changes the aggregate list, which must flow through the
+    // downstream structural list function.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("person", &.{input.atom("carol")}),
+        input.fact("parent", &.{ input.atom("alice"), input.atom("carol") }),
+    }, &.{}));
+    var grown = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
+    grown.deinit();
+    try expectAnswerCount(&db, "numchildren(X, N)?", 3);
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }),
+    }));
+    var shrunk = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try shrunk.query.answers.items[0].getInteger("N"));
+    shrunk.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "multiple and nested aggregates stay correct through the rebuild path" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2). item(g1, a). item(g2, b). tag(g1, t1). tag(g2, t2).
+        \\both(G, S, T) :- group(G), setof(X, item(G, X), S), setof(Y, tag(G, Y), T).
+        \\nested(S) :- group(g1), setof([G, T], (group(G), setof(X, item(G, X), T)), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a]");
+    try expectBindingValue(&db, &initial.query.answers.items[0], "T", "[t1]");
+    initial.deinit();
+
+    // Rules outside the maintainable class fall back to the stratum
+    // rebuild, which must still produce rebuild-equivalent results.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("item", &.{ input.atom("g1"), input.atom("c") }),
+        input.fact("tag", &.{ input.atom("g1"), input.atom("t3") }),
+    }, &.{}));
+    var updated = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&db, &updated.query.answers.items[0], "S", "[a, c]");
+    try expectBindingValue(&db, &updated.query.answers.items[0], "T", "[t1, t3]");
+    updated.deinit();
+    var nested = try db.execute("nested(S)?");
+    try expectBindingValue(
+        &db,
+        &nested.query.answers.items[0],
+        "S",
+        "[[g1, [a, c]], [g2, [b]]]",
+    );
+    nested.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("item", &.{ input.atom("g1"), input.atom("a") }),
+    }));
+    var reduced = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&db, &reduced.query.answers.items[0], "S", "[c]");
+    reduced.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "random aggregate update traces match a clean rebuild after every batch" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2). group(g3).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(G, N) :- collected(G, S), length(S, N).
+        \\empty(G) :- group(G), not member(G, m1), not member(G, m2), not member(G, m3).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "size(G, N)?", 3);
+
+    const groups = [_][]const u8{ "g1", "g2", "g3" };
+    const members = [_][]const u8{ "m1", "m2", "m3" };
+    var prng = std.Random.DefaultPrng.init(0xa99a6a7e5eed);
+    const random = prng.random();
+    for (0..40) |_| {
+        var insert_buffer: [2][2]input.Term = undefined;
+        var inserts: [2]input.Relation = undefined;
+        const insert_count = random.uintLessThan(usize, 3);
+        for (0..insert_count) |slot| {
+            insert_buffer[slot] = .{
+                input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                input.atom(members[random.uintLessThan(usize, members.len)]),
+            };
+            inserts[slot] = input.fact("member", &insert_buffer[slot]);
+        }
+        var delete_buffer: [2][2]input.Term = undefined;
+        var deletes: [2]input.Relation = undefined;
+        const delete_count = random.uintLessThan(usize, 3);
+        for (0..delete_count) |slot| {
+            delete_buffer[slot] = .{
+                input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                input.atom(members[random.uintLessThan(usize, members.len)]),
+            };
+            deletes[slot] = input.fact("member", &delete_buffer[slot]);
+        }
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try std.testing.expect(db.materialization == .clean);
+        try expectClosureMatchesRebuild(&db);
+    }
+}
+
+fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2). member(g1, a).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var first = try db.execute("collected(G, S)?");
+    first.deinit();
+    _ = try db.applyChanges(&.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
+        input.fact("member", &.{ input.atom("g2"), input.atom("c") }),
+    }, &.{});
+    _ = try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+    });
+    var second = try db.execute("collected(g1, S)?");
+    defer second.deinit();
+    const formatted = try (try second.query.answers.items[0].getValue("S"))
+        .formatAlloc(allocator);
+    defer allocator.free(formatted);
+    if (!std.mem.eql(u8, formatted, "[b]")) return error.UnexpectedAggregate;
+}
+
+test "aggregate maintenance releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        aggregateMaintenanceAllocationScenario,
+        .{},
+    );
 }
 
 fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {

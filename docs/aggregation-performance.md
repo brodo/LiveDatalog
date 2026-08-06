@@ -127,3 +127,11 @@ counter added to the relation store.
 Another no-regression check: the aggregation median measured 52.7 us/query
 (52.7, 53.4, and 52.7 us) and the repeated-query median 23.1 us/query
 (23.8, 23.1, and 23.0 us), both within noise of the earlier measurements.
+
+## 2026-08-06 after M4 (materialized aggregate groups)
+
+Both workloads only query, so this remains a no-regression check: the
+aggregation median measured 52.2 us/query (52.2, 51.8, and 53.4 us) and the
+repeated-query median 22.5 us/query (22.2, 22.5, and 22.7 us). The M4 work
+changes update cost rather than query cost; a dedicated update benchmark
+belongs with the M6 maintenance-statistics work.

@@ -620,6 +620,40 @@ M3 was completed on 2026-08-06 with these decisions:
   terms.
 - Nested and multiple source aggregates work through normalization.
 
+### Completed decisions
+
+M4 was completed on 2026-08-06 with these decisions:
+
+- Aggregates are evaluated inside rule matching rather than stored as
+  separate relations, so the maintained unit is the *rule head tuple per
+  group* rather than a standalone auxiliary aggregate view. Group identity
+  is the binding of the rule's outer goals: variables that occur in the
+  outer clauses or the head. This gives the auxiliary view's group key,
+  member projection, and canonical list without a second storage format.
+- `stratumImpact` replaced the earlier boolean block check. Negation over a
+  changed predicate still forces the stratum rebuild; an aggregate over a
+  changed predicate forces it only when the rule is outside the maintainable
+  class (`maintainableAggregateIndex`): exactly one `setof`, not nested, and
+  not a seed rule.
+- `maintainAggregates` runs after the deletion and insertion phases over the
+  batch's touched facts. For each maintainable rule whose inner relations
+  changed it derives candidate groups by unifying each touched fact with the
+  aggregate's inner clauses, restricting the binding to group scope, and
+  solving the outer goals; only those groups are recomputed. A group's stale
+  head tuples become deletions and its recomputed tuple an insertion, which
+  cascade through the existing delete-and-rederive and delta engines, so
+  downstream strata and structural list functions update without extra
+  machinery. Rounds repeat while results keep changing, bounded by the
+  stratum count with a documented full-rebuild fallback.
+- Group existence is separate from membership for free: because groups come
+  from the outer goals, a group whose last member disappears still yields
+  `[]`, while deleting the group key removes the tuple. Both directions are
+  tested, including restoring a deleted key.
+- Multiple and nested aggregates per rule remain outside the maintained
+  class in this phase and take the documented stratum-rebuild fallback;
+  they are covered by rebuild-equivalence tests. The Chapter 3 normalization
+  into auxiliary rules is deferred rather than implemented here.
+
 ## M5: projected aggregate views and CReaM counts
 
 ### Scope
