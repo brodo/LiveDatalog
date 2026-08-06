@@ -112,9 +112,13 @@ Insertions into a materialized database propagate incrementally through
 positive rules, and deletions use delete-and-rederive, so facts with an
 alternative proof survive while unsupported recursive consequences —
 including cyclically self-supporting ones — disappear. A rule with a single
-unnested `setof` maintains only the groups an update touched. Updates that
-reach negation, or an aggregate outside that class, recompute the affected
-strata. Every path is checked against a full rebuild.
+unnested `setof` maintains only the groups an update touched. When such a
+rule's head projects an outer variable away, several groups can derive the
+same tuple, so derivation counts decide when it appears and disappears.
+Updates that reach negation, or an aggregate outside that class, recompute
+the affected strata. Every path is checked against a full rebuild.
+`maintenanceStats` reports closure size, incremental work, and how the
+maintained views are classified.
 
 Floats follow the finite-value policy from
 [ADR 0001](docs/adr/0001-finite-f64-scalars.md): compiling `input.float`

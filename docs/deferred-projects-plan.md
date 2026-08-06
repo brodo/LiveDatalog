@@ -678,6 +678,46 @@ M4 was completed on 2026-08-06 with these decisions:
 - Counts agree with explicit proof enumeration on bounded test databases.
 - The Chapter 5 examples are executable regression tests.
 
+### Completed decisions
+
+M5 was completed on 2026-08-06 with these decisions:
+
+- A maintained aggregate rule is *projected* when its head omits some outer
+  variable, matching the Chapter 5 Case 2 / Section 5.2.2 distinction.
+  `projectedVariables` computes that set; a rule keeping every outer
+  variable is self-maintainable in the sense of Corollary 5.2.1 and keeps
+  the M4 path, because each of its head tuples belongs to exactly one group.
+- Each projected rule gets an `AuxiliaryView` holding one tuple per
+  derivation: the projected values followed by the head values they derive.
+  This is exactly the chapter's `v_c` counting view, with the count stored
+  as tuple multiplicity rather than a separate number.
+- The derivation count is *derived* from the auxiliary view by an indexed
+  lookup rather than stored alongside it, so it cannot drift from the
+  tuples it summarizes; it is transactional because the auxiliary views live
+  in the staged database and are rolled back with it. `derivationCount`
+  reports `NumericOverflow` rather than wrapping when a count exceeds the
+  counter width.
+- A projected head tuple becomes visible only on a zero-to-one transition
+  and is deleted only on a one-to-zero transition, so a group whose
+  canonical list changes transfers its whole support from the old tuple to
+  the new one inside one batch.
+- Group identity is the projected values *together with* the head variables
+  the outer goals bind — projected values alone are ambiguous, since
+  different groups can share them. Both the per-group tuple lookup and the
+  vanished-group sweep therefore re-unify a stored tuple's head portion
+  against the rule head before treating it as belonging to a group. The
+  randomized count-versus-enumeration test caught this.
+- Projected views also react to outer-goal changes, which create and destroy
+  whole groups; a group with no remaining outer solution has its auxiliary
+  tuples swept. Delete-and-rederive still backstops every path, so an
+  imprecise transition cannot produce a wrong closure.
+- `maintenanceStats` records the classification the phase asks for: closure
+  size, propagated and removed facts, stratum expansions, and the counts of
+  self-maintainable views, projected views, and auxiliary tuples.
+- Chapter 5 Examples 5.2.1 and 5.3.1 are executable regression tests,
+  including the `v_c` counts of 2 and 1 and the two-step deletion that keeps
+  and then drops `v(a, [1, 2])`.
+
 ## M6: downstream list functions and maintenance API
 
 ### Scope

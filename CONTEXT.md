@@ -54,6 +54,18 @@ maintained value is the rule's head tuple for that binding. Group existence
 therefore comes from the outer goals: a group whose last member disappears
 still yields `[]`, while removing the group key removes the tuple.
 
+### Projected view
+
+A maintained aggregate rule whose head omits some outer variable, so several
+groups can derive the same head tuple. Each projected rule owns an auxiliary
+view holding one tuple per derivation — the projected values followed by the
+head values — and the number of such tuples is the head tuple's derivation
+count. The tuple becomes visible on a zero-to-one transition and is deleted
+on a one-to-zero transition. A rule retaining every outer variable needs no
+auxiliary view and is self-maintainable. Group identity is the projected
+values together with the head variables the outer goals bind; projected
+values alone are ambiguous.
+
 ### Relation store
 
 The indexed owner of ground facts (`relation_store.zig`). Its

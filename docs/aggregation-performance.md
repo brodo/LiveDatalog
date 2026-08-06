@@ -135,3 +135,11 @@ aggregation median measured 52.2 us/query (52.2, 51.8, and 53.4 us) and the
 repeated-query median 22.5 us/query (22.2, 22.5, and 22.7 us). The M4 work
 changes update cost rather than query cost; a dedicated update benchmark
 belongs with the M6 maintenance-statistics work.
+
+## 2026-08-06 after M5 (projected views and CReaM counts)
+
+Still query-only, so another no-regression check: the aggregation median
+measured 54.1 us/query (54.1, 51.6, and 59.5 us) and the repeated-query
+median 23.6 us/query (23.7, 23.6, and 22.9 us). Neither benchmark defines a
+projected aggregate view, so the auxiliary views are empty here and add no
+query cost.
