@@ -35,3 +35,14 @@ samples, and compare medians on the same host and toolchain where possible.
 
 The workload contains no float literals; the change to bare-literal
 classification is not measurable on this benchmark.
+
+## 2026-08-06 after S2 (mixed numeric arithmetic)
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.0
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 6.305, 6.358, 6.218, 6.113, and 6.252 ms
+- median: **6.252 ms/query**
+
+The workload performs no arithmetic; the median is within run-to-run noise of
+the 2026-07-30 baseline.

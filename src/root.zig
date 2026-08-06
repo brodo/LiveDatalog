@@ -2589,6 +2589,33 @@ test "float parsing evaluation and overflow release every allocation on failure"
     );
 }
 
+fn mixedArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\measure(a, 2.5). measure(b, 0.5).
+        \\shifted(X, S) :- measure(X, V), S = V + 0.5.
+        \\setof([X, S], shifted(X, S), Out)?
+    );
+    result.deinit();
+    var overflow = db.execute(
+        "N = 1.7976931348623157e308 + 1.7976931348623157e308?",
+    ) catch |err| switch (err) {
+        Error.NumericOverflow => return,
+        else => return err,
+    };
+    overflow.deinit();
+    return error.ExpectedNumericOverflow;
+}
+
+test "mixed arithmetic releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        mixedArithmeticAllocationScenario,
+        .{},
+    );
+}
+
 test "recursive list length and sum use checked integer arithmetic" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -3069,6 +3096,194 @@ test "mixed numeric comparison and query-local float literals" {
     try std.testing.expectEqualStrings("2.5", spelled);
     bound.deinit();
     try std.testing.expectEqual(scalar_count, db.scalars.values.items.len);
+}
+
+fn expectAnswerCount(db: *Jatalog, source: []const u8, expected: usize) !void {
+    var result = try db.execute(source);
+    defer result.deinit();
+    try std.testing.expectEqual(expected, result.query.answers.items.len);
+}
+
+test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+
+    var promoted = try db.execute("X = 1.5 + 1?");
+    const spelled = try (try promoted.query.answers.items[0].getValue("X"))
+        .formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(spelled);
+    try std.testing.expectEqualStrings("2.5", spelled);
+    promoted.deinit();
+
+    var integral = try db.execute("X = 1.5 + 2.5?");
+    defer integral.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        try integral.query.answers.items[0].getInteger("X"),
+    );
+
+    var negative = try db.execute("X = -0.5 - 0.5?");
+    defer negative.deinit();
+    try std.testing.expectEqual(
+        @as(i64, -1),
+        try negative.query.answers.items[0].getInteger("X"),
+    );
+
+    // Bound-output success, mismatch, and subtraction with both signs.
+    try expectAnswerCount(&db, "4 = 1.5 + 2.5?", 1);
+    try expectAnswerCount(&db, "5 = 1.5 + 2?", 0);
+    try expectAnswerCount(&db, "-2.5 = -1.5 - 1?", 1);
+    try expectAnswerCount(&db, "2.5 = 1 - -1.5?", 1);
+
+    // Gradual underflow keeps exact subnormal results.
+    try expectAnswerCount(
+        &db,
+        "1.1125369292536007e-308 = 2.2250738585072014e-308 - 1.1125369292536007e-308?",
+        1,
+    );
+    try expectAnswerCount(&db, "0 = 5e-324 - 5e-324?", 1);
+
+    // A mixed operation on an i64 extreme produces the rounded f64, which
+    // stays a float because its integral value is outside the i64 range.
+    var extreme = try db.execute("X = 9223372036854775807 + 0.5?");
+    const extreme_spelled = try (try extreme.query.answers.items[0].getValue("X"))
+        .formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(extreme_spelled);
+    try std.testing.expectEqualStrings("9.223372036854776e18", extreme_spelled);
+    extreme.deinit();
+
+    try std.testing.expectError(Error.NumericOverflow, db.execute(
+        "N = 1.7976931348623157e308 + 1.7976931348623157e308?",
+    ));
+    try std.testing.expectError(Error.NumericOverflow, db.execute(
+        "N = -1.7976931348623157e308 - 1.7976931348623157e308?",
+    ));
+    try std.testing.expectError(Error.NumericType, db.execute("N = nope + 0.5?"));
+
+    // Integer-only overflow behavior is unchanged by promotion.
+    try std.testing.expectError(Error.NumericOverflow, db.execute(
+        "N = 9223372036854775807 + 1?",
+    ));
+}
+
+test "mixed equality and ordering are exact at numeric boundaries" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+
+    // Around 2^53: float literals canonicalize to their exact integer, so
+    // nearby odd integers stay distinct.
+    try expectAnswerCount(&db, "9007199254740993 > 9.007199254740992e15?", 1);
+    try expectAnswerCount(&db, "9007199254740993 = 9.007199254740993e15?", 0);
+    try expectAnswerCount(&db, "9007199254740992 = 9.007199254740992e15?", 1);
+
+    // Both i64 limits against the adjacent representable floats.
+    try expectAnswerCount(&db, "9223372036854775807 < 9.223372036854776e18?", 1);
+    try expectAnswerCount(&db, "-9223372036854775808 = -9.223372036854775808e18?", 1);
+    try expectAnswerCount(&db, "-9223372036854775807 > -9.223372036854776e18?", 1);
+
+    // Adjacent representable floats around 1.
+    try expectAnswerCount(&db, "1.0000000000000002 > 1?", 1);
+    try expectAnswerCount(&db, "0.9999999999999999 < 1?", 1);
+    try expectAnswerCount(&db, "1.0000000000000002 = 1?", 0);
+
+    var ordered = try db.execute(
+        \\near(0.9999999999999999). near(1). near(1.0000000000000002).
+        \\setof(X, near(X), S)?
+    );
+    defer ordered.deinit();
+    try expectBindingValue(
+        &db,
+        &ordered.query.answers.items[0],
+        "S",
+        "[0.9999999999999999, 1, 1.0000000000000002]",
+    );
+}
+
+test "canonical numeric identity holds inside lists and nested aggregates" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+
+    var dedup = try db.execute(
+        \\one(1). one(1.0). one(01). one(1e0). one('1'). one('1.0').
+        \\setof(X, one(X), S)?
+    );
+    defer dedup.deinit();
+    try expectBindingValue(&db, &dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
+
+    try expectAnswerCount(&db, "nested([1.0, 2.5]). nested([1, 2.5])?", 1);
+    try expectAnswerCount(&db, "pair(cons(0.5, 1.0)). pair(cons(0.5, 1))?", 1);
+
+    var grouped = try db.execute(
+        \\kind(g). kind(h). item(g, 0.5). item(g, 1.0). item(g, 1). item(h, 2.5).
+        \\grouped(Out) :- kind(g), setof([G, S], (kind(G), setof(V, item(G, V), S)), Out).
+        \\grouped(Out)?
+    );
+    defer grouped.deinit();
+    try expectBindingValue(
+        &db,
+        &grouped.query.answers.items[0],
+        "Out",
+        "[[g, [0.5, 1]], [h, [2.5]]]",
+    );
+
+    var summed = try db.execute(
+        \\sum([], 0).
+        \\sum(H!T, N) :- sum(T, M), N = M + H.
+        \\sum([1, 0.5, 2.5], Total)?
+    );
+    defer summed.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 4),
+        try summed.query.answers.items[0].getInteger("Total"),
+    );
+}
+
+test "source and typed mixed numeric operations produce identical answers" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute("measure(a, 2.5). measure(b, 3). measure(c, 0.5).");
+    setup.deinit();
+
+    const x = input.variable("x");
+    const v = input.variable("v");
+    const s = input.variable("s");
+    const d = input.variable("d");
+    var typed = try db.query(&.{
+        input.relation("measure", &.{ x, v }),
+        input.compare(.less_than, v, input.integer(3)),
+        input.add(s, v, input.integer(1)),
+        input.subtract(d, v, input.integer(2)),
+    });
+    defer typed.deinit();
+
+    var source = try db.execute("measure(X, V), V < 3, S = V + 1, D = V - 2?");
+    defer source.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), typed.answers.items.len);
+    try std.testing.expectEqual(
+        typed.answers.items.len,
+        source.query.answers.items.len,
+    );
+    for (typed.answers.items, source.query.answers.items) |*typed_answer, *source_answer| {
+        for ([_][2][]const u8{
+            .{ "v", "V" },
+            .{ "s", "S" },
+            .{ "d", "D" },
+        }) |names| {
+            const typed_value = try (try typed_answer.getValue(names[0]))
+                .formatAlloc(std.testing.allocator);
+            defer std.testing.allocator.free(typed_value);
+            const source_value = try (try source_answer.getValue(names[1]))
+                .formatAlloc(std.testing.allocator);
+            defer std.testing.allocator.free(source_value);
+            try std.testing.expectEqualStrings(source_value, typed_value);
+        }
+    }
+
+    const typed_shifted = try (try typed.answers.items[0].getValue("s"))
+        .formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(typed_shifted);
+    try std.testing.expectEqualStrings("3.5", typed_shifted);
 }
 
 test "integer identity is exact above 2^53 and recursive inside lists" {

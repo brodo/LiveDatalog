@@ -184,6 +184,28 @@ S1 was completed on 2026-08-06 with these decisions, recorded in
 - Source and typed programs produce identical answers for every supported
   mixed numeric operation.
 
+### Completed decisions
+
+S2 was completed on 2026-08-06. Canonicalization, numeric identity, and exact
+mixed ordering had already landed with S1 (see the S1 decisions and
+[ADR 0001](adr/0001-finite-f64-scalars.md)); S2 added mixed arithmetic:
+
+- `scalar.Store.add` and `subtract` keep integer-only operands on the checked
+  `i64` path. Any float operand promotes both operands to `f64` (the integer
+  via round-to-nearest), computes in `f64`, and interns through `internFloat`,
+  which reports `NumericOverflow` for a non-finite result and canonicalizes an
+  exact in-range integral result back to an integer scalar.
+- Consequently a mixed operation on an `i64` extreme can yield an
+  out-of-range integral float that stays a float, for example
+  `9223372036854775807 + 0.5 = 9.223372036854776e18`. This is accepted rounding
+  behavior for mixed arithmetic, unlike comparisons, which never round.
+- Gradual underflow in arithmetic results is accepted down to subnormals and
+  exact zero, which canonicalizes to integer `0`.
+- Unification, equality, fact deduplication, structural equality, ordering,
+  and `setof` deduplication needed no changes: they already flow through
+  canonical scalar identity, now verified by boundary, list, nested-aggregate,
+  and typed-versus-source parity tests.
+
 ## S3: typed embedding, owned results, and migration
 
 ### Scope

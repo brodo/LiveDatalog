@@ -102,23 +102,34 @@ pub const Store = struct {
         return self.values.items[@intFromEnum(id)];
     }
 
-    pub fn getInteger(self: *const Store, id: Id) !i64 {
-        return switch (self.get(id)) {
-            .integer => |value| value,
-            .atom, .float => error.NumericType,
-        };
-    }
-
+    /// Adds two numeric scalars. Integer-only operations stay on the checked
+    /// `i64` path; an operation involving a float produces `f64` and interns
+    /// the result under the canonical numeric policy.
     pub fn add(self: *Store, left: Id, right: Id) !Id {
-        const value = std.math.add(i64, try self.getInteger(left), try self.getInteger(right)) catch
-            return error.NumericOverflow;
-        return self.internInteger(value);
+        const a = self.get(left);
+        const b = self.get(right);
+        if (a == .integer and b == .integer) {
+            const value = std.math.add(i64, a.integer, b.integer) catch
+                return error.NumericOverflow;
+            return self.internInteger(value);
+        }
+        const a_float = floatValue(a) orelse return error.NumericType;
+        const b_float = floatValue(b) orelse return error.NumericType;
+        return self.internFloat(a_float + b_float);
     }
 
+    /// Subtracts two numeric scalars with the same promotion policy as `add`.
     pub fn subtract(self: *Store, left: Id, right: Id) !Id {
-        const value = std.math.sub(i64, try self.getInteger(left), try self.getInteger(right)) catch
-            return error.NumericOverflow;
-        return self.internInteger(value);
+        const a = self.get(left);
+        const b = self.get(right);
+        if (a == .integer and b == .integer) {
+            const value = std.math.sub(i64, a.integer, b.integer) catch
+                return error.NumericOverflow;
+            return self.internInteger(value);
+        }
+        const a_float = floatValue(a) orelse return error.NumericType;
+        const b_float = floatValue(b) orelse return error.NumericType;
+        return self.internFloat(a_float - b_float);
     }
 
     pub fn compareNumeric(self: *const Store, left: Id, right: Id) !std.math.Order {
@@ -147,6 +158,14 @@ pub const Store = struct {
         }
     }
 };
+
+fn floatValue(value: Value) ?f64 {
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .atom => null,
+    };
+}
 
 fn numericOrder(a: Value, b: Value) ?std.math.Order {
     return switch (a) {

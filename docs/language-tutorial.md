@@ -318,7 +318,7 @@ N: 3
 The variable `H` is unused here, but matching `H!T` proves that the input is a
 non-empty list and makes the smaller tail available to the recursive call.
 
-## Integer arithmetic
+## Numeric arithmetic
 
 LiveDatalog supports addition and subtraction in equality expressions:
 
@@ -327,9 +327,12 @@ N = A + B
 N = A - B
 ```
 
-Both operands on the right must already be bound integer scalars. Operations use
-checked signed 64-bit arithmetic. Non-integer operands and overflow produce an
-error.
+Both operands on the right must already be bound numeric scalars. Integer-only
+operations use checked signed 64-bit arithmetic and report `NumericOverflow`
+outside the `i64` range. An operation involving a float produces an `f64`
+result: an exact in-range integral result canonicalizes back to an integer
+(`4 = 1.5 + 2.5` holds), and a result beyond the finite float range reports
+`NumericOverflow`. Non-numeric operands produce a `NumericType` error.
 
 Arithmetic can be used safely with structurally decreasing list recursion:
 
