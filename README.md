@@ -133,6 +133,13 @@ const stats = database.maintenanceStats();
 - updates reaching negation, or an aggregate outside the maintained class of
   one unnested `setof` per rule, recompute the affected strata.
 
+Retraction takes the deletion path too. `retract` and the source `~`
+statement resolve their goals against the closure and hand the matching base
+facts to the same engine, so pattern retraction such as
+`retract(edge(a, X))` — which deletes every matching fact and has no
+batch-API equivalent — is maintained incrementally rather than triggering a
+rebuild.
+
 A maintained aggregate rule recomputes only the groups an update touched.
 When its head projects an outer variable away, several groups can derive the
 same tuple, so derivation counts decide when that tuple appears and

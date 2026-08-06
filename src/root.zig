@@ -734,17 +734,40 @@ pub const Jatalog = struct {
         staging.* = previous;
     }
 
+    /// Applies the base facts a retraction removed. `staging` holds the
+    /// post-retraction base facts computed by goal evaluation; the removals
+    /// are replayed onto a fresh clone so query-local values interned while
+    /// evaluating the goals never reach the committed database. The removals
+    /// then take the same incremental deletion path as a batch: exact facts
+    /// through delete-and-rederive and aggregate maintenance when the
+    /// closure is clean, and dirty-stratum rebuild otherwise.
     fn commitRetraction(self: *Jatalog, staging: *Jatalog) !void {
         var committed = try self.clone();
         defer committed.deinit();
+        const maintain = committed.closure != null and committed.materialization == .clean;
+        var removed: RelationStore = .init(committed.allocator);
+        defer removed.deinit();
         var index = committed.facts.len();
         while (index > 0) {
             index -= 1;
             const fact = committed.facts.factAt(index);
             if (try staging.facts.contains(fact)) continue;
-            try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+            if (maintain) {
+                try copyFactInto(committed.allocator, &removed, fact);
+            } else {
+                try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+            }
             committed.facts.removeAt(index);
         }
+        if (maintain and removed.len() > 0) {
+            try committed.propagateDeletions(&removed);
+            var touched: RelationStore = .init(committed.allocator);
+            defer touched.deinit();
+            for (0..removed.len()) |position|
+                try copyFactInto(committed.allocator, &touched, removed.factAt(position));
+            if (touched.len() > 0) try committed.maintainAggregates(&touched);
+        }
+        try committed.verifyShadow();
         self.commit(&committed);
     }
 
@@ -4973,6 +4996,155 @@ test "projected view counts agree with explicit proof enumeration" {
     }
 }
 
+test "retraction maintains the closure incrementally" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(c, a). edge(x, y).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try db.materialize();
+    try expectAnswerCount(&db, "path(X, Y)?", 10);
+    const after_build = db.maintenanceStats();
+
+    // A typed retraction runs delete-and-rederive rather than dirtying the
+    // stratum, so no rule expansion happens and the closure stays clean.
+    try std.testing.expect(try db.retract(&.{
+        input.relation("edge", &.{ input.atom("x"), input.atom("y") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
+    try std.testing.expect(db.maintenanceStats().removed_facts > after_build.removed_facts);
+    try expectAnswerCount(&db, "path(x, y)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // Retracting the only base support of a cycle removes the whole
+    // unsupported cycle, still without a rebuild.
+    const before_cycle = db.maintenanceStats();
+    try std.testing.expect(try db.retract(&.{
+        input.relation("edge", &.{ input.atom("c"), input.atom("a") }),
+    }));
+    try std.testing.expectEqual(before_cycle.stratum_expansions, db.maintenanceStats().stratum_expansions);
+    try expectAnswerCount(&db, "path(a, a)?", 0);
+    try expectAnswerCount(&db, "path(a, c)?", 1);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "pattern retraction removes every matching fact incrementally" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\edge(a, b). edge(a, c). edge(a, d). edge(b, e).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try db.materialize();
+    const after_build = db.maintenanceStats();
+
+    // One goal with a variable retracts all three outgoing edges of a.
+    try std.testing.expect(try db.retract(&.{
+        input.relation("edge", &.{ input.atom("a"), input.variable("target") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
+    try expectAnswerCount(&db, "edge(a, X)?", 0);
+    try expectAnswerCount(&db, "path(a, X)?", 0);
+    try expectAnswerCount(&db, "path(b, e)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // Source-level retraction takes the same path.
+    const before_source = db.maintenanceStats();
+    var retracted = try db.execute("edge(b, e)~");
+    retracted.deinit();
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(before_source.stratum_expansions, db.maintenanceStats().stratum_expansions);
+    try expectAnswerCount(&db, "path(X, Y)?", 0);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "retraction maintains aggregate groups and negation strata" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\group(g1). group(g2). member(g1, a). member(g1, b). member(g2, z).
+        \\banned(g2).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\allowed(G) :- group(G), not banned(G).
+    );
+    setup.deinit();
+    try db.materialize();
+    const after_build = db.maintenanceStats();
+
+    // Retracting a member updates only the affected group's list.
+    try std.testing.expect(try db.retract(&.{
+        input.relation("member", &.{ input.atom("g1"), input.atom("a") }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
+    try std.testing.expect(db.maintenanceStats().maintained_groups > after_build.maintained_groups);
+    var collected = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&db, &collected.query.answers.items[0], "S", "[b]");
+    collected.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Retracting the last member leaves the enumerated group empty.
+    try std.testing.expect(try db.retract(&.{
+        input.relation("member", &.{ input.atom("g1"), input.atom("b") }),
+    }));
+    var emptied = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&db, &emptied.query.answers.items[0], "S", "[]");
+    emptied.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Retracting a negated predicate is the documented rebuild category.
+    const before_negation = db.maintenanceStats();
+    try expectAnswerCount(&db, "allowed(g2)?", 0);
+    try std.testing.expect(try db.retract(&.{
+        input.relation("banned", &.{input.atom("g2")}),
+    }));
+    try expectAnswerCount(&db, "allowed(g2)?", 1);
+    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > before_negation.rebuild_fallbacks);
+    try expectClosureMatchesRebuild(&db);
+}
+
+fn retractionAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(a, c). edge(b, c). group(g). member(g, m1). member(g, m2).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    try db.materialize();
+    _ = try db.retract(&.{
+        input.relation("edge", &.{ input.atom("a"), input.variable("target") }),
+    });
+    _ = try db.retract(&.{
+        input.relation("member", &.{ input.atom("g"), input.atom("m1") }),
+    });
+    var result = try db.execute("collected(g, S)?");
+    defer result.deinit();
+    const formatted = try (try result.query.answers.items[0].getValue("S")).formatAlloc(allocator);
+    defer allocator.free(formatted);
+    if (!std.mem.eql(u8, formatted, "[m2]")) return error.UnexpectedAggregate;
+}
+
+test "incremental retraction releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        retractionAllocationScenario,
+        .{},
+    );
+}
+
 test "aggregate changes propagate through downstream list functions and arithmetic" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -5075,10 +5247,15 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     }));
     try expectAnswerCount(&db, "path(a, e)?", 0);
 
-    // Retraction marks the affected strata dirty instead of running
-    // delete-and-rederive, so incremental propagation resumes only once the
-    // closure is materialized again.
+    // Retraction takes the same incremental deletion path as a batch, so
+    // the closure stays clean and this materialize is a no-op.
+    try std.testing.expect(db.materialization == .clean);
+    const before_materialize = db.maintenanceStats();
     try db.materialize();
+    try std.testing.expectEqual(
+        before_materialize.stratum_expansions,
+        db.maintenanceStats().stratum_expansions,
+    );
 
     // An inserted edge derives new path facts through the delta engine.
     const before_edge = db.maintenanceStats();

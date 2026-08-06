@@ -190,15 +190,25 @@ Query workload, unchanged protocol: 51.4, 52.9, and 55.2 us/query, median
 
 ### 25-node baseline, one edge changed between queries
 
+Both workloads add the same sequence of shortcut edges, one per query, and
+differ only in how the closure is brought up to date: `applyChanges`
+maintains it incrementally, while `addFact` marks the dependent strata dirty
+so the following query recomputes them.
+
 | Path | ns/change |
 | --- | --- |
-| incremental maintenance | 453795, 461720, 537262 |
-| full rebuild after each change | 902745, 923920, 1439758 |
+| incremental maintenance | 131204, 132987 |
+| recomputation on next query | 865983, 857829 |
 
-Incremental maintenance is about **2x faster than full rebuild** here, with
-zero rebuild fallbacks reported. This is the workload shape incremental
+Incremental maintenance is about **6.5x faster than recomputation** here,
+with zero rebuild fallbacks reported. This is the workload shape incremental
 maintenance suits: a large recursive closure where one edge changes a
 comparatively small part of it.
+
+An earlier version of this comparison had the recomputing workload apply its
+change with `retract`, which since became incrementally maintained itself;
+the workload then paid for maintenance and threw the result away. Both
+workloads now perform the identical change sequence.
 
 ### Insert, delete, mixed, and negation workloads
 

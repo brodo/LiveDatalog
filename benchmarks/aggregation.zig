@@ -53,20 +53,21 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    // Workload 2: one edge changes between queries. The shortcut edge is
-    // inserted and removed in turn, so the database cycles through two
-    // states and each query observes a different closure.
-    const shortcut: [2]LiveDatalog.input.Term = .{ input.atom("n5"), input.atom("n20") };
+    // Workloads 2 and 3 add the same sequence of shortcut edges, one per
+    // query, and differ only in how the closure is brought up to date:
+    // `applyChanges` maintains it incrementally, while `addFact` marks the
+    // dependent strata dirty so the following query recomputes them.
+    var shortcut_from: [16]u8 = undefined;
+    var shortcut_to: [16]u8 = undefined;
     {
         var database = try buildDatabase(allocator);
         defer database.deinit();
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..iterations) |index| {
-            if (index % 2 == 0) {
-                _ = try database.applyChanges(&.{input.fact("edge", &shortcut)}, &.{});
-            } else {
-                _ = try database.applyChanges(&.{}, &.{input.fact("edge", &shortcut)});
-            }
+            const from = try std.fmt.bufPrint(&shortcut_from, "n{d}", .{index});
+            const to = try std.fmt.bufPrint(&shortcut_to, "n{d}", .{index + 10});
+            const shortcut: [2]LiveDatalog.input.Term = .{ input.atom(from), input.atom(to) };
+            _ = try database.applyChanges(&.{input.fact("edge", &shortcut)}, &.{});
             var result = try database.execute("summary(S)?");
             defer result.deinit();
             if (result.query.answers.items.len != 1) return error.UnexpectedResult;
@@ -80,26 +81,21 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    // Workload 3: the same edge changes, but every change is followed by a
-    // full rebuild of the derived closure.
     {
         var database = try buildDatabase(allocator);
         defer database.deinit();
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..iterations) |index| {
-            if (index % 2 == 0) {
-                try database.addFact("edge", &.{ shortcut[0], shortcut[1] });
-            } else {
-                _ = try database.retract(&.{input.relation("edge", &shortcut)});
-            }
-            try database.rebuild();
+            const from = try std.fmt.bufPrint(&shortcut_from, "n{d}", .{index});
+            const to = try std.fmt.bufPrint(&shortcut_to, "n{d}", .{index + 10});
+            try database.addFact("edge", &.{ input.atom(from), input.atom(to) });
             var result = try database.execute("summary(S)?");
             defer result.deinit();
             if (result.query.answers.items.len != 1) return error.UnexpectedResult;
         }
         const elapsed: u64 = @intCast(start.untilNow(init.io).raw.nanoseconds);
         try writer.print(
-            "{d} edge changes with full rebuild: {d} ns ({d} ns/change)\n",
+            "{d} edge changes with recomputation: {d} ns ({d} ns/change)\n",
             .{ iterations, elapsed, elapsed / iterations },
         );
     }

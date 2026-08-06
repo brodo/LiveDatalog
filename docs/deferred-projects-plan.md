@@ -762,12 +762,15 @@ M6 was completed on 2026-08-06, finishing Project M:
   `retract` are unchanged and interoperate with the batch API. `retract` is
   not superseded by `applyChanges`: it deletes every base fact matching a
   goal, including goals with variables and joins, which exact-fact batch
-  deletion cannot express. It does still mark the affected strata dirty
-  rather than running delete-and-rederive, so a batch issued immediately
-  after a retraction rebuilds instead of propagating until the closure is
-  materialized again. Routing pattern retraction through the incremental
-  deletion engine — resolving its goals to exact facts and handing those to
-  `propagateDeletions` — was outside every phase's scope and remains open.
+  deletion cannot express.
+- Retraction was subsequently routed through the incremental deletion
+  engine. `commitRetraction` is the single choke point for both `retract`
+  and the source `~` statement: it replays the removed base facts onto a
+  fresh clone — so query-local values interned while evaluating the goals
+  never reach the committed database — and then takes the same path a batch
+  deletion takes, delete-and-rederive plus aggregate maintenance when the
+  closure is clean and dirty-stratum rebuild otherwise. Retraction therefore
+  leaves the closure clean, and shadow verification now covers it.
 - Maintenance stays lazy by default — an update marks strata and the next
   query repairs them — with `materialize` as the eager trigger and `rebuild`
   as the always-available reference path. Both run on staging and commit
