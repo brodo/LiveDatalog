@@ -1083,17 +1083,45 @@ pub const Jatalog = struct {
         insertions: []const input.Relation,
         deletions: []const input.Relation,
     ) !bool {
-        var changed = false;
         // The model is only consulted when maintenance is possible at all;
-        // a dirty closure has to be repaired regardless of cost.
+        // a dirty closure has to be repaired regardless of cost. Both phases
+        // then follow the one decision.
         const can_maintain = self.closure != null and self.materialization == .clean;
         const maintain = can_maintain and self.shouldMaintain(insertions.len + deletions.len);
         if (can_maintain) {
             if (maintain) self.maintain_choices += 1 else self.recompute_choices += 1;
         }
         const work_before = self.work;
+
+        // Facts the aggregate phase must reconsider: every fact this batch
+        // took out of the closure, and every fact it derived into it.
+        var touched: RelationStore = .init(self.allocator);
+        defer touched.deinit();
+        const deleted = try self.applyDeletions(deletions, maintain, &touched);
+        const inserted = try self.applyInsertions(insertions, maintain, &touched);
+        if (touched.len() > 0) try self.maintainAggregates(&touched);
+
+        const realized = deleted + inserted;
+        if (maintain and realized > 0)
+            self.noteMaintenanceWork(insertions.len + deletions.len, self.work - work_before);
+        return realized > 0;
+    }
+
+    /// Removes this batch's deletions from the base facts. When maintaining,
+    /// they take the delete-and-rederive path and everything that leaves the
+    /// closure is added to `touched`; otherwise each removal dirties the
+    /// strata that read its predicate. Returns how many base facts were
+    /// really removed, which is fewer than `deletions.len()` whenever the
+    /// batch names a fact the database does not hold.
+    fn applyDeletions(
+        self: *Jatalog,
+        deletions: []const input.Relation,
+        maintain: bool,
+        touched: *RelationStore,
+    ) !usize {
         var removed: RelationStore = .init(self.allocator);
         defer removed.deinit();
+        var count: usize = 0;
         for (deletions) |relation| {
             const expression = try self.compileRelation(relation.predicate, relation.terms, false);
             defer freeExpr(self.allocator, expression);
@@ -1102,42 +1130,58 @@ pub const Jatalog = struct {
             defer self.allocator.free(terms);
             for (expression.terms, terms) |term, *id| id.* = try self.termToValue(term, null);
             const fact: Fact = .{ .predicate = expression.predicate, .terms = terms };
-            if (try self.facts.removeFact(fact)) {
-                changed = true;
-                if (maintain) {
-                    try copyFactInto(self.allocator, &removed, fact, false);
-                } else {
-                    try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
-                }
+            if (!try self.facts.removeFact(fact)) continue;
+            count += 1;
+            if (maintain) {
+                try copyFactInto(self.allocator, &removed, fact, false);
+            } else {
+                try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
             }
         }
-        var touched: RelationStore = .init(self.allocator);
-        defer touched.deinit();
-        if (maintain and removed.len() > 0) {
+        // `removed` is only populated while maintaining. Delete-and-rederive
+        // rewrites it in place into the set of facts that actually left the
+        // closure: over-deleted consequences are added and rederived ones
+        // removed, so it must be read for `touched` only afterwards.
+        if (removed.len() > 0) {
             try self.propagateDeletions(&removed);
-            for (0..removed.len()) |index| try copyFactInto(self.allocator, &touched, removed.factAt(index), false);
+            for (0..removed.len()) |index|
+                try copyFactInto(self.allocator, touched, removed.factAt(index), false);
         }
+        return count;
+    }
 
-        // Insertions follow the same decision as deletions; the closure
-        // state is rechecked because a deletion fallback may have dirtied it.
-        const propagate = maintain and self.closure != null and self.materialization == .clean;
-        const batch_start = if (propagate) self.closure.?.len() else 0;
+    /// Adds this batch's insertions to the base facts. When maintaining, each
+    /// new fact also joins the clean closure and the batch propagates through
+    /// the positive strata, with everything derived added to `touched`;
+    /// otherwise each insertion dirties the strata that read its predicate.
+    /// Returns how many base facts were really added, which is fewer than
+    /// `insertions.len()` whenever the batch re-inserts a fact the database
+    /// already holds.
+    fn applyInsertions(
+        self: *Jatalog,
+        insertions: []const input.Relation,
+        maintain: bool,
+        touched: *RelationStore,
+    ) !usize {
+        // Maintaining the deletions cannot have taken the closure out from
+        // under this phase: a delete-and-rederive fallback repairs the
+        // closure through `ensureMaterialized` rather than leaving it dirty.
+        std.debug.assert(!maintain or
+            (self.closure != null and self.materialization == .clean));
+        const batch_start = if (maintain) self.closure.?.len() else 0;
+        var count: usize = 0;
         for (insertions) |relation| {
             const expression = try self.compileRelation(relation.predicate, relation.terms, false);
             defer freeExpr(self.allocator, expression);
-            if (try self.applyInsertion(expression, propagate)) changed = true;
+            if (try self.applyInsertion(expression, maintain)) count += 1;
         }
-        if (propagate and self.closure.?.len() > batch_start) {
-            try self.propagateInsertions(batch_start);
-            if (self.materialization == .clean) {
-                for (batch_start..self.closure.?.len()) |index|
-                    try copyFactInto(self.allocator, &touched, self.closure.?.factAt(index), false);
-            }
+        if (!maintain or self.closure.?.len() == batch_start) return count;
+        try self.propagateInsertions(batch_start);
+        if (self.materialization == .clean) {
+            for (batch_start..self.closure.?.len()) |index|
+                try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
         }
-        if (touched.len() > 0) try self.maintainAggregates(&touched);
-        if (maintain and changed)
-            self.noteMaintenanceWork(insertions.len + deletions.len, self.work - work_before);
-        return changed;
+        return count;
     }
 
     /// Propagates a batch of base insertions already appended to the clean
@@ -4483,6 +4527,41 @@ test "alternative recursive and non-recursive derivations preserve facts" {
         input.fact("marked", &.{input.atom("a")}),
     }));
     try expectAnswerCount(&db, "special(a)?", 1);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "a deletion falling back to rebuild leaves the batch's insertions a clean closure" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\node(a). node(b). node(c). edge(a, b).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\isolated(X) :- node(X), not path(a, X).
+    );
+    setup.deinit();
+    try db.materialize();
+    try expectAnswerCount(&db, "isolated(b)?", 0);
+
+    // Deleting the edge over-deletes path(a, b), which reaches `isolated`
+    // through negation and forces delete-and-rederive to abandon the
+    // incremental path. The insertion in the same batch then has to find a
+    // clean closure to propagate into: the fallback repairs the closure
+    // through `ensureMaterialized` rather than leaving it dirty, which is
+    // the invariant `applyInsertions` asserts.
+    const before = db.maintenanceStats().rebuild_fallbacks;
+    try std.testing.expect(try db.applyChanges(
+        &.{input.fact("edge", &.{ input.atom("b"), input.atom("c") })},
+        &.{input.fact("edge", &.{ input.atom("a"), input.atom("b") })},
+    ));
+    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > before);
+
+    try expectAnswerCount(&db, "isolated(b)?", 1);
+    try expectAnswerCount(&db, "path(b, c)?", 1);
+    try expectAnswerCount(&db, "path(a, c)?", 0);
     try expectClosureMatchesRebuild(&db);
 }
 
