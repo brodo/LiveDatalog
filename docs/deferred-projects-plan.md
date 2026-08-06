@@ -346,6 +346,34 @@ P1 was completed on 2026-08-06 with these decisions:
 
 Stop with query-time rebuilding intact. Persistent state begins in M1.
 
+### Completed decisions
+
+P2 was completed on 2026-08-06 with these decisions:
+
+- Rules carry a stable database-local `id` assigned from a never-reused
+  counter that survives cloning; body occurrences are identified by
+  `(rule id, clause index)`.
+- Deltas are store index ranges rather than separate relations: because the
+  relation store appends in derivation order, `delta` is the range of
+  entries added in the previous round and `next_delta` accrues past the
+  range's end, with set-semantics insertion deduplicating against both the
+  closure and the current round automatically.
+- `expandLevel` runs round zero naively, then re-evaluates each rule once
+  per *growing* body occurrence with that occurrence restricted to the delta
+  range. A predicate is growing when it belongs to the current stratum or is
+  the head of an active seed rule — the latter matters because seeded
+  structural recursion (which keeps its naive evaluation over the value
+  table) inserts lower-stratum facts during a higher stratum's rounds.
+- Rounds continue while facts append or the value table grows, matching the
+  naive fixpoint condition; stratification keeps negated and aggregate
+  dependencies below the stratum, so they never need delta treatment.
+- `expandNaive` remains as the in-tree semantic oracle, and differential
+  tests compare both closures for joins, direct, mutual, and structural
+  recursion, negation, aggregation, double-recursive rules, and
+  multi-proof diamonds.
+- The aggregation benchmark median improved from 1.995 ms to 0.910 ms per
+  query.
+
 ## P3: join planning and aggregate lookup
 
 ### Scope

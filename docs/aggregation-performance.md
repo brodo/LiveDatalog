@@ -71,3 +71,16 @@ from 6.117 ms to 1.995 ms per query (about 3.1x) because recursive-closure
 joins now probe lazily built bound-position indexes instead of scanning the
 full fact list. Queries still rebuild all derived facts; persistent
 materialization is deferred to project M.
+
+## 2026-08-06 after P2 (semi-naive evaluation)
+
+- Zig 0.16.0, `ReleaseFast`
+- arm64, macOS 26.5.0
+- five process-level samples after the benchmark executable was cached
+- per-query samples: 0.923, 0.894, 0.891, 0.910, and 0.922 ms
+- median: **0.910 ms/query**
+
+Semi-naive delta rounds reduced the median from 1.995 ms to 0.910 ms per
+query (about 2.2x, and about 6.9x against the 2026-07-30 naive baseline)
+because recursive rules re-join only the facts appended in the previous
+round instead of the full closure every round.
