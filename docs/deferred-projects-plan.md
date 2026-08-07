@@ -937,6 +937,66 @@ table unless closure lookup has been shown insufficient.
   application currently scans it once per rule per round — or would this be its
   only consumer?
 
+### Completed decisions
+
+M7 was completed on 2026-08-07:
+
+- Over-deletion now names a pinned occurrence's head two ways, chosen by the
+  rule rather than by the fact. `overdeleteConstructed` keeps the old path for
+  an ordinary rule, whose head `validateRuleSafety` guarantees the body binds.
+  `overdeleteEnumerated` handles a seeded structural rule by looking the head
+  up in the closure through the existing pattern indexes and unifying each
+  candidate against the head term. Closure lookup was the expected answer and
+  is what landed; the value-table form was not built.
+- Enumeration is exact rather than an over-approximation, in both directions.
+  A candidate that unifies names a seed value that is interned — it is in a
+  stored fact — so forward evaluation would have derived it. A head the
+  forward direction derived is either in the closure, and is found, or is not,
+  and the constructed path would have discarded it too.
+- The candidate is unified into the binding *before* the remaining goals are
+  solved. Solving first and narrowing the lookup with the result is the
+  cheaper order and does not work: the seed argument's variables can occur in
+  the body, as `H` does in `sum(H!T, N) :- sum(T, M), N = M + H`, and solving
+  `N = M + H` without the candidate reports the same `UnboundVariable` the
+  phase exists to remove. Unifying first also makes the guarantee simple —
+  every head variable is bound, so any one solution of the remaining goals is
+  a whole proof of that exact tuple.
+- The seeded-rule guard is gone from `deletionBlocked`, which no longer
+  differs from `insertionBlocked`; the two became one `levelBlocked`.
+  Rederivation needed no change, as predicted.
+- Answering the phase's first open question: **no**, and it does not matter
+  for correctness. The canonical seeded rule shares no *ground* head argument
+  with the body binding — the seed argument is only partially fixed (its tail)
+  and the other head arguments are computed downstream of it — so the mask is
+  usually empty and the lookup degenerates to the head predicate's whole
+  relation. Unification filters it, so this is a cost, not a defect. The
+  second open question was not reached: nothing else asked for a value-table
+  index, and the session boundary reserved it for a case closure lookup could
+  not handle.
+- `MaintenanceStats` gained `overdeleted_facts` and `rederived_facts`, the two
+  halves the existing `removed_facts` nets together, so a deletion's cost can
+  be attributed.
+- `benchmark-structural-deletion` compares the two shapes the measurement gate
+  asks for. Incremental deletion is about **40x faster** than the rebuild when
+  one element's support goes and one derived fact falls with it, and about
+  **100x slower** when the recursion's base case goes and every derived fact
+  falls at once — the latter because each over-deleted fact rescans the head
+  relation, which is quadratic, while a rebuild after the base case is deleted
+  derives nothing at all. Per delete-and-restore cycle the loss narrows to
+  about 1.6x. The numbers are in
+  [`aggregation-performance.md`](aggregation-performance.md).
+- The rebuild fallback was therefore *not* kept: the incremental path is
+  correct, rebuild-equivalent, and the large win on the local shape is the
+  common one. The cost model arbitrates as it does everywhere else, and on
+  the base-case shape it currently chooses wrong, because one learned rebuild
+  estimate cannot separate a rebuild that recomputes everything from one that
+  finds nothing. Making it shape-aware is cost-model work, not M7's.
+- The follow-up this phase identified, and deliberately did not take: index
+  the closure by the seed argument's *tail* rather than by whole values at
+  bound positions. That is what would make the base-case shape linear, and it
+  is a change to the P1 storage contract for one consumer, so it belongs to a
+  phase that can weigh it against P3's planning work.
+
 # Project F: query folding
 
 Query folding is a planner feature, not a transparent evaluator optimization.

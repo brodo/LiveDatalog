@@ -323,3 +323,64 @@ exist, so realized and named counts nearly agree, and fallbacks are rare
 outside the negation row. The corrections matter for workloads that batch
 speculative updates or that repeatedly fall back, neither of which is
 currently benchmarked.
+
+## 2026-08-07 after M7 (deletion through seeded structural rules)
+
+Before M7, deleting a fact a seeded structural rule reads sent the whole
+stratum to a dirty-stratum rebuild, because over-deletion could not name the
+head such a rule derived. It now enumerates that head out of the closure. The
+question the phase was required to answer is whether that is worth doing, and
+the answer depends entirely on the shape of the deletion, so the benchmark
+measures both extremes:
+
+```sh
+zig build benchmark-structural-deletion -Doptimize=ReleaseFast
+```
+
+The workload is `prefix(H!T, N) :- prefix(T, M), allowed(H), N = M + 1` over a
+single 120-element list, which derives one `prefix` fact per suffix plus a
+`deep` consequence for each — 361 closure facts in all. The `leaf` shape
+deletes `allowed` for the list's outermost element, invalidating exactly the
+longest prefix; the `base` shape deletes `prefix([], 0)`, invalidating every
+one of them. Deletion and restoration are timed separately, because only the
+deletion half runs the code this phase added.
+
+| Shape | Policy | ns/delete | ns/restore | over-deleted | rederived |
+| --- | --- | --- | --- | --- | --- |
+| leaf | incremental | 183089 | 432754 | 2 | 0 |
+| leaf | recompute | 7364337 | 7584120 | 0 | 0 |
+| leaf | automatic | 184091 | 1513912 | 2 | 0 |
+| base | incremental | 4748110 | 7689291 | 239 | 0 |
+| base | recompute | 48221 | 7428912 | 0 | 0 |
+| base | automatic | 4679102 | 7577583 | 239 | 0 |
+
+Times are medians of five process-level samples on arm64, macOS 26.5.0, Zig
+0.16.0, `ReleaseFast`; counts are per batch. `rederived` is zero because this
+program gives no fact a second proof, so the whole cost is over-deletion —
+rederivation still runs and still fails once per over-deleted fact.
+
+Incremental deletion is about **40x faster** than the rebuild on the leaf
+shape and about **100x slower** on the base shape. Both extremes have the same
+cause. Over-deletion through a seeded rule cannot constrain its closure
+lookup — the seed argument is only partially fixed, by its tail, and the other
+head arguments are computed downstream of it — so each over-deleted fact
+rescans the head relation, which is quadratic in the number of facts the
+deletion invalidates. On the leaf shape that number is one. On the base shape
+it is all of them, and the rebuild it is compared against is unusually cheap
+there: with the base case gone the recursion derives nothing, so recomputing
+the stratum costs a single empty round. Per delete-and-restore cycle, where
+the restore pays for a real rebuild, the loss narrows to about **1.6x**.
+
+Two consequences worth recording. The automatic policy chooses maintenance on
+both shapes, which is right on the leaf and wrong on the base: the model holds
+one learned rebuild estimate and cannot tell a rebuild that recomputes
+everything from one that finds nothing. And the fix for the base shape is not
+in this phase — it is a closure index keyed by the seed argument's tail rather
+than by whole values at bound positions, which would make over-deletion linear
+and is a change to the storage contract for a single consumer.
+
+The other benchmarks are unchanged, as expected: no existing workload
+over-deletes a seeded rule's head. `benchmark-maintenance` measured 642794,
+712348, 867990 and 339653 ns/batch for the four incremental rows, and the
+25-node baseline 133875 ns/change with incremental maintenance against
+1101254 with recomputation — all within host variation of the M6 records.

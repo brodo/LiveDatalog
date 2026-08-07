@@ -179,6 +179,21 @@ pub fn build(b: *std.Build) void {
     );
     maintenance_benchmark_step.dependOn(&b.addRunArtifact(maintenance_benchmark_exe).step);
 
+    const structural_benchmark_exe = b.addExecutable(.{
+        .name = "structural-deletion-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/structural_deletion.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const structural_benchmark_step = b.step(
+        "benchmark-structural-deletion",
+        "Compare incremental deletion through a seeded structural rule with a stratum rebuild",
+    );
+    structural_benchmark_step.dependOn(&b.addRunArtifact(structural_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

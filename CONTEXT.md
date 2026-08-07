@@ -60,10 +60,7 @@ How a base-fact update reaches the derived closure (`update.zig`). Every
 update takes exactly one of three paths, all of which yield the same database
 a clean rebuild would: incremental insertion propagation through positive
 rules, delete-and-rederive for deletions, or a stratum rebuild when the update
-reaches negation or an aggregate outside the maintained class. Deletion takes
-the rebuild in one further case: it runs a rule backwards from a deleted body
-fact to the head it supported, which a seeded structural rule does not permit
-because its head carries a variable only the value table binds. Because
+reaches negation or an aggregate outside the maintained class. Because
 maintaining and recomputing differ only in cost, a cost model chooses between
 them per update, estimating both from measured work — counted in candidate
 facts examined, and attributed so that each candidate moves exactly one of the
@@ -90,6 +87,18 @@ fell back to a rebuild — a distinction the materialization tri-state cannot
 make, because the fallback repairs the closure before returning and leaves it
 `clean` either way. A rebuild retires the watermark and has already recomputed
 every consequence, so it yields nothing for the aggregate phase to reconsider.
+
+Over-deletion runs a rule backwards, from a deleted body fact to the head that
+derivation supported, and how it names that head depends on the rule. An
+ordinary rule's body binding determines its head, so the head is built. A
+seeded structural rule's does not — in `length(H!T, N) :- length(T, M),
+N = M + 1` nothing in the body names `H` — so its head is instead looked up in
+the closure and unified, which is sound because over-deletion only ever acts on
+head tuples the closure holds. The candidate is unified into the binding before
+the remaining goals are solved, because the seed argument's variables can
+appear in the body as well, as `H` does in `sum(H!T, N) :- sum(T, M),
+N = M + H`. The lookup is a candidate prefilter like any other, so a head it
+cannot constrain costs candidates rather than correctness.
 
 ### Projected view
 

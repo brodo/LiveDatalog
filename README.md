@@ -129,7 +129,8 @@ const stats = database.maintenanceStats();
 - insertions propagate through positive rules with semi-naive deltas;
 - deletions use delete-and-rederive, so a fact with an alternative proof
   survives while unsupported recursive consequences — including cyclically
-  self-supporting ones — disappear;
+  self-supporting ones, and those of a structurally recursive rule whose base
+  case is removed — disappear;
 - updates reaching negation, or an aggregate outside the maintained class of
   one unnested `setof` per rule, recompute the affected strata.
 
@@ -144,8 +145,9 @@ A maintained aggregate rule recomputes only the groups an update touched.
 When its head projects an outer variable away, several groups can derive the
 same tuple, so derivation counts decide when that tuple appears and
 disappears. `maintenanceStats` reports closure size, facts added and removed
-incrementally, groups recomputed, rebuild fallbacks, and how the views are
-classified.
+incrementally — with the over-deleted and rederived halves of that removal
+count reported separately — groups recomputed, rebuild fallbacks, and how the
+views are classified.
 
 **Choosing between them.** Maintaining and recomputing produce the same
 database, so which one runs is purely a cost decision. By default the engine
@@ -237,6 +239,10 @@ zig build benchmark-projected-aggregate -Doptimize=ReleaseFast
 
 ```sh
 zig build benchmark-maintenance -Doptimize=ReleaseFast
+```
+
+```sh
+zig build benchmark-structural-deletion -Doptimize=ReleaseFast
 ```
 
 See [Aggregation performance](docs/aggregation-performance.md) for the workload

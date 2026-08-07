@@ -2321,18 +2321,267 @@ test "over-deletion reaches a seeded rule fed by values from a higher stratum" {
     try expectAnswerCount(&db, "size(g2, 1)?", 1);
     try test_support.expectClosureMatchesRebuild(&db.state);
 
-    // Deleting the structural rule's own seed fact removes the whole chain,
-    // and with it every `size`. Over-deletion cannot run this rule backwards —
-    // it would have to name `H` in `length(H!T, N)` from `length(T, M)` alone —
-    // so the stratum takes the rebuild instead of reporting UnboundVariable.
-    const fallbacks_before = db.maintenanceStats().rebuild_fallbacks;
+    // Deleting the structural rule's own base case removes the whole chain,
+    // and with it every `size`. Over-deletion cannot *build* `length(H!T, N)`
+    // backwards from `length(T, M)` — nothing there names `H` — so it looks the
+    // head up in the closure instead, and the stratum is maintained rather than
+    // rebuilt.
+    const before = db.maintenanceStats();
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
     }));
-    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > fallbacks_before);
+    try std.testing.expectEqual(before.rebuild_fallbacks, db.maintenanceStats().rebuild_fallbacks);
+    try std.testing.expectEqual(before.stratum_expansions, db.state.eval.expansions);
+    try std.testing.expect(db.maintenanceStats().removed_facts > before.removed_facts);
     try expectAnswerCount(&db, "size(G, N)?", 0);
     try expectAnswerCount(&db, "length(L, N)?", 0);
     try test_support.expectClosureMatchesRebuild(&db.state);
+}
+
+test "deleting a structural base case unwinds the whole chain incrementally" {
+    // The shape M7 exists for: the deleted fact is the seeded rule's own base
+    // case, so every derived length in the value table loses its support at
+    // once. Over-deletion cannot build `length(H!T, N)` from `length(T, M)` —
+    // nothing in that body names `H` — so it enumerates the head out of the
+    // closure instead.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\chain([a, b, c]). chain([d]).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+    );
+    setup.deinit();
+    try db.materialize();
+    // [a, b, c], [b, c], [c], [d] and [] are interned, and each has a length:
+    // the base fact plus four derived.
+    try expectAnswerCount(&db, "length(L, N)?", 5);
+
+    const before = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
+    }));
+    try expectAnswerCount(&db, "length(L, N)?", 0);
+    const after = db.maintenanceStats();
+    try std.testing.expectEqual(before.rebuild_fallbacks, after.rebuild_fallbacks);
+    try std.testing.expectEqual(before.stratum_expansions, after.stratum_expansions);
+    // The four derived lengths, and none of them rederivable.
+    try std.testing.expectEqual(before.overdeleted_facts + 4, after.overdeleted_facts);
+    try std.testing.expectEqual(before.rederived_facts, after.rederived_facts);
+    // The removal count nets the base fact in with them.
+    try std.testing.expectEqual(before.removed_facts + 5, after.removed_facts);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+
+    // Deleting a leaf instead of the base case is the other shape: putting the
+    // base case back rebuilds the chain, and removing the fact that interned
+    // the long list leaves the derived lengths standing, because the value
+    // table is monotone and a rebuild keeps them too.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
+    }, &.{}));
+    try expectAnswerCount(&db, "length(L, N)?", 5);
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("chain", &.{input.list(&.{input.atom("d")})}),
+    }));
+    try expectAnswerCount(&db, "length(L, N)?", 5);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+}
+
+test "a seeded rule whose body consumes the seed over-deletes correctly" {
+    // `H` appears in the body as well as the head here, so the candidate head
+    // has to be unified into the binding *before* the remaining goals run.
+    // Solving `N = M + H` first would report UnboundVariable, which is the
+    // defect that sent this whole class to the rebuild path.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\item([1, 2, 4]).
+        \\total([], 0).
+        \\total(H!T, N) :- total(T, M), N = M + H.
+    );
+    setup.deinit();
+    try db.materialize();
+    try expectAnswerCount(&db, "total([1, 2, 4], 7)?", 1);
+
+    const fallbacks_before = db.maintenanceStats().rebuild_fallbacks;
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("total", &.{ input.list(&.{}), input.integer(0) }),
+    }));
+    try std.testing.expectEqual(fallbacks_before, db.maintenanceStats().rebuild_fallbacks);
+    try expectAnswerCount(&db, "total(L, N)?", 0);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+}
+
+test "a chain fact with an alternative proof survives its support's deletion" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\list([a, b]). list([q]). unit([q]).
+        \\len([], 0).
+        \\len(H!T, N) :- len(T, M), N = M + 1.
+        \\len(H!T, N) :- unit(H!T), N = 1.
+    );
+    setup.deinit();
+    try db.materialize();
+    // [], [b], [a, b] and [q] all have lengths, and [q] has two proofs.
+    try expectAnswerCount(&db, "len(L, N)?", 4);
+
+    const before = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("len", &.{ input.list(&.{}), input.integer(0) }),
+    }));
+    const after = db.maintenanceStats();
+    try std.testing.expectEqual(before.rebuild_fallbacks, after.rebuild_fallbacks);
+    // len([q], 1) is rederived from the unit rule; len([b], 1) and
+    // len([a, b], 2) had only the chain, and go.
+    try std.testing.expectEqual(before.overdeleted_facts + 3, after.overdeleted_facts);
+    try std.testing.expectEqual(before.rederived_facts + 1, after.rederived_facts);
+    try expectAnswerCount(&db, "len(L, N)?", 1);
+    try expectAnswerCount(&db, "len([q], 1)?", 1);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+}
+
+test "several seeded occurrences and mutual seeded recursion over-delete each head once" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\list([a, b, c]).
+        \\twice([], 0).
+        \\twice(H!T, N) :- twice(T, M), twice(T, K), N = M + K.
+        \\even([]).
+        \\even(H!T) :- odd(T).
+        \\odd(H!T) :- even(T).
+    );
+    setup.deinit();
+    try db.materialize();
+    try expectAnswerCount(&db, "twice(L, N)?", 4);
+    try expectAnswerCount(&db, "even(L)?", 2);
+    try expectAnswerCount(&db, "odd(L)?", 2);
+
+    // Both occurrences of `twice(T, _)` reach the same heads. `deleted` is a
+    // set, so the second pinning finds each head already queued; a head taken
+    // twice would double the removal count.
+    const before = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("twice", &.{ input.list(&.{}), input.integer(0) }),
+    }));
+    try std.testing.expectEqual(before.rebuild_fallbacks, db.maintenanceStats().rebuild_fallbacks);
+    try std.testing.expectEqual(
+        before.removed_facts + 4,
+        db.maintenanceStats().removed_facts,
+    );
+    try expectAnswerCount(&db, "twice(L, N)?", 0);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+
+    // The mutually recursive pair shares one base case, and deleting it must
+    // unwind both predicates. Their alternation crosses no stratum: mutual
+    // recursion is one strongly connected component, so both rules are
+    // over-deleted in the same level.
+    const mutual_before = db.maintenanceStats();
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("even", &.{input.list(&.{})}),
+    }));
+    try std.testing.expectEqual(
+        mutual_before.rebuild_fallbacks,
+        db.maintenanceStats().rebuild_fallbacks,
+    );
+    try expectAnswerCount(&db, "even(L)?", 0);
+    try expectAnswerCount(&db, "odd(L)?", 0);
+    try test_support.expectClosureMatchesRebuild(&db.state);
+}
+
+/// Deletes a structural base case incrementally, which is the path that
+/// enumerates head candidates out of the closure and unwinds the chain.
+fn seededDeletionAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    var setup = try db.execute(
+        \\chain([a, b]).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\longest(N) :- length(L, N), N > 1.
+    );
+    setup.deinit();
+    try db.materialize();
+    _ = try db.applyChanges(&.{}, &.{
+        input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
+    });
+    var result = try db.execute("length(L, N)?");
+    defer result.deinit();
+    if (result.query.answers.items.len != 0) return error.UnexpectedAnswer;
+}
+
+test "seeded over-deletion releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(seededDeletionAllocationScenario);
+}
+
+test "randomized structural deletions match a clean rebuild under shadow verification" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\tag(t).
+        \\box(k1, [a, b]). box(k2, [c]).
+        \\len([], 0).
+        \\len(H!T, N) :- len(T, M), N = M + 1.
+        \\size(K, N) :- box(K, L), len(L, N).
+        \\big(K) :- size(K, N), N > 1.
+        \\quiet(K) :- box(K, L), not big(K).
+        \\spread(S) :- tag(t), setof(N, size(K, N), S).
+    );
+    setup.deinit();
+    try db.materialize();
+
+    const keys = [_][]const u8{ "k1", "k2", "k3" };
+    const lists = [_][]const input.Term{
+        &.{ input.atom("a"), input.atom("b") },
+        &.{input.atom("c")},
+        &.{ input.atom("d"), input.atom("e"), input.atom("f") },
+    };
+    var prng = std.Random.DefaultPrng.init(0x5eeded5eeded);
+    const random = prng.random();
+    for (0..30) |step| {
+        var box_terms: [2]input.Term = .{
+            input.atom(keys[random.uintLessThan(usize, keys.len)]),
+            input.list(lists[random.uintLessThan(usize, lists.len)]),
+        };
+        var base_terms: [2]input.Term = .{ input.list(&.{}), input.integer(0) };
+        var inserts: [2]input.Relation = undefined;
+        var deletes: [2]input.Relation = undefined;
+        var insert_count: usize = 0;
+        var delete_count: usize = 0;
+        if (random.boolean()) {
+            inserts[insert_count] = input.fact("box", &box_terms);
+            insert_count += 1;
+        } else {
+            deletes[delete_count] = input.fact("box", &box_terms);
+            delete_count += 1;
+        }
+        // Toggling the seeded rule's base case is what drives the whole chain
+        // in and out of the closure.
+        if (step % 3 == 0) {
+            if (random.boolean()) {
+                inserts[insert_count] = input.fact("len", &base_terms);
+                insert_count += 1;
+            } else {
+                deletes[delete_count] = input.fact("len", &base_terms);
+                delete_count += 1;
+            }
+        }
+        // Shadow verification asserts rebuild equality inside the call.
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try test_support.expectClosureMatchesRebuild(&db.state);
+    }
 }
 
 test "deleting the only base support removes the entire unsupported cycle" {

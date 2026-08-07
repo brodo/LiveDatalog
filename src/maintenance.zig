@@ -126,7 +126,7 @@ fn propagateInsertions(db: *database.Database, batch_start: usize) !DeltaOutcome
     const max_level = analysis.max_level;
     var level: usize = 0;
     while (level <= max_level) : (level += 1) {
-        if (try insertionBlocked(db, level, batch_start)) {
+        if (try levelBlocked(db, level, &db.closure.?, batch_start)) {
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try materialization.ensureMaterialized(db);
@@ -137,45 +137,25 @@ fn propagateInsertions(db: *database.Database, batch_start: usize) !DeltaOutcome
     db.propagated_facts += db.closure.?.len() - start_len;
     return .maintained;
 }
-/// Whether stratum `level` must be rebuilt rather than maintained because the
-/// facts appended to the closure from `batch_start` reach one of its rules
-/// through negation or through an aggregate this phase cannot maintain.
-fn insertionBlocked(db: *database.Database, level: usize, batch_start: usize) !bool {
+/// Whether stratum `level` must be rebuilt rather than maintained, because the
+/// facts in `changed` from `from` onwards reach one of its rules through
+/// negation or through an aggregate this phase cannot maintain.
+///
+/// Insertion and deletion share the whole of this test. Deletion used to add a
+/// second one: over-deletion runs a rule backwards, and a seeded structural
+/// rule has a head variable no body goal binds, so the head such a derivation
+/// supported could not be named. `overdeleteEnumerated` names it by looking it
+/// up in the closure instead, and the extra guard went with it.
+fn levelBlocked(
+    db: *database.Database,
+    level: usize,
+    changed: *const relation_store.RelationStore,
+    from: usize,
+) !bool {
     var keys: std.AutoHashMapUnmanaged(relation_store.PredicateKey, void) = .empty;
     defer keys.deinit(db.allocator);
-    try relation_store.collectPredicateKeys(db.allocator, &db.closure.?, batch_start, &keys);
+    try relation_store.collectPredicateKeys(db.allocator, changed, from, &keys);
     return try stratumImpact(db, level, &keys) == .rebuild;
-}
-
-/// Whether stratum `level` must be rebuilt rather than maintained through
-/// delete-and-rederive.
-///
-/// Deletion shares the insertion triggers and adds one of its own. Over-
-/// deletion runs a rule backwards: it unifies a deleted fact against a body
-/// occurrence, solves the remaining goals, and reconstructs the head. A seeded
-/// structural rule has a head variable that no body goal binds — in
-/// `length(H!T, N) :- length(T, M), N = M + 1` the value of `H` comes from the
-/// value table, which is what `seed_argument` records — so running it backwards
-/// cannot name the head tuple to delete. There is nothing to over-delete
-/// against, so the stratum takes the rebuild instead.
-///
-/// Rederivation needs no such guard: it unifies a whole candidate fact against
-/// the head, which binds every head variable including the seed.
-fn deletionBlocked(db: *database.Database, level: usize, deleted: *const relation_store.RelationStore) !bool {
-    var keys: std.AutoHashMapUnmanaged(relation_store.PredicateKey, void) = .empty;
-    defer keys.deinit(db.allocator);
-    try relation_store.collectPredicateKeys(db.allocator, deleted, 0, &keys);
-    if (try stratumImpact(db, level, &keys) == .rebuild) return true;
-    const analysis = try db.eval.ensureAnalysis();
-    for (db.eval.rules.items) |rule| {
-        if (rule.seed_argument == null) continue;
-        if (evaluator.ruleStratum(&analysis.strata, rule) != level) continue;
-        for (rule.body) |clause| switch (clause) {
-            .relational => |expression| if (keys.contains(syntax.predicateKey(expression))) return true,
-            .builtin, .negated, .aggregate => {},
-        };
-    }
-    return false;
 }
 /// Classifies how a batch's changed predicates affect one stratum:
 /// negation over a changed predicate always needs the rebuild path, an
@@ -212,9 +192,6 @@ pub fn stratumImpact(
 /// after their base support disappears. A stratum whose negated or
 /// aggregated dependencies lost facts is invalidated and recomputed
 /// through the dirty-stratum rebuild instead.
-///
-/// A stratum containing a seeded structural rule whose body lost facts is
-/// rebuilt rather than over-deleted; see `deletionBlocked`.
 fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationStore) !DeltaOutcome {
     var old_closure = try db.closure.?.clone();
     defer old_closure.deinit();
@@ -224,7 +201,7 @@ fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationS
     const analysis = try db.eval.ensureAnalysis();
     var level: usize = 0;
     while (level <= analysis.max_level) : (level += 1) {
-        if (try deletionBlocked(db, level, deleted)) {
+        if (try levelBlocked(db, level, deleted, 0)) {
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try materialization.ensureMaterialized(db);
@@ -281,6 +258,13 @@ fn overdeleteLevel(
         }
     }
 }
+/// Runs one rule backwards through one of its body occurrences: bind that
+/// occurrence to the deleted fact, and take out of the closure every head
+/// tuple the resulting derivations supported.
+///
+/// Which head tuples those are is answered two ways. An ordinary rule's body
+/// binding determines its head, so the head is *built*. A seeded structural
+/// rule's does not, so its head is *enumerated*.
 fn overdeleteOccurrence(
     db: *database.Database,
     old_closure: *relation_store.RelationStore,
@@ -295,26 +279,165 @@ fn overdeleteOccurrence(
     if (!try db.eval.unify(victim, expression, &initial)) return;
     const rest = try syntax.outerClauses(db.allocator, rule, clause_index);
     defer db.allocator.free(rest);
+    if (rule.seed_argument == null)
+        return overdeleteConstructed(db, old_closure, deleted, rule, rest, &initial);
+    return overdeleteEnumerated(db, old_closure, deleted, rule, rest, &initial);
+}
+/// Over-deletes through an ordinary rule: solve the remaining goals against
+/// the pre-deletion closure and build the head each solution derived.
+/// `validateRuleSafety` requires every head variable of such a rule to be
+/// bound by the body, so the build cannot fail for want of a binding.
+fn overdeleteConstructed(
+    db: *database.Database,
+    old_closure: *relation_store.RelationStore,
+    deleted: *relation_store.RelationStore,
+    rule: syntax.Rule,
+    rest: []const syntax.Clause,
+    initial: *const syntax.Binding,
+) !void {
     var answers: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
     }
-    db.eval.matchClauses(rest, old_closure, 0, &initial, &answers, null) catch |err| switch (err) {
-        errors.Error.NumericType, errors.Error.NumericOverflow => return,
-        else => return err,
-    };
+    if (!try solveRest(db, rest, old_closure, initial, &answers)) return;
     for (answers.items) |*answer| {
         const head_fact = try db.eval.deriveFact(rule.head, answer);
-        var keep = false;
-        defer if (!keep) db.allocator.free(head_fact.terms);
-        if (try db.facts.contains(head_fact)) continue;
-        if (try deleted.contains(head_fact)) continue;
-        if (!try db.closure.?.contains(head_fact)) continue;
-        _ = try db.closure.?.removeFact(head_fact);
-        _ = try deleted.insert(head_fact, true);
-        keep = true;
+        var taken = false;
+        defer if (!taken) db.allocator.free(head_fact.terms);
+        if (!try deletableHead(db, head_fact, deleted)) continue;
+        try takeHead(db, head_fact, deleted);
+        taken = true;
     }
+}
+/// Over-deletes through a seeded structural rule, whose head the body binding
+/// does not determine.
+///
+/// Pinning `length(T, M)` in `length(H!T, N) :- length(T, M), N = M + 1`
+/// against a deleted fact binds `T`, `M` and then `N`, but never `H`. Forward
+/// evaluation binds it by enumerating the value table against
+/// `head.terms[seed_argument]`; backwards there is no value to enumerate
+/// against. So the head is looked up rather than built, which is sound because
+/// over-deletion only ever acts on head tuples the closure holds — the built
+/// ones are discarded when it does not.
+///
+/// The lookup is a candidate prefilter like every other, keyed by the head
+/// arguments the body binding leaves ground, and for the canonical seeded rule
+/// there are none: the seed argument is fixed only in its tail, and the
+/// remaining head arguments are computed downstream of it. The unification
+/// below is therefore the filter that matters, and the lookup usually hands it
+/// the head predicate's whole relation. That costs candidates, not
+/// correctness; making it cheaper wants a closure index keyed by the seed
+/// argument's tail, which is deferred work.
+///
+/// The candidate is unified into the binding *before* the remaining goals are
+/// solved, not after. It has to be: the seed argument's variables can appear in
+/// the body too, as `H` does in `sum(H!T, N) :- sum(T, M), N = M + H`, and the
+/// candidate is the only thing that binds them.
+fn overdeleteEnumerated(
+    db: *database.Database,
+    old_closure: *relation_store.RelationStore,
+    deleted: *relation_store.RelationStore,
+    rule: syntax.Rule,
+    rest: []const syntax.Clause,
+    initial: *const syntax.Binding,
+) !void {
+    // The head unification is the selective test — it holds the candidate's
+    // seed argument to the tail the body binding fixed — and it is also the
+    // cheap one, so it runs first, over the store, before anything is copied.
+    // Copies are needed at all only because taking a fact out of the closure
+    // retires every index into it, including this lookup's candidate list.
+    var seeded: syntax.Binding = .{};
+    defer seeded.deinit(db.allocator);
+    var candidates: std.ArrayList(relation_store.Fact) = .empty;
+    defer {
+        for (candidates.items) |fact| db.allocator.free(fact.terms);
+        candidates.deinit(db.allocator);
+    }
+    for (try db.eval.lookupCandidates(&db.closure.?, rule.head, initial)) |index| {
+        const candidate = db.closure.?.factAt(index);
+        try refill(db.allocator, &seeded, initial);
+        if (!try db.eval.unify(candidate, rule.head, &seeded)) continue;
+        try relation_store.appendFactCopy(db.allocator, &candidates, candidate);
+    }
+
+    for (candidates.items) |candidate| {
+        if (!try deletableHead(db, candidate, deleted)) continue;
+        try refill(db.allocator, &seeded, initial);
+        if (!try db.eval.unify(candidate, rule.head, &seeded)) continue;
+        var answers: std.ArrayList(syntax.Binding) = .empty;
+        defer {
+            for (answers.items) |*answer| answer.deinit(db.allocator);
+            answers.deinit(db.allocator);
+        }
+        if (!try solveRest(db, rest, old_closure, &seeded, &answers)) continue;
+        // The candidate bound every head variable, so each answer derives the
+        // candidate itself: one solution is a whole proof, and more of them are
+        // more proofs of the same tuple.
+        if (answers.items.len == 0) continue;
+        const head_fact: relation_store.Fact = .{
+            .predicate = candidate.predicate,
+            .terms = try db.allocator.dupe(syntax.ValueId, candidate.terms),
+        };
+        var taken = false;
+        defer if (!taken) db.allocator.free(head_fact.terms);
+        try takeHead(db, head_fact, deleted);
+        taken = true;
+    }
+}
+/// Refills `scratch` from `source`, keeping the capacity it already has. The
+/// filter above runs once per candidate fact of the head relation, which is
+/// where over-deletion through a seeded rule spends its time, so it reuses one
+/// binding rather than cloning `source` per candidate.
+fn refill(
+    allocator: std.mem.Allocator,
+    scratch: *syntax.Binding,
+    source: *const syntax.Binding,
+) !void {
+    scratch.values.clearRetainingCapacity();
+    try scratch.values.ensureUnusedCapacity(allocator, source.values.count());
+    for (source.values.keys(), source.values.values()) |variable, value|
+        scratch.values.putAssumeCapacity(variable, value);
+}
+/// Solves a rule's remaining goals against the pre-deletion closure, and
+/// reports whether the solve ran to completion. A numeric error abandons it
+/// and its partial answers, exactly as forward seeded rule application does: a
+/// derivation that could not be computed forwards never happened.
+fn solveRest(
+    db: *database.Database,
+    rest: []const syntax.Clause,
+    old_closure: *relation_store.RelationStore,
+    bindings: *const syntax.Binding,
+    answers: *std.ArrayList(syntax.Binding),
+) !bool {
+    db.eval.matchClauses(rest, old_closure, 0, bindings, answers, null) catch |err| switch (err) {
+        errors.Error.NumericType, errors.Error.NumericOverflow => return false,
+        else => return err,
+    };
+    return true;
+}
+/// Whether this head tuple is one over-deletion may take: a base fact is not
+/// derived, a fact already queued has been taken, and a fact the reduced
+/// closure no longer holds was never there to take.
+fn deletableHead(
+    db: *database.Database,
+    head: relation_store.Fact,
+    deleted: *relation_store.RelationStore,
+) !bool {
+    if (try db.facts.contains(head)) return false;
+    if (try deleted.contains(head)) return false;
+    return db.closure.?.contains(head);
+}
+/// Takes a head tuple out of the closure and queues it for rederivation,
+/// adopting `head.terms` on success. On failure the caller still owns them.
+fn takeHead(
+    db: *database.Database,
+    head: relation_store.Fact,
+    deleted: *relation_store.RelationStore,
+) !void {
+    _ = try db.closure.?.removeFact(head);
+    _ = try deleted.insert(head, true);
+    db.overdeleted_facts += 1;
 }
 /// Reinserts over-deleted facts of this stratum that retain an
 /// alternative proof in the reduced closure, repeating until no further
@@ -343,6 +466,7 @@ fn rederiveLevel(
             }
             try relation_store.copyFactInto(db.allocator, &db.closure.?, candidate, true);
             deleted.removeAt(index);
+            db.rederived_facts += 1;
             progress = true;
         }
     }

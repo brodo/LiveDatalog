@@ -31,6 +31,11 @@ pub const MaintenanceStats = struct {
     propagated_facts: usize,
     /// Facts removed from the closure by delete-and-rederive.
     removed_facts: usize,
+    /// The two halves `removed_facts` nets against each other: consequences
+    /// over-deletion took out of the closure, and the ones rederivation found
+    /// another proof for and put back.
+    overdeleted_facts: usize,
+    rederived_facts: usize,
     stratum_expansions: usize,
     /// Updates that abandoned incremental maintenance for a stratum rebuild.
     rebuild_fallbacks: usize,
@@ -77,6 +82,11 @@ pub const Database = struct {
     /// Counts facts removed from the closure by incremental
     /// delete-and-rederive, net of rederived facts.
     removed_facts: usize = 0,
+    /// Counts the two halves of that net separately, which is what says
+    /// whether a deletion was cheap because little was affected or expensive
+    /// because most of what it took out came straight back.
+    overdeleted_facts: usize = 0,
+    rederived_facts: usize = 0,
     /// Counts updates that abandoned incremental maintenance for a
     /// stratum rebuild.
     rebuild_fallbacks: usize = 0,
@@ -121,6 +131,8 @@ pub const Database = struct {
         result.materialization = self.materialization;
         result.propagated_facts = self.propagated_facts;
         result.removed_facts = self.removed_facts;
+        result.overdeleted_facts = self.overdeleted_facts;
+        result.rederived_facts = self.rederived_facts;
         result.rebuild_fallbacks = self.rebuild_fallbacks;
         result.maintained_groups = self.maintained_groups;
         result.shadow_verification = self.shadow_verification;
@@ -243,6 +255,8 @@ pub const Database = struct {
             .closure_facts = if (self.closure) |*closure| closure.len() else 0,
             .propagated_facts = self.propagated_facts,
             .removed_facts = self.removed_facts,
+            .overdeleted_facts = self.overdeleted_facts,
+            .rederived_facts = self.rederived_facts,
             .stratum_expansions = self.eval.expansions,
             .rebuild_fallbacks = self.rebuild_fallbacks,
             .maintained_groups = self.maintained_groups,
