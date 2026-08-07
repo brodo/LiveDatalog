@@ -52,7 +52,7 @@ pub fn propagateInsertions(db: *Jatalog, batch_start: usize) !void {
     const max_level = analysis.max_level;
     var level: usize = 0;
     while (level <= max_level) : (level += 1) {
-        if (try strataBlockedBy(db, level, &db.closure.?, batch_start)) {
+        if (try insertionBlocked(db, level, batch_start)) {
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try db.ensureMaterialized();
@@ -62,20 +62,45 @@ pub fn propagateInsertions(db: *Jatalog, batch_start: usize) !void {
     }
     db.propagated_facts += db.closure.?.len() - start_len;
 }
-/// Whether stratum `level` must be rebuilt rather than maintained because
-/// the facts in `changed[from..]` reach one of its rules through negation
-/// or through an aggregate this phase cannot maintain. Insertions pass the
-/// closure from the batch's start, deletions the whole deleted set.
-fn strataBlockedBy(
-    db: *Jatalog,
-    level: usize,
-    changed: *const RelationStore,
-    from: usize,
-) !bool {
+/// Whether stratum `level` must be rebuilt rather than maintained because the
+/// facts appended to the closure from `batch_start` reach one of its rules
+/// through negation or through an aggregate this phase cannot maintain.
+fn insertionBlocked(db: *Jatalog, level: usize, batch_start: usize) !bool {
     var keys: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
     defer keys.deinit(db.allocator);
-    try collectPredicateKeys(db.allocator, changed, from, &keys);
+    try collectPredicateKeys(db.allocator, &db.closure.?, batch_start, &keys);
     return try stratumImpact(db, level, &keys) == .rebuild;
+}
+
+/// Whether stratum `level` must be rebuilt rather than maintained through
+/// delete-and-rederive.
+///
+/// Deletion shares the insertion triggers and adds one of its own. Over-
+/// deletion runs a rule backwards: it unifies a deleted fact against a body
+/// occurrence, solves the remaining goals, and reconstructs the head. A seeded
+/// structural rule has a head variable that no body goal binds — in
+/// `length(H!T, N) :- length(T, M), N = M + 1` the value of `H` comes from the
+/// value table, which is what `seed_argument` records — so running it backwards
+/// cannot name the head tuple to delete. There is nothing to over-delete
+/// against, so the stratum takes the rebuild instead.
+///
+/// Rederivation needs no such guard: it unifies a whole candidate fact against
+/// the head, which binds every head variable including the seed.
+fn deletionBlocked(db: *Jatalog, level: usize, deleted: *const RelationStore) !bool {
+    var keys: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+    defer keys.deinit(db.allocator);
+    try collectPredicateKeys(db.allocator, deleted, 0, &keys);
+    if (try stratumImpact(db, level, &keys) == .rebuild) return true;
+    const analysis = try db.eval.ensureAnalysis();
+    for (db.eval.rules.items) |rule| {
+        if (rule.seed_argument == null) continue;
+        if (ruleStratum(&analysis.strata, rule) != level) continue;
+        for (rule.body) |clause| switch (clause) {
+            .relational => |expression| if (keys.contains(predicateKey(expression))) return true,
+            .builtin, .negated, .aggregate => {},
+        };
+    }
+    return false;
 }
 /// Classifies how a batch's changed predicates affect one stratum:
 /// negation over a changed predicate always needs the rebuild path, an
@@ -113,12 +138,8 @@ pub fn stratumImpact(
 /// aggregated dependencies lost facts is invalidated and recomputed
 /// through the dirty-stratum rebuild instead.
 ///
-/// Note: `overdeleteLevel` selects a stratum's rules by head stratum
-/// alone, while `propagateLevel` and `expandLevel` also keep seeded
-/// structural rules active in higher strata. Whether over-deletion needs
-/// the same cross-stratum reach is unresolved; no test currently
-/// distinguishes the two, and shadow verification has not caught a
-/// disagreement.
+/// A stratum containing a seeded structural rule whose body lost facts is
+/// rebuilt rather than over-deleted; see `deletionBlocked`.
 pub fn propagateDeletions(db: *Jatalog, deleted: *RelationStore) !void {
     var old_closure = try db.closure.?.clone();
     defer old_closure.deinit();
@@ -128,7 +149,7 @@ pub fn propagateDeletions(db: *Jatalog, deleted: *RelationStore) !void {
     const analysis = try db.eval.ensureAnalysis();
     var level: usize = 0;
     while (level <= analysis.max_level) : (level += 1) {
-        if (try strataBlockedBy(db, level, deleted, 0)) {
+        if (try deletionBlocked(db, level, deleted)) {
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try db.ensureMaterialized();
@@ -145,10 +166,14 @@ pub fn propagateDeletions(db: *Jatalog, deleted: *RelationStore) !void {
 /// occurrences join against the pre-deletion snapshot so derivations
 /// that used several deleted facts are still found.
 ///
-/// Unlike the propagation and expansion phases this selects rules by
-/// `ruleStratum` rather than `ruleActiveAt`, so a seeded structural rule
-/// is over-deleted only in its own stratum and not in the higher strata
-/// it stays active in. See the note in `propagateDeletions`.
+/// Selecting rules by `ruleStratum` rather than the `ruleActiveAt` the
+/// propagation and expansion phases use is deliberate and sufficient. Those
+/// phases keep a seeded rule active above its own stratum because new values
+/// are interned there, and values drive it. Over-deletion follows facts, not
+/// values, and stratification puts every body predicate at or below its
+/// head's stratum, so a rule can only lose support from strata this loop has
+/// already reached. Extending the reach would re-examine rules against
+/// victims their bodies cannot mention.
 fn overdeleteLevel(
     db: *Jatalog,
     old_closure: *RelationStore,
@@ -481,6 +506,55 @@ test "batch deletions and mixed batches maintain the closure correctly" {
     try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{}, &.{
         input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
     }));
+}
+
+test "over-deletion reaches a seeded rule fed by values from a higher stratum" {
+    // `length` is a seeded structural rule: it is driven by the value table
+    // rather than by a fact relation, so it sits in stratum zero while the
+    // lists it consumes are interned by `collected` in a higher stratum. That
+    // is the one case where a rule keeps deriving facts above its own stratum,
+    // and it is why `expandLevel` and `propagateLevel` select rules with
+    // `ruleActiveAt` while `overdeleteLevel` uses `ruleStratum`.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\group(g1). group(g2).
+        \\member(g1, a). member(g1, b). member(g2, c).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(G, N) :- collected(G, S), length(S, N).
+    );
+    setup.deinit();
+    try db.materialize();
+    try expectAnswerCount(&db, "size(g1, 2)?", 1);
+
+    // Removing a member shortens g1's list. The old list value stays interned,
+    // so `length` keeps deriving its length — a rebuild does the same, because
+    // the value table is monotone and nothing withdraws a structural value.
+    // What must disappear is `size(g1, 2)`, whose support went with the list.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
+    }));
+    try expectAnswerCount(&db, "size(g1, 2)?", 0);
+    try expectAnswerCount(&db, "size(g1, 1)?", 1);
+    try expectAnswerCount(&db, "size(g2, 1)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting the structural rule's own seed fact removes the whole chain,
+    // and with it every `size`. Over-deletion cannot run this rule backwards —
+    // it would have to name `H` in `length(H!T, N)` from `length(T, M)` alone —
+    // so the stratum takes the rebuild instead of reporting UnboundVariable.
+    const fallbacks_before = db.maintenanceStats().rebuild_fallbacks;
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
+    }));
+    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > fallbacks_before);
+    try expectAnswerCount(&db, "size(G, N)?", 0);
+    try expectAnswerCount(&db, "length(L, N)?", 0);
+    try expectClosureMatchesRebuild(&db);
 }
 
 test "deleting the only base support removes the entire unsupported cycle" {

@@ -60,7 +60,10 @@ Every base-fact update takes exactly one of three paths, all of which yield
 the same database a clean rebuild would: incremental insertion propagation
 through positive rules, delete-and-rederive for deletions, or a stratum
 rebuild when the update reaches negation or an aggregate outside the
-maintained class. Because maintaining and recomputing differ only in cost, a
+maintained class. Deletion takes the rebuild in one further case: it runs a
+rule backwards from a deleted body fact to the head it supported, which a
+seeded structural rule does not permit because its head carries a variable
+only the value table binds. Because maintaining and recomputing differ only in cost, a
 cost model chooses between them per update, estimating both from measured
 work — counted in candidate facts examined, and attributed so that each
 candidate moves exactly one of the two estimates, with a fallback rebuild
