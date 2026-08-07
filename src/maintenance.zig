@@ -896,11 +896,7 @@ fn retractionAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "incremental retraction releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        retractionAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(retractionAllocationScenario);
 }
 
 /// Runs one deterministic update trace under a fixed policy and returns the
@@ -930,11 +926,7 @@ fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "batch updates roll back completely on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        batchUpdateAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(batchUpdateAllocationScenario);
 }
 
 fn runPolicyTrace(db: *root.Jatalog, policy: root.MaintenancePolicy) !void {

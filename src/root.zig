@@ -996,11 +996,7 @@ fn materializationAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "materialization lifecycle releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        materializationAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(materializationAllocationScenario);
 }
 
 test "materialize rebuild and stats form the explicit maintenance API" {
@@ -1392,11 +1388,7 @@ fn aggregateEvaluationAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "aggregate evaluation releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        aggregateEvaluationAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(aggregateEvaluationAllocationScenario);
 }
 
 fn floatAllocationScenario(allocator: std.mem.Allocator) !void {
@@ -1417,11 +1409,7 @@ fn floatAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "float parsing evaluation and overflow release every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        floatAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(floatAllocationScenario);
 }
 
 fn mixedArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
@@ -1444,11 +1432,7 @@ fn mixedArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "mixed arithmetic releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        mixedArithmeticAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(mixedArithmeticAllocationScenario);
 }
 
 test "recursive list length and sum use checked integer arithmetic" {
@@ -1624,11 +1608,7 @@ fn recursiveArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "recursive arithmetic rejection is allocation safe" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        recursiveArithmeticAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(recursiveArithmeticAllocationScenario);
 }
 
 test "embedding API constructs structural aggregate rules and queries" {
@@ -1708,11 +1688,7 @@ fn embeddedAggregateAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "embedding aggregate ownership is allocation safe" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        embeddedAggregateAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(embeddedAggregateAllocationScenario);
 }
 
 test "aggregate retraction is correct across the complete language tour" {
@@ -2081,11 +2057,7 @@ fn typedFloatAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "typed float input releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        typedFloatAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(typedFloatAllocationScenario);
 }
 
 test "integer identity is exact above 2^53 and recursive inside lists" {

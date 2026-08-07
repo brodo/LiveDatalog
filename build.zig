@@ -203,15 +203,21 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the library
     // source. The published module above deliberately leaves `optimize` unset
     // so that consumers pick their own; a test binary is a root and needs one.
-    // Using the published module directly left this binary pinned to Debug and
-    // silently ignoring `-Doptimize`, which matters because it holds nearly
-    // every test in the project — the allocation-failure tests run their whole
-    // scenario once per allocation site, so Debug costs about ninety seconds
-    // that `-Doptimize=ReleaseSafe` does in ten.
+    //
+    // This binary holds nearly every test in the project, and the suite spends
+    // its time running the engine rather than compiling it, so it does not
+    // follow the executable's Debug default: the same tests cost about a
+    // minute in Debug and a few seconds in ReleaseSafe, which keeps every
+    // safety check. An explicit `-Doptimize` still wins, for the failure that
+    // wants a Debug binary to step through.
+    const test_optimize: std.builtin.OptimizeMode = if (b.user_input_options.contains("optimize"))
+        optimize
+    else
+        .ReleaseSafe;
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = test_optimize,
     });
     const mod_tests = b.addTest(.{
         .root_module = test_mod,

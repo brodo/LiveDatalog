@@ -209,8 +209,11 @@ zig build test
 ```
 
 The test step runs unit tests, formatting verification, Ziglint, and the
-checked-in aggregation example. Individual maintenance steps are also
-available:
+checked-in aggregation example. The test binary is built in `ReleaseSafe`
+rather than following the executable's `Debug` default, because the suite
+spends its time running the engine and every safety check still applies. Pass
+`-Doptimize=Debug` for the failure that wants a Debug binary to step through.
+Individual maintenance steps are also available:
 
 ```sh
 zig build fmt

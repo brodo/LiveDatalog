@@ -1241,9 +1241,5 @@ fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "aggregate maintenance releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        aggregateMaintenanceAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(aggregateMaintenanceAllocationScenario);
 }

@@ -457,11 +457,7 @@ fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "structural parsing and evaluation release every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        structuralAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(structuralAllocationScenario);
 }
 
 fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
@@ -481,11 +477,7 @@ fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
 }
 
 test "aggregate parser errors release all partial clause trees" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        aggregateAllocationScenario,
-        .{},
-    );
+    try test_support.expectEveryAllocationFailureReleased(aggregateAllocationScenario);
 }
 
 test "quoted numeric atoms remain distinct from numeric scalars" {
