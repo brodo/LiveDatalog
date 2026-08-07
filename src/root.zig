@@ -7,6 +7,7 @@ const cost_model = @import("cost_model.zig");
 const syntax = @import("syntax.zig");
 const results = @import("results.zig");
 const evaluator = @import("evaluator.zig");
+const maintenance = @import("maintenance.zig");
 pub const Error = error{
     InvalidFact,
     InvalidRule,
@@ -27,6 +28,10 @@ pub const Error = error{
 };
 
 const Fact = relation_store.Fact;
+const StratumImpact = maintenance.StratumImpact;
+const copyFactInto = relation_store.copyFactInto;
+const appendFactCopy = relation_store.appendFactCopy;
+const collectPredicateKeys = relation_store.collectPredicateKeys;
 const Value = evaluator.Value;
 const ValueTable = evaluator.ValueTable;
 const Analysis = evaluator.Analysis;
@@ -168,9 +173,6 @@ const InputBuilder = struct {
     }
 };
 
-/// How a batch's changed predicates affect one stratum's maintenance.
-const StratumImpact = enum { none, aggregate, rebuild };
-
 /// CReaM-style auxiliary view for a maintained aggregate rule whose head
 /// projects out some of its outer-goal variables. Each tuple retains those
 /// projected values followed by the head values they derive, so the number
@@ -213,50 +215,6 @@ const AuxiliaryView = struct {
         return tuple.terms[self.projected.len..];
     }
 };
-
-/// Inserts a copy of `fact` into `store`, which takes ownership of the copied
-/// terms. The single place the database duplicates a fact between stores.
-fn copyFactInto(
-    allocator: std.mem.Allocator,
-    store: *RelationStore,
-    fact: Fact,
-    derived: bool,
-) !void {
-    const terms = try allocator.dupe(ValueId, fact.terms);
-    _ = store.insert(.{ .predicate = fact.predicate, .terms = terms }, derived) catch |err| {
-        allocator.free(terms);
-        return err;
-    };
-}
-
-/// Appends a copy of `fact` to `list`, which takes ownership of the copied
-/// terms. The `std.ArrayList` counterpart of `copyFactInto`, used where facts
-/// are queued for later application rather than stored.
-fn appendFactCopy(
-    allocator: std.mem.Allocator,
-    list: *std.ArrayList(Fact),
-    fact: Fact,
-) !void {
-    const terms = try allocator.dupe(ValueId, fact.terms);
-    list.append(allocator, .{ .predicate = fact.predicate, .terms = terms }) catch |err| {
-        allocator.free(terms);
-        return err;
-    };
-}
-
-/// Collects the distinct predicate keys of `store[from..]`, the set the
-/// stratum-impact analysis tests a batch's reach against.
-fn collectPredicateKeys(
-    allocator: std.mem.Allocator,
-    store: *const RelationStore,
-    from: usize,
-    keys: *std.AutoHashMapUnmanaged(PredicateKey, void),
-) !void {
-    for (from..store.len()) |index| {
-        const fact = store.factAt(index);
-        try keys.put(allocator, .{ .name = fact.predicate, .arity = fact.terms.len }, {});
-    }
-}
 
 const Materialization = union(enum) {
     uninitialized,
@@ -406,7 +364,7 @@ pub const Jatalog = struct {
             committed.eval.cost.decide(delta) == .maintain;
         if (maintain and delta > 0) {
             const span = committed.eval.cost.begin();
-            try committed.propagateDeletions(&removed);
+            try maintenance.propagateDeletions(&committed, &removed);
             var touched: RelationStore = .init(committed.allocator);
             defer touched.deinit();
             for (0..removed.len()) |position|
@@ -635,7 +593,7 @@ pub const Jatalog = struct {
         // closure: over-deleted consequences are added and rederived ones
         // removed, so it must be read for `touched` only afterwards.
         if (removed.len() > 0) {
-            try self.propagateDeletions(&removed);
+            try maintenance.propagateDeletions(self, &removed);
             for (0..removed.len()) |index|
                 try copyFactInto(self.allocator, touched, removed.factAt(index), false);
         }
@@ -668,76 +626,12 @@ pub const Jatalog = struct {
             if (try self.applyInsertion(expression, maintain)) count += 1;
         }
         if (!maintain or self.closure.?.len() == batch_start) return count;
-        try self.propagateInsertions(batch_start);
+        try maintenance.propagateInsertions(self, batch_start);
         if (self.materialization == .clean) {
             for (batch_start..self.closure.?.len()) |index|
                 try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
         }
         return count;
-    }
-
-    /// Propagates a batch of base insertions already appended to the clean
-    /// closure at `batch_start`, one stratum at a time. A stratum whose
-    /// negated or aggregated dependencies gained facts falls back to the
-    /// dirty-stratum rebuild; strata below it keep their incremental state.
-    fn propagateInsertions(self: *Jatalog, batch_start: usize) !void {
-        const start_len = self.closure.?.len();
-        const analysis = try self.eval.ensureAnalysis();
-        const max_level = analysis.max_level;
-        var level: usize = 0;
-        while (level <= max_level) : (level += 1) {
-            if (try self.strataBlockedBy(level, &self.closure.?, batch_start)) {
-                self.rebuild_fallbacks += 1;
-                self.markDirty(level);
-                try self.ensureMaterialized();
-                return;
-            }
-            try self.propagateLevel(&self.closure.?, &analysis.strata, level, batch_start);
-        }
-        self.propagated_facts += self.closure.?.len() - start_len;
-    }
-
-    /// Whether stratum `level` must be rebuilt rather than maintained because
-    /// the facts in `changed[from..]` reach one of its rules through negation
-    /// or through an aggregate this phase cannot maintain. Insertions pass the
-    /// closure from the batch's start, deletions the whole deleted set.
-    fn strataBlockedBy(
-        self: *Jatalog,
-        level: usize,
-        changed: *const RelationStore,
-        from: usize,
-    ) !bool {
-        var keys: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
-        defer keys.deinit(self.allocator);
-        try collectPredicateKeys(self.allocator, changed, from, &keys);
-        return try self.stratumImpact(level, &keys) == .rebuild;
-    }
-
-    /// Classifies how a batch's changed predicates affect one stratum:
-    /// negation over a changed predicate always needs the rebuild path, an
-    /// aggregate over a changed predicate needs it only when the rule is
-    /// outside the maintainable class, and everything else is handled by
-    /// the ordinary delta and delete-and-rederive engines.
-    fn stratumImpact(
-        self: *Jatalog,
-        level: usize,
-        changed: *const std.AutoHashMapUnmanaged(PredicateKey, void),
-    ) !StratumImpact {
-        if (changed.count() == 0) return .none;
-        const analysis = try self.eval.ensureAnalysis();
-        var impact: StratumImpact = .none;
-        for (self.eval.rules.items) |rule| {
-            if (!ruleActiveAt(&analysis.strata, rule, level)) continue;
-            for (rule.body) |clause| switch (clause) {
-                .negated => |expression| if (changed.contains(predicateKey(expression))) return .rebuild,
-                .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, changed)) {
-                    if (maintainableAggregateIndex(rule) == null) return .rebuild;
-                    impact = .aggregate;
-                },
-                .relational, .builtin => {},
-            };
-        }
-        return impact;
     }
 
     /// Maintains rules containing one unnested `setof` after a batch changed
@@ -783,7 +677,7 @@ pub const Jatalog = struct {
 
             touched.clear();
             if (removals.len() > 0) {
-                try self.propagateDeletions(&removals);
+                try maintenance.propagateDeletions(self, &removals);
                 for (0..removals.len()) |index|
                     try copyFactInto(self.allocator, touched, removals.factAt(index), false);
             }
@@ -794,7 +688,7 @@ pub const Jatalog = struct {
                 try copyFactInto(self.allocator, &self.closure.?, fact, true);
             }
             if (self.closure.?.len() > batch_start) {
-                try self.propagateInsertions(batch_start);
+                try maintenance.propagateInsertions(self, batch_start);
                 if (self.materialization != .clean) return;
                 for (batch_start..self.closure.?.len()) |index|
                     try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
@@ -1165,243 +1059,6 @@ pub const Jatalog = struct {
             const fact = derived.factAt(index);
             if (try self.closure.?.contains(fact)) continue;
             try appendFactCopy(self.allocator, additions, fact);
-        }
-    }
-
-    /// Applies a batch of base deletions to the clean closure with
-    /// delete-and-rederive, one stratum at a time: over-delete every fact
-    /// whose derivation used a deleted fact, joining against a snapshot of
-    /// the pre-deletion closure, then reinsert facts that retain an
-    /// alternative proof in the reduced closure. Plain reference counts
-    /// would be unsound here because cyclic derivations support one another
-    /// after their base support disappears. A stratum whose negated or
-    /// aggregated dependencies lost facts is invalidated and recomputed
-    /// through the dirty-stratum rebuild instead.
-    ///
-    /// Note: `overdeleteLevel` selects a stratum's rules by head stratum
-    /// alone, while `propagateLevel` and `expandLevel` also keep seeded
-    /// structural rules active in higher strata. Whether over-deletion needs
-    /// the same cross-stratum reach is unresolved; no test currently
-    /// distinguishes the two, and shadow verification has not caught a
-    /// disagreement.
-    fn propagateDeletions(self: *Jatalog, deleted: *RelationStore) !void {
-        var old_closure = try self.closure.?.clone();
-        defer old_closure.deinit();
-        for (0..deleted.len()) |index| {
-            _ = try self.closure.?.removeFact(deleted.factAt(index));
-        }
-        const analysis = try self.eval.ensureAnalysis();
-        var level: usize = 0;
-        while (level <= analysis.max_level) : (level += 1) {
-            if (try self.strataBlockedBy(level, deleted, 0)) {
-                self.rebuild_fallbacks += 1;
-                self.markDirty(level);
-                try self.ensureMaterialized();
-                return;
-            }
-            try self.overdeleteLevel(&old_closure, deleted, &analysis.strata, level);
-            try self.rederiveLevel(deleted, &analysis.strata, level);
-        }
-        self.removed_facts += deleted.len();
-    }
-
-    /// Over-deletes stratum `level`: every fact derivable by one of the
-    /// stratum's rules from at least one already-deleted fact is removed
-    /// from the closure and queued for rederivation. The remaining body
-    /// occurrences join against the pre-deletion snapshot so derivations
-    /// that used several deleted facts are still found.
-    ///
-    /// Unlike the propagation and expansion phases this selects rules by
-    /// `ruleStratum` rather than `ruleActiveAt`, so a seeded structural rule
-    /// is over-deleted only in its own stratum and not in the higher strata
-    /// it stays active in. See the note in `propagateDeletions`.
-    fn overdeleteLevel(
-        self: *Jatalog,
-        old_closure: *RelationStore,
-        deleted: *RelationStore,
-        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
-        level: usize,
-    ) !void {
-        var cursor: usize = 0;
-        while (cursor < deleted.len()) : (cursor += 1) {
-            const victim = deleted.factAt(cursor);
-            for (self.eval.rules.items) |rule| {
-                if (ruleStratum(levels, rule) != level) continue;
-                for (rule.body, 0..) |clause, clause_index| {
-                    const expression = switch (clause) {
-                        .relational => |value| value,
-                        else => continue,
-                    };
-                    if (expression.predicate != victim.predicate or
-                        expression.terms.len != victim.terms.len) continue;
-                    try self.overdeleteOccurrence(
-                        old_closure,
-                        deleted,
-                        rule,
-                        clause_index,
-                        victim,
-                    );
-                }
-            }
-        }
-    }
-
-    fn overdeleteOccurrence(
-        self: *Jatalog,
-        old_closure: *RelationStore,
-        deleted: *RelationStore,
-        rule: Rule,
-        clause_index: usize,
-        victim: Fact,
-    ) !void {
-        const expression = rule.body[clause_index].relational;
-        var initial: Binding = .{};
-        defer initial.deinit(self.allocator);
-        if (!try self.eval.unify(victim, expression, &initial)) return;
-        const rest = try outerClauses(self.allocator, rule, clause_index);
-        defer self.allocator.free(rest);
-        var answers: std.ArrayList(Binding) = .empty;
-        defer {
-            for (answers.items) |*answer| answer.deinit(self.allocator);
-            answers.deinit(self.allocator);
-        }
-        self.eval.matchClauses(rest, old_closure, 0, &initial, &answers, null) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => return,
-            else => return err,
-        };
-        for (answers.items) |*answer| {
-            const head_fact = try self.eval.deriveFact(rule.head, answer);
-            var keep = false;
-            defer if (!keep) self.allocator.free(head_fact.terms);
-            if (try self.facts.contains(head_fact)) continue;
-            if (try deleted.contains(head_fact)) continue;
-            if (!try self.closure.?.contains(head_fact)) continue;
-            _ = try self.closure.?.removeFact(head_fact);
-            _ = try deleted.insert(head_fact, true);
-            keep = true;
-        }
-    }
-
-    /// Reinserts over-deleted facts of this stratum that retain an
-    /// alternative proof in the reduced closure, repeating until no further
-    /// fact can be rederived so that chains of rederivations settle.
-    fn rederiveLevel(
-        self: *Jatalog,
-        deleted: *RelationStore,
-        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
-        level: usize,
-    ) !void {
-        var progress = true;
-        while (progress) {
-            progress = false;
-            var index: usize = 0;
-            while (index < deleted.len()) {
-                const candidate = deleted.factAt(index);
-                const key: PredicateKey = .{
-                    .name = candidate.predicate,
-                    .arity = candidate.terms.len,
-                };
-                if ((levels.get(key) orelse 0) != level or
-                    !try self.hasAlternativeDerivation(candidate))
-                {
-                    index += 1;
-                    continue;
-                }
-                try copyFactInto(self.allocator, &self.closure.?, candidate, true);
-                deleted.removeAt(index);
-                progress = true;
-            }
-        }
-    }
-
-    fn hasAlternativeDerivation(self: *Jatalog, fact: Fact) !bool {
-        for (self.eval.rules.items) |rule| {
-            if (rule.head.predicate != fact.predicate or
-                rule.head.terms.len != fact.terms.len) continue;
-            var bindings: Binding = .{};
-            defer bindings.deinit(self.allocator);
-            if (!try self.eval.unify(fact, rule.head, &bindings)) continue;
-            var answers: std.ArrayList(Binding) = .empty;
-            defer {
-                for (answers.items) |*answer| answer.deinit(self.allocator);
-                answers.deinit(self.allocator);
-            }
-            self.eval.matchClauses(
-                rule.body,
-                &self.closure.?,
-                0,
-                &bindings,
-                &answers,
-                null,
-            ) catch |err| switch (err) {
-                Error.NumericType, Error.NumericOverflow => continue,
-                else => return err,
-            };
-            if (answers.items.len > 0) return true;
-        }
-        return false;
-    }
-
-    /// Runs semi-naive delta rounds for one stratum during batch
-    /// propagation. Unlike `expandLevel` there is no naive round zero: the
-    /// initial delta is everything appended since the batch began, and every
-    /// relational body occurrence is delta-joined because the batch may have
-    /// grown predicates at any lower stratum.
-    fn propagateLevel(
-        self: *Jatalog,
-        facts: *RelationStore,
-        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
-        level: usize,
-        batch_start: usize,
-    ) !void {
-        const ActiveRule = struct {
-            rule: Rule,
-            occurrences: []usize,
-        };
-        var active: std.ArrayList(ActiveRule) = .empty;
-        defer {
-            for (active.items) |entry| self.allocator.free(entry.occurrences);
-            active.deinit(self.allocator);
-        }
-        for (self.eval.rules.items) |rule| {
-            if (!ruleActiveAt(levels, rule, level)) continue;
-            var occurrences: std.ArrayList(usize) = .empty;
-            errdefer occurrences.deinit(self.allocator);
-            if (rule.seed_argument == null) {
-                for (rule.body, 0..) |clause, clause_index| {
-                    if (clause == .relational)
-                        try occurrences.append(self.allocator, clause_index);
-                }
-            }
-            const owned = try occurrences.toOwnedSlice(self.allocator);
-            active.append(self.allocator, .{
-                .rule = rule,
-                .occurrences = owned,
-            }) catch |err| {
-                self.allocator.free(owned);
-                return err;
-            };
-        }
-
-        var delta_start = batch_start;
-        var value_mark = self.eval.values.values.items.len;
-        while (true) {
-            const delta_end = facts.len();
-            const values_grew = self.eval.values.values.items.len != value_mark;
-            if (delta_end == delta_start and !values_grew) break;
-            value_mark = self.eval.values.values.items.len;
-            for (active.items) |entry| {
-                if (entry.rule.seed_argument != null) {
-                    try self.eval.applyRule(facts, entry.rule, null);
-                } else for (entry.occurrences) |occurrence| {
-                    try self.eval.applyRule(facts, entry.rule, .{
-                        .clause_index = occurrence,
-                        .delta_start = delta_start,
-                        .delta_end = delta_end,
-                    });
-                }
-            }
-            delta_start = delta_end;
         }
     }
 
@@ -1857,7 +1514,7 @@ pub const Jatalog = struct {
         return std.math.cast(u32, count) orelse Error.NumericOverflow;
     }
 
-    fn markDirty(self: *Jatalog, level: usize) void {
+    pub fn markDirty(self: *Jatalog, level: usize) void {
         switch (self.materialization) {
             .uninitialized => {},
             .clean => self.materialization = .{ .dirty_from_stratum = level },
@@ -1883,7 +1540,7 @@ pub const Jatalog = struct {
     /// failure the previous closure and state remain installed; values
     /// interned by the aborted expansion stay in the value table and are
     /// reclaimed at deinit.
-    fn ensureMaterialized(self: *Jatalog) !void {
+    pub fn ensureMaterialized(self: *Jatalog) !void {
         if (self.eval.rules.items.len == 0) return;
         const from_level: usize = switch (self.materialization) {
             .clean => return,
@@ -2739,6 +2396,7 @@ test {
     _ = syntax;
     _ = results;
     _ = evaluator;
+    _ = maintenance;
 }
 
 /// Compares the semi-naive closure against the naive reference closure on a

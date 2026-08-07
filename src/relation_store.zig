@@ -532,3 +532,47 @@ test "random operation sequences agree with an unordered reference set" {
     }
     try std.testing.expectEqual(reference.items.len, store.len());
 }
+
+/// Inserts a copy of `fact` into `store`, which takes ownership of the copied
+/// terms. The single place the database duplicates a fact between stores.
+pub fn copyFactInto(
+    allocator: std.mem.Allocator,
+    store: *RelationStore,
+    fact: Fact,
+    derived: bool,
+) !void {
+    const terms = try allocator.dupe(ValueId, fact.terms);
+    _ = store.insert(.{ .predicate = fact.predicate, .terms = terms }, derived) catch |err| {
+        allocator.free(terms);
+        return err;
+    };
+}
+
+/// Appends a copy of `fact` to `list`, which takes ownership of the copied
+/// terms. The `std.ArrayList` counterpart of `copyFactInto`, used where facts
+/// are queued for later application rather than stored.
+pub fn appendFactCopy(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Fact),
+    fact: Fact,
+) !void {
+    const terms = try allocator.dupe(ValueId, fact.terms);
+    list.append(allocator, .{ .predicate = fact.predicate, .terms = terms }) catch |err| {
+        allocator.free(terms);
+        return err;
+    };
+}
+
+/// Collects the distinct predicate keys of `store[from..]`, the set the
+/// stratum-impact analysis tests a batch's reach against.
+pub fn collectPredicateKeys(
+    allocator: std.mem.Allocator,
+    store: *const RelationStore,
+    from: usize,
+    keys: *std.AutoHashMapUnmanaged(PredicateKey, void),
+) !void {
+    for (from..store.len()) |index| {
+        const fact = store.factAt(index);
+        try keys.put(allocator, .{ .name = fact.predicate, .arity = fact.terms.len }, {});
+    }
+}

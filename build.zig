@@ -200,11 +200,21 @@ pub fn build(b: *std.Build) void {
         &.{ b.path("src"), b.path("benchmarks"), b.path("build.zig") },
     ));
 
-    // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
+    // Creates an executable that will run `test` blocks from the library
+    // source. The published module above deliberately leaves `optimize` unset
+    // so that consumers pick their own; a test binary is a root and needs one.
+    // Using the published module directly left this binary pinned to Debug and
+    // silently ignoring `-Doptimize`, which matters because it holds nearly
+    // every test in the project — the allocation-failure tests run their whole
+    // scenario once per allocation site, so Debug costs about ninety seconds
+    // that `-Doptimize=ReleaseSafe` does in ten.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const mod_tests = b.addTest(.{
-        .root_module = mod,
+        .root_module = test_mod,
     });
 
     // A run step that will run the test executable.
