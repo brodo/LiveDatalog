@@ -285,3 +285,41 @@ measured 54.1 us/query (54.1, 51.6, and 59.5 us) and the repeated-query
 median 23.6 us/query (23.7, 23.6, and 22.9 us). Neither benchmark defines a
 projected aggregate view, so the auxiliary views are empty here and add no
 query cost.
+
+## 2026-08-07 cost model work attribution
+
+The model above learned two estimates from one shared work counter without
+partitioning what it counted between them. Three corrections, none of which
+change what the model decides on the workloads recorded above:
+
+- Maintenance cost was divided by the number of relations a batch *named*
+  rather than the number of base facts it *changed*. Re-inserting a fact the
+  database already holds and deleting one it does not are no-ops, so a batch
+  naming eight of them alongside one real change recorded roughly an eighth
+  of the true per-fact cost. Since the estimate halves the weight of history
+  on each update, a few such batches were enough to pin the model on
+  maintenance. Measured directly: the same single insertion recorded 71 units
+  per fact when named alone and 8 when named alongside seven no-op deletions.
+- A maintenance attempt that falls back to a rebuild — the path an update
+  takes when it reaches negation or an unmaintainable aggregate — charged
+  that rebuild to *both* estimates, moving them in opposite directions from
+  one event. Rebuild work is now claimed by the rebuild estimate and excluded
+  from the enclosing maintenance measurement, so every candidate examined is
+  attributed to exactly one estimate.
+- An update that changes nothing is no longer counted as a decision. This one
+  is not observable through the public API: both callers wrap the decision in
+  a transaction that is discarded when nothing changed, so the miscount never
+  reached a committed database.
+
+Re-measured on this host after the corrections, the choices are identical to
+the table above — maintain 37/40, recompute 36/40, recompute 37/40, maintain
+281/300 — and the automatic policy lands 3.7 to 6.0 percent above the pinned
+winner rather than 6 to 10. Absolute times are not comparable with that table,
+which was recorded on a different host.
+
+The workloads that exercise these paths are not the ones recorded here: each
+benchmark batch names one insertion and one deletion of facts that mostly do
+exist, so realized and named counts nearly agree, and fallbacks are rare
+outside the negation row. The corrections matter for workloads that batch
+speculative updates or that repeatedly fall back, neither of which is
+currently benchmarked.

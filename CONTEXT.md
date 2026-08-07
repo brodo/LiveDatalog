@@ -62,7 +62,12 @@ through positive rules, delete-and-rederive for deletions, or a stratum
 rebuild when the update reaches negation or an aggregate outside the
 maintained class. Because maintaining and recomputing differ only in cost, a
 cost model chooses between them per update, estimating both from measured
-work; `MaintenancePolicy` pins the choice when a caller needs one path. Retraction — including pattern retraction with variables,
+work — counted in candidate facts examined, and attributed so that each
+candidate moves exactly one of the two estimates, with a fallback rebuild
+counting as recomputation rather than as the maintenance that triggered it.
+Estimates are fed the number of base facts an update changed, not the number
+its caller named. `MaintenancePolicy` pins the choice when a caller needs one
+path. Retraction — including pattern retraction with variables,
 which the batch API cannot express — resolves its goals to base facts and
 takes the deletion path. Aggregate group maintenance runs on top of the first two.
 `maintenanceStats` makes the path taken observable, and shadow verification

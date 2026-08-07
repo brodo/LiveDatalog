@@ -236,10 +236,6 @@ pub const MaintenancePolicy = enum {
     recompute,
 };
 
-/// How often the cost model takes the path it currently believes is more
-/// expensive, so that both estimates keep being refreshed.
-const explore_interval: usize = 16;
-
 /// Folds a new observation into a running estimate, halving the weight of
 /// history each time so the model tracks a changing workload within a few
 /// updates while still damping a single unusual batch.
@@ -247,6 +243,128 @@ fn blendWork(current: ?u64, observed: u64) u64 {
     const previous = current orelse return observed;
     return (previous +| observed) / 2;
 }
+
+/// Chooses between maintaining and recomputing, and learns what each costs
+/// from this database's own history.
+///
+/// Work is counted in candidate facts examined, which makes the decision
+/// deterministic and independent of the machine. Every candidate examined is
+/// attributed to exactly one of the two estimates: a rebuild that happens
+/// inside a maintenance attempt — the fallback an update takes when it
+/// reaches negation or an unmaintainable aggregate — is charged to the
+/// rebuild estimate and excluded from the maintenance one, so a single event
+/// cannot move both estimates in opposite directions.
+///
+/// Estimates are fed the number of base facts an update *realized*, not the
+/// number of relations its caller named, because a batch that re-inserts
+/// facts the database already holds does proportionally less work than its
+/// size suggests.
+const CostModel = struct {
+    /// How often the model takes the path it currently believes is more
+    /// expensive, so that both estimates keep being refreshed.
+    const explore_interval: usize = 16;
+
+    const Decision = enum { maintain, recompute };
+
+    /// The work counter at the start of an attempt, and how much of it had
+    /// already been charged to the rebuild estimate.
+    const Span = struct { work: u64, rebuilt: u64 };
+
+    policy: MaintenancePolicy = .automatic,
+    /// Monotonic count of candidate facts examined, this model's unit.
+    work: u64 = 0,
+    /// The part of `work` already attributed to the rebuild estimate.
+    rebuilt_work: u64 = 0,
+    /// Observed cost of a stratum rebuild, and of maintaining one changed
+    /// base fact. Null until the database has observed one of each.
+    rebuild_work: ?u64 = null,
+    maintenance_work_per_fact: ?u64 = null,
+    maintain_choices: usize = 0,
+    recompute_choices: usize = 0,
+    decisions: usize = 0,
+
+    /// Counts one lookup's candidates. The extra unit prices the lookup
+    /// itself, so that a lookup returning nothing is not free.
+    fn noteCandidates(self: *CostModel, count: usize) void {
+        self.work +|= count + 1;
+    }
+
+    fn begin(self: *const CostModel) Span {
+        return .{ .work = self.work, .rebuilt = self.rebuilt_work };
+    }
+
+    /// Work observed during `span` that no nested rebuild already claimed.
+    /// A rebuild can only claim work counted inside the span that encloses
+    /// it, so the difference cannot go negative; it saturates rather than
+    /// trapping in case a future caller nests spans some other way.
+    fn elapsed(self: *const CostModel, span: Span) u64 {
+        return (self.work - span.work) -| (self.rebuilt_work - span.rebuilt);
+    }
+
+    /// Chooses a path for an update expected to change `estimated_facts` base
+    /// facts, and records the choice. Callers consult this only when
+    /// maintenance is possible at all: a dirty closure must be repaired
+    /// regardless of cost, and that repair is not a decision.
+    ///
+    /// Maintenance cost is unknown until one batch has been maintained, so
+    /// the first decision always maintains in order to measure it. Scaling
+    /// the per-fact estimate by the batch size overstates large batches,
+    /// because maintenance also carries costs that do not grow with the
+    /// batch; that bias favours recomputation for large batches, which is the
+    /// safe direction.
+    fn decide(self: *CostModel, estimated_facts: usize) Decision {
+        const choice = self.choose(estimated_facts);
+        // An update that changes nothing costs nothing either way, so it is
+        // not a decision and must not be counted as one.
+        if (estimated_facts > 0) switch (choice) {
+            .maintain => self.maintain_choices += 1,
+            .recompute => self.recompute_choices += 1,
+        };
+        return choice;
+    }
+
+    fn choose(self: *CostModel, estimated_facts: usize) Decision {
+        switch (self.policy) {
+            .incremental => return .maintain,
+            .recompute => return .recompute,
+            .automatic => {},
+        }
+        if (estimated_facts == 0) return .maintain;
+        self.decisions += 1;
+        // Bootstrap: measure each path once before trusting either estimate.
+        if (self.maintenance_work_per_fact == null) return .maintain;
+        const rebuild_estimate = self.rebuild_work orelse return .recompute;
+        const per_fact = self.maintenance_work_per_fact.?;
+        const cheaper: Decision = if (per_fact *| estimated_facts < rebuild_estimate)
+            .maintain
+        else
+            .recompute;
+        // Periodically take the rejected path so both estimates stay fresh.
+        // Without this only the winner's estimate is ever updated, and an
+        // initial full build permanently overstates what a dirty-stratum
+        // rebuild would actually cost.
+        if (self.decisions % explore_interval == 0)
+            return if (cheaper == .maintain) .recompute else .maintain;
+        return cheaper;
+    }
+
+    /// Records what maintaining `realized_facts` base changes cost.
+    fn noteMaintenance(self: *CostModel, realized_facts: usize, span: Span) void {
+        if (realized_facts == 0) return;
+        self.maintenance_work_per_fact = blendWork(
+            self.maintenance_work_per_fact,
+            self.elapsed(span) / realized_facts,
+        );
+    }
+
+    /// Records what a stratum rebuild cost, and claims that work so an
+    /// enclosing maintenance attempt does not also count it.
+    fn noteRebuild(self: *CostModel, span: Span) void {
+        const observed = self.work - span.work;
+        self.rebuilt_work +|= observed;
+        self.rebuild_work = blendWork(self.rebuild_work, observed);
+    }
+};
 
 /// How a batch's changed predicates affect one stratum's maintenance.
 const StratumImpact = enum { none, aggregate, rebuild };
@@ -746,16 +864,8 @@ pub const Jatalog = struct {
     maintained_groups: usize = 0,
     /// Debug mode: verify every maintained closure against a fresh rebuild.
     shadow_verification: bool = false,
-    policy: MaintenancePolicy = .automatic,
-    /// Monotonic count of candidate facts examined, the cost model's unit.
-    work: u64 = 0,
-    /// Observed work of a closure rebuild, and of maintaining one changed
-    /// base fact. Both are learned from this database's own history.
-    rebuild_work: ?u64 = null,
-    maintenance_work_per_fact: ?u64 = null,
-    recompute_choices: usize = 0,
-    maintain_choices: usize = 0,
-    decisions: usize = 0,
+    /// Chooses between maintaining and recomputing, and learns both costs.
+    cost: CostModel = .{},
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
         return .{
@@ -810,13 +920,7 @@ pub const Jatalog = struct {
         result.rebuild_fallbacks = self.rebuild_fallbacks;
         result.maintained_groups = self.maintained_groups;
         result.shadow_verification = self.shadow_verification;
-        result.policy = self.policy;
-        result.work = self.work;
-        result.rebuild_work = self.rebuild_work;
-        result.maintenance_work_per_fact = self.maintenance_work_per_fact;
-        result.recompute_choices = self.recompute_choices;
-        result.maintain_choices = self.maintain_choices;
-        result.decisions = self.decisions;
+        result.cost = self.cost;
         errdefer {
             for (result.auxiliary.items) |*view| view.deinit(self.allocator);
             result.auxiliary.deinit(self.allocator);
@@ -868,21 +972,21 @@ pub const Jatalog = struct {
             try copyFactInto(committed.allocator, &removed, fact, false);
             committed.facts.removeAt(index);
         }
+        // Retraction resolves its goals before deciding, so unlike a batch it
+        // knows exactly how many base facts it changes: the estimate the
+        // model decides on and the count it later measures are the same.
         const delta = removed.len();
-        const can_maintain = committed.closure != null and committed.materialization == .clean;
-        const maintain = can_maintain and committed.shouldMaintain(delta);
-        if (can_maintain and delta > 0) {
-            if (maintain) committed.maintain_choices += 1 else committed.recompute_choices += 1;
-        }
+        const maintain = committed.canMaintain() and
+            committed.cost.decide(delta) == .maintain;
         if (maintain and delta > 0) {
-            const work_before = committed.work;
+            const span = committed.cost.begin();
             try committed.propagateDeletions(&removed);
             var touched: RelationStore = .init(committed.allocator);
             defer touched.deinit();
             for (0..removed.len()) |position|
                 try copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
             if (touched.len() > 0) try committed.maintainAggregates(&touched);
-            committed.noteMaintenanceWork(delta, committed.work - work_before);
+            committed.cost.noteMaintenance(delta, span);
         } else {
             for (0..removed.len()) |position| {
                 const fact = removed.factAt(position);
@@ -1019,48 +1123,14 @@ pub const Jatalog = struct {
     /// `.automatic`; pin `.incremental` or `.recompute` when a caller needs
     /// one specific path regardless of cost.
     pub fn setMaintenancePolicy(self: *Jatalog, policy: MaintenancePolicy) void {
-        self.policy = policy;
+        self.cost.policy = policy;
     }
 
-    /// Decides whether a batch of `delta_facts` base changes is cheaper to
-    /// maintain than to recompute.
-    ///
-    /// Both estimates are learned from this database's own history in units
-    /// of candidate facts examined, which makes the decision deterministic
-    /// and independent of the machine. Rebuild cost is seeded by the first
-    /// materialization; maintenance cost is unknown until one batch has been
-    /// maintained, so the first batch always maintains in order to measure
-    /// it. Scaling the per-fact maintenance estimate by the batch size
-    /// overstates large batches, because maintenance also carries costs that
-    /// do not grow with the batch; that bias favours recomputation for large
-    /// batches, which is the safe direction.
-    fn shouldMaintain(self: *Jatalog, delta_facts: usize) bool {
-        switch (self.policy) {
-            .incremental => return true,
-            .recompute => return false,
-            .automatic => {},
-        }
-        if (delta_facts == 0) return true;
-        self.decisions += 1;
-        // Bootstrap: measure each path once before trusting either estimate.
-        if (self.maintenance_work_per_fact == null) return true;
-        const rebuild_estimate = self.rebuild_work orelse return false;
-        const per_fact = self.maintenance_work_per_fact.?;
-        const cheaper = per_fact *| delta_facts < rebuild_estimate;
-        // Periodically take the rejected path so both estimates stay fresh.
-        // Without this only the winner's estimate is ever updated, and an
-        // initial full build permanently overstates what a dirty-stratum
-        // rebuild would actually cost.
-        if (self.decisions % explore_interval == 0) return !cheaper;
-        return cheaper;
-    }
-
-    fn noteMaintenanceWork(self: *Jatalog, delta_facts: usize, observed: u64) void {
-        if (delta_facts == 0) return;
-        self.maintenance_work_per_fact = blendWork(
-            self.maintenance_work_per_fact,
-            observed / delta_facts,
-        );
+    /// Whether the closure is in a state incremental maintenance can start
+    /// from. A dirty closure has to be repaired regardless of cost, so the
+    /// cost model is consulted only when this holds.
+    fn canMaintain(self: *const Jatalog) bool {
+        return self.closure != null and self.materialization == .clean;
     }
 
     /// Compares the maintained closure against a rebuild performed on a
@@ -1083,15 +1153,12 @@ pub const Jatalog = struct {
         insertions: []const input.Relation,
         deletions: []const input.Relation,
     ) !bool {
-        // The model is only consulted when maintenance is possible at all;
-        // a dirty closure has to be repaired regardless of cost. Both phases
-        // then follow the one decision.
-        const can_maintain = self.closure != null and self.materialization == .clean;
-        const maintain = can_maintain and self.shouldMaintain(insertions.len + deletions.len);
-        if (can_maintain) {
-            if (maintain) self.maintain_choices += 1 else self.recompute_choices += 1;
-        }
-        const work_before = self.work;
+        // Both phases follow the one decision. The batch size is only an
+        // estimate of the work ahead; what it actually changed is measured
+        // afterwards.
+        const maintain = self.canMaintain() and
+            self.cost.decide(insertions.len + deletions.len) == .maintain;
+        const span = self.cost.begin();
 
         // Facts the aggregate phase must reconsider: every fact this batch
         // took out of the closure, and every fact it derived into it.
@@ -1102,8 +1169,7 @@ pub const Jatalog = struct {
         if (touched.len() > 0) try self.maintainAggregates(&touched);
 
         const realized = deleted + inserted;
-        if (maintain and realized > 0)
-            self.noteMaintenanceWork(insertions.len + deletions.len, self.work - work_before);
+        if (maintain) self.cost.noteMaintenance(realized, span);
         return realized > 0;
     }
 
@@ -2171,11 +2237,11 @@ pub const Jatalog = struct {
             .stratum_expansions = self.expansions,
             .rebuild_fallbacks = self.rebuild_fallbacks,
             .maintained_groups = self.maintained_groups,
-            .policy = self.policy,
-            .maintain_choices = self.maintain_choices,
-            .recompute_choices = self.recompute_choices,
-            .rebuild_work = self.rebuild_work,
-            .maintenance_work_per_fact = self.maintenance_work_per_fact,
+            .policy = self.cost.policy,
+            .maintain_choices = self.cost.maintain_choices,
+            .recompute_choices = self.cost.recompute_choices,
+            .rebuild_work = self.cost.rebuild_work,
+            .maintenance_work_per_fact = self.cost.maintenance_work_per_fact,
             .self_maintainable_views = self_maintainable,
             .projected_views = projected,
             .auxiliary_tuples = auxiliary_tuples,
@@ -2432,13 +2498,15 @@ pub const Jatalog = struct {
         // and much larger operation, so recording it would permanently
         // overstate what recomputation costs.
         const repairs_update = self.materialization == .dirty_from_stratum;
-        const work_before = self.work;
+        const span = self.cost.begin();
         const closure = try self.buildClosure(from_level);
         if (self.closure) |*old| old.deinit();
         self.closure = closure;
         self.materialization = .clean;
         try self.rebuildAuxiliaryViews();
-        if (repairs_update) self.rebuild_work = blendWork(self.rebuild_work, self.work - work_before);
+        // This also runs as the fallback inside a maintenance attempt, where
+        // claiming the work keeps it out of the maintenance estimate.
+        if (repairs_update) self.cost.noteRebuild(span);
     }
 
     fn buildClosure(self: *Jatalog, from_level: usize) !RelationStore {
@@ -2797,7 +2865,7 @@ pub const Jatalog = struct {
         // Candidate examination dominates both maintenance and rebuild, so
         // counting candidates is the cost model's unit of work. It is a
         // deterministic, machine-independent proxy for elapsed time.
-        self.work +|= candidates.len + 1;
+        self.cost.noteCandidates(candidates.len);
         return candidates;
     }
 
@@ -5409,6 +5477,100 @@ fn runPolicyTrace(db: *Jatalog, policy: MaintenancePolicy) !void {
         _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
     }
     try db.materialize();
+}
+
+/// Program used by the cost-attribution tests below: a transitive closure
+/// small enough that one edge change is cheap to maintain.
+const cost_attribution_program =
+    \\edge(a, b). edge(b, c).
+    \\path(X, Y) :- edge(X, Y).
+    \\path(X, Z) :- edge(X, Y), path(Y, Z).
+;
+
+test "an empty update is not a maintenance decision" {
+    // Nothing to do costs nothing either way, so there is no cheaper path to
+    // pick and nothing to learn from having picked it. Asserted against the
+    // model directly: both callers wrap the decision in a transaction that is
+    // discarded when the update changes nothing, so a miscount there would
+    // never reach a committed database and no test through the public API can
+    // tell the two behaviours apart.
+    var model: CostModel = .{};
+    try std.testing.expectEqual(CostModel.Decision.maintain, model.decide(0));
+    try std.testing.expectEqual(@as(usize, 0), model.maintain_choices);
+    try std.testing.expectEqual(@as(usize, 0), model.recompute_choices);
+    try std.testing.expectEqual(@as(usize, 0), model.decisions);
+
+    // A real update is a decision and is counted.
+    _ = model.decide(1);
+    try std.testing.expectEqual(@as(usize, 1), model.maintain_choices);
+}
+
+test "the maintenance estimate counts facts changed, not facts named" {
+    const new_edge = input.fact("edge", &.{ input.atom("c"), input.atom("d") });
+
+    var lean: Jatalog = .init(std.testing.allocator);
+    defer lean.deinit();
+    lean.setMaintenancePolicy(.incremental);
+    var lean_setup = try lean.execute(cost_attribution_program);
+    lean_setup.deinit();
+    try lean.materialize();
+    _ = try lean.applyChanges(&.{new_edge}, &.{});
+
+    var padded: Jatalog = .init(std.testing.allocator);
+    defer padded.deinit();
+    padded.setMaintenancePolicy(.incremental);
+    var padded_setup = try padded.execute(cost_attribution_program);
+    padded_setup.deinit();
+    try padded.materialize();
+    // The same single real insertion, named alongside deletions of facts the
+    // database does not hold. Deleting an absent fact is a no-op, so the cost
+    // per changed fact must match the lean batch rather than being divided by
+    // the number of relations the caller happened to name.
+    _ = try padded.applyChanges(&.{new_edge}, &.{
+        input.fact("edge", &.{ input.atom("p"), input.atom("q") }),
+        input.fact("edge", &.{ input.atom("q"), input.atom("r") }),
+        input.fact("edge", &.{ input.atom("r"), input.atom("s") }),
+        input.fact("edge", &.{ input.atom("s"), input.atom("t") }),
+        input.fact("edge", &.{ input.atom("t"), input.atom("u") }),
+        input.fact("edge", &.{ input.atom("u"), input.atom("v") }),
+        input.fact("edge", &.{ input.atom("v"), input.atom("w") }),
+    });
+
+    try std.testing.expectEqual(
+        lean.maintenanceStats().maintenance_work_per_fact,
+        padded.maintenanceStats().maintenance_work_per_fact,
+    );
+}
+
+test "a rebuild fallback is charged to the rebuild estimate, not to maintenance" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    db.setMaintenancePolicy(.incremental);
+    var setup = try db.execute(
+        \\node(a). node(b). node(c). node(d). node(e). edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\isolated(X) :- node(X), not path(a, X).
+    );
+    setup.deinit();
+    try db.materialize();
+
+    // Deleting this edge over-deletes path facts that reach `isolated`
+    // through negation, so delete-and-rederive abandons the incremental path
+    // and rebuilds. The rebuild is real work, but it is recomputation work:
+    // charging it to the maintenance estimate as well would let one event
+    // push both estimates in opposite directions.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
+    }));
+    const stats = db.maintenanceStats();
+    try std.testing.expect(stats.rebuild_fallbacks > 0);
+    try std.testing.expect(stats.rebuild_work != null);
+    try std.testing.expect(stats.maintenance_work_per_fact != null);
+    // One base fact changed, so the per-fact estimate is the whole measured
+    // maintenance cost. With the rebuild excluded it is only the abandoned
+    // over-deletion attempt, which is far cheaper than the rebuild itself.
+    try std.testing.expect(stats.maintenance_work_per_fact.? < stats.rebuild_work.?);
 }
 
 test "the cost model changes the path taken but never the result" {
