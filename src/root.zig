@@ -4,12 +4,9 @@ const scalar = @import("scalar.zig");
 pub const input = @import("input.zig");
 const input_compiler = @import("input_compiler.zig");
 const relation_store = @import("relation_store.zig");
-
-const Id = u64;
-const ValueId = u64;
-const Fact = relation_store.Fact;
-const PredicateKey = relation_store.PredicateKey;
-const RelationStore = relation_store.RelationStore;
+const cost_model = @import("cost_model.zig");
+const syntax = @import("syntax.zig");
+const results = @import("results.zig");
 pub const Error = error{
     InvalidFact,
     InvalidRule,
@@ -28,6 +25,62 @@ pub const Error = error{
     /// fresh rebuild. Only reachable with `setShadowVerification(true)`.
     MaintenanceMismatch,
 };
+
+const Fact = relation_store.Fact;
+const ResultNode = results.ResultNode;
+const ResultCons = results.ResultCons;
+pub const ResultValue = results.ResultValue;
+const isProperResultList = results.isProperResultList;
+const freeResultNode = results.freeResultNode;
+pub const Answer = results.Answer;
+pub const QueryResult = results.QueryResult;
+pub const ExecutionResult = results.ExecutionResult;
+const Id = syntax.Id;
+const ValueId = syntax.ValueId;
+const Term = syntax.Term;
+const GoalKind = syntax.GoalKind;
+const Expr = syntax.Expr;
+const Rule = syntax.Rule;
+const DeltaConstraint = syntax.DeltaConstraint;
+const Aggregate = syntax.Aggregate;
+const Clause = syntax.Clause;
+const Binding = syntax.Binding;
+const predicateKey = syntax.predicateKey;
+const outerClauses = syntax.outerClauses;
+const maintainableAggregateIndex = syntax.maintainableAggregateIndex;
+const clausesReadGrownAnywhere = syntax.clausesReadGrownAnywhere;
+const clausesReadGrownNonPositively = syntax.clausesReadGrownNonPositively;
+const noteBodyDependencies = syntax.noteBodyDependencies;
+const freeExpr = syntax.freeExpr;
+const freeRule = syntax.freeRule;
+const cloneTerm = syntax.cloneTerm;
+const cloneExpr = syntax.cloneExpr;
+const cloneClause = syntax.cloneClause;
+const cloneRule = syntax.cloneRule;
+const freeClauseTree = syntax.freeClauseTree;
+const freeTerm = syntax.freeTerm;
+const termVariablesBound = syntax.termVariablesBound;
+const bindTermVariables = syntax.bindTermVariables;
+const collectTermVariables = syntax.collectTermVariables;
+const collectExprVariables = syntax.collectExprVariables;
+const collectClauseSurfaceVariables = syntax.collectClauseSurfaceVariables;
+const collectClauseAllVariables = syntax.collectClauseAllVariables;
+const isVariable = syntax.isVariable;
+const goalKind = syntax.goalKind;
+const goalOperator = syntax.goalOperator;
+const termContainsCons = syntax.termContainsCons;
+const termEqual = syntax.termEqual;
+const isTailDescendant = syntax.isTailDescendant;
+const bindingsEqual = syntax.bindingsEqual;
+const classifyExpr = syntax.classifyExpr;
+const ruleContainsArithmetic = syntax.ruleContainsArithmetic;
+const isBuiltin = syntax.isBuiltin;
+const isArithmetic = syntax.isArithmetic;
+const CostModel = cost_model.CostModel;
+/// Re-exported so callers select a policy without importing the model.
+pub const MaintenancePolicy = cost_model.MaintenancePolicy;
+const PredicateKey = relation_store.PredicateKey;
+const RelationStore = relation_store.RelationStore;
 
 /// Interns predicate and variable symbols used by a database. IDs are
 /// insertion indexes, which makes `resolve` a reverse lookup into the ordered
@@ -159,213 +212,6 @@ const InputBuilder = struct {
     }
 };
 
-const Term = union(enum) {
-    scalar: scalar.Id,
-    variable: Id,
-    nil,
-    cons: *Cons,
-
-    pub const Cons = struct {
-        head: Term,
-        tail: Term,
-    };
-
-    fn isGround(self: Term) bool {
-        return switch (self) {
-            .variable => false,
-            .cons => |pair| pair.head.isGround() and pair.tail.isGround(),
-            else => true,
-        };
-    }
-};
-
-const GoalKind = enum {
-    relation,
-    equality,
-    inequality,
-    less_than,
-    less_or_equal,
-    greater_than,
-    greater_or_equal,
-    add,
-    subtract,
-};
-
-const Expr = struct {
-    predicate: Id,
-    terms: []Term,
-    negated: bool = false,
-    kind: GoalKind = .relation,
-
-    fn arity(self: Expr) usize {
-        return self.terms.len;
-    }
-
-    fn isGround(self: Expr) bool {
-        for (self.terms) |term| if (!term.isGround()) return false;
-        return true;
-    }
-};
-
-const Rule = struct {
-    /// Stable database-local identifier; body occurrences are identified by
-    /// `(id, clause index)`. Ids survive cloning and are never reused.
-    id: u32 = 0,
-    head: Expr,
-    body: []Clause,
-    seed_argument: ?usize = null,
-};
-
-/// Restricts one relational body occurrence to facts appended during the
-/// previous semi-naive round.
-const DeltaConstraint = struct {
-    clause_index: usize,
-    delta_start: usize,
-    delta_end: usize,
-};
-
-/// Chooses between maintaining the closure incrementally and recomputing
-/// the affected strata. Both paths produce the same database, so this is
-/// purely a cost decision.
-pub const MaintenancePolicy = enum {
-    /// Estimate both costs from observed work and take the cheaper path.
-    automatic,
-    /// Always maintain incrementally when the closure is clean.
-    incremental,
-    /// Always mark the affected strata dirty and recompute them.
-    recompute,
-};
-
-/// Folds a new observation into a running estimate, halving the weight of
-/// history each time so the model tracks a changing workload within a few
-/// updates while still damping a single unusual batch.
-fn blendWork(current: ?u64, observed: u64) u64 {
-    const previous = current orelse return observed;
-    return (previous +| observed) / 2;
-}
-
-/// Chooses between maintaining and recomputing, and learns what each costs
-/// from this database's own history.
-///
-/// Work is counted in candidate facts examined, which makes the decision
-/// deterministic and independent of the machine. Every candidate examined is
-/// attributed to exactly one of the two estimates: a rebuild that happens
-/// inside a maintenance attempt — the fallback an update takes when it
-/// reaches negation or an unmaintainable aggregate — is charged to the
-/// rebuild estimate and excluded from the maintenance one, so a single event
-/// cannot move both estimates in opposite directions.
-///
-/// Estimates are fed the number of base facts an update *realized*, not the
-/// number of relations its caller named, because a batch that re-inserts
-/// facts the database already holds does proportionally less work than its
-/// size suggests.
-const CostModel = struct {
-    /// How often the model takes the path it currently believes is more
-    /// expensive, so that both estimates keep being refreshed.
-    const explore_interval: usize = 16;
-
-    const Decision = enum { maintain, recompute };
-
-    /// The work counter at the start of an attempt, and how much of it had
-    /// already been charged to the rebuild estimate.
-    const Span = struct { work: u64, rebuilt: u64 };
-
-    policy: MaintenancePolicy = .automatic,
-    /// Monotonic count of candidate facts examined, this model's unit.
-    work: u64 = 0,
-    /// The part of `work` already attributed to the rebuild estimate.
-    rebuilt_work: u64 = 0,
-    /// Observed cost of a stratum rebuild, and of maintaining one changed
-    /// base fact. Null until the database has observed one of each.
-    rebuild_work: ?u64 = null,
-    maintenance_work_per_fact: ?u64 = null,
-    maintain_choices: usize = 0,
-    recompute_choices: usize = 0,
-    decisions: usize = 0,
-
-    /// Counts one lookup's candidates. The extra unit prices the lookup
-    /// itself, so that a lookup returning nothing is not free.
-    fn noteCandidates(self: *CostModel, count: usize) void {
-        self.work +|= count + 1;
-    }
-
-    fn begin(self: *const CostModel) Span {
-        return .{ .work = self.work, .rebuilt = self.rebuilt_work };
-    }
-
-    /// Work observed during `span` that no nested rebuild already claimed.
-    /// A rebuild can only claim work counted inside the span that encloses
-    /// it, so the difference cannot go negative; it saturates rather than
-    /// trapping in case a future caller nests spans some other way.
-    fn elapsed(self: *const CostModel, span: Span) u64 {
-        return (self.work - span.work) -| (self.rebuilt_work - span.rebuilt);
-    }
-
-    /// Chooses a path for an update expected to change `estimated_facts` base
-    /// facts, and records the choice. Callers consult this only when
-    /// maintenance is possible at all: a dirty closure must be repaired
-    /// regardless of cost, and that repair is not a decision.
-    ///
-    /// Maintenance cost is unknown until one batch has been maintained, so
-    /// the first decision always maintains in order to measure it. Scaling
-    /// the per-fact estimate by the batch size overstates large batches,
-    /// because maintenance also carries costs that do not grow with the
-    /// batch; that bias favours recomputation for large batches, which is the
-    /// safe direction.
-    fn decide(self: *CostModel, estimated_facts: usize) Decision {
-        const choice = self.choose(estimated_facts);
-        // An update that changes nothing costs nothing either way, so it is
-        // not a decision and must not be counted as one.
-        if (estimated_facts > 0) switch (choice) {
-            .maintain => self.maintain_choices += 1,
-            .recompute => self.recompute_choices += 1,
-        };
-        return choice;
-    }
-
-    fn choose(self: *CostModel, estimated_facts: usize) Decision {
-        switch (self.policy) {
-            .incremental => return .maintain,
-            .recompute => return .recompute,
-            .automatic => {},
-        }
-        if (estimated_facts == 0) return .maintain;
-        self.decisions += 1;
-        // Bootstrap: measure each path once before trusting either estimate.
-        if (self.maintenance_work_per_fact == null) return .maintain;
-        const rebuild_estimate = self.rebuild_work orelse return .recompute;
-        const per_fact = self.maintenance_work_per_fact.?;
-        const cheaper: Decision = if (per_fact *| estimated_facts < rebuild_estimate)
-            .maintain
-        else
-            .recompute;
-        // Periodically take the rejected path so both estimates stay fresh.
-        // Without this only the winner's estimate is ever updated, and an
-        // initial full build permanently overstates what a dirty-stratum
-        // rebuild would actually cost.
-        if (self.decisions % explore_interval == 0)
-            return if (cheaper == .maintain) .recompute else .maintain;
-        return cheaper;
-    }
-
-    /// Records what maintaining `realized_facts` base changes cost.
-    fn noteMaintenance(self: *CostModel, realized_facts: usize, span: Span) void {
-        if (realized_facts == 0) return;
-        self.maintenance_work_per_fact = blendWork(
-            self.maintenance_work_per_fact,
-            self.elapsed(span) / realized_facts,
-        );
-    }
-
-    /// Records what a stratum rebuild cost, and claims that work so an
-    /// enclosing maintenance attempt does not also count it.
-    fn noteRebuild(self: *CostModel, span: Span) void {
-        const observed = self.work - span.work;
-        self.rebuilt_work +|= observed;
-        self.rebuild_work = blendWork(self.rebuild_work, observed);
-    }
-};
-
 /// How a batch's changed predicates affect one stratum's maintenance.
 const StratumImpact = enum { none, aggregate, rebuild };
 
@@ -412,40 +258,6 @@ const AuxiliaryView = struct {
     }
 };
 
-/// The rule's body with the clause at `skip_index` removed: the outer goals
-/// of an aggregate rule, or the body occurrences that remain to be joined
-/// when over-deleting through one occurrence. The clauses themselves are
-/// borrowed from the rule; the caller owns only the returned slice.
-fn outerClauses(allocator: std.mem.Allocator, rule: Rule, skip_index: usize) ![]Clause {
-    const result = try allocator.alloc(Clause, rule.body.len - 1);
-    var count: usize = 0;
-    for (rule.body, 0..) |clause, index| {
-        if (index == skip_index) continue;
-        result[count] = clause;
-        count += 1;
-    }
-    return result;
-}
-
-/// Returns the body index of the single unnested `setof` occurrence a rule
-/// can have maintained incrementally, or null when the rule falls outside
-/// the maintainable class and needs the rebuild fallback: no aggregate,
-/// several aggregates, a nested aggregate, or seeded structural recursion.
-fn maintainableAggregateIndex(rule: Rule) ?usize {
-    if (rule.seed_argument != null) return null;
-    var found: ?usize = null;
-    for (rule.body, 0..) |clause, index| {
-        const aggregate = switch (clause) {
-            .aggregate => |value| value,
-            else => continue,
-        };
-        if (found != null) return null;
-        for (aggregate.body) |inner| if (inner == .aggregate) return null;
-        found = index;
-    }
-    return found;
-}
-
 /// Inserts a copy of `fact` into `store`, which takes ownership of the copied
 /// terms. The single place the database duplicates a fact between stores.
 fn copyFactInto(
@@ -488,15 +300,6 @@ fn collectPredicateKeys(
         const fact = store.factAt(index);
         try keys.put(allocator, .{ .name = fact.predicate, .arity = fact.terms.len }, {});
     }
-}
-
-fn bindingsEqual(left: *const Binding, right: *const Binding) bool {
-    if (left.values.count() != right.values.count()) return false;
-    for (left.values.keys(), left.values.values()) |variable, value| {
-        const other = right.values.get(variable) orelse return false;
-        if (other != value) return false;
-    }
-    return true;
 }
 
 const Materialization = union(enum) {
@@ -545,252 +348,6 @@ fn ruleStratum(
     return levels.get(predicateKey(rule.head)) orelse 0;
 }
 
-const Aggregate = struct {
-    template: Term,
-    body: []Clause,
-    output: Term,
-};
-
-const Clause = union(enum) {
-    relational: Expr,
-    builtin: Expr,
-    negated: Expr,
-    aggregate: Aggregate,
-};
-
-fn noteBodyDependencies(
-    allocator: std.mem.Allocator,
-    body: []const Clause,
-    head_level: usize,
-    first_dependent: *std.array_hash_map.Auto(PredicateKey, usize),
-) !void {
-    for (body) |clause| switch (clause) {
-        .relational, .negated => |expression| {
-            const entry = try first_dependent.getOrPut(allocator, predicateKey(expression));
-            if (!entry.found_existing or entry.value_ptr.* > head_level)
-                entry.value_ptr.* = head_level;
-        },
-        .builtin => {},
-        .aggregate => |aggregate| try noteBodyDependencies(
-            allocator,
-            aggregate.body,
-            head_level,
-            first_dependent,
-        ),
-    };
-}
-
-fn clausesReadGrownNonPositively(
-    body: []const Clause,
-    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
-) bool {
-    for (body) |clause| switch (clause) {
-        .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
-        .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, grown)) return true,
-        .relational, .builtin => {},
-    };
-    return false;
-}
-
-fn clausesReadGrownAnywhere(
-    body: []const Clause,
-    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
-) bool {
-    for (body) |clause| switch (clause) {
-        .relational, .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
-        .aggregate => |aggregate| if (clausesReadGrownAnywhere(aggregate.body, grown)) return true,
-        .builtin => {},
-    };
-    return false;
-}
-
-fn predicateKey(expression: Expr) PredicateKey {
-    return .{ .name = expression.predicate, .arity = expression.terms.len };
-}
-
-const Binding = struct {
-    values: std.array_hash_map.Auto(Id, ValueId) = .empty,
-
-    pub fn deinit(self: *Binding, allocator: std.mem.Allocator) void {
-        self.values.deinit(allocator);
-        self.* = undefined;
-    }
-
-    fn clone(self: *const Binding, allocator: std.mem.Allocator) !Binding {
-        return .{ .values = try self.values.clone(allocator) };
-    }
-};
-
-const ResultNode = union(enum) {
-    atom: []u8,
-    integer: i64,
-    float: f64,
-    nil,
-    cons: *ResultCons,
-};
-
-const ResultCons = struct {
-    head: *ResultNode,
-    tail: *ResultNode,
-};
-
-pub const ResultValue = struct {
-    node: *const ResultNode,
-
-    pub const Kind = enum { atom, integer, float, nil, cons };
-
-    pub fn kind(self: ResultValue) Kind {
-        return switch (self.node.*) {
-            .atom => .atom,
-            .integer => .integer,
-            .float => .float,
-            .nil => .nil,
-            .cons => .cons,
-        };
-    }
-
-    pub fn getAtom(self: ResultValue) Error![]const u8 {
-        return switch (self.node.*) {
-            .atom => |value| value,
-            else => Error.TypeMismatch,
-        };
-    }
-
-    pub fn getInteger(self: ResultValue) Error!i64 {
-        return switch (self.node.*) {
-            .integer => |value| value,
-            else => Error.TypeMismatch,
-        };
-    }
-
-    pub fn getFloat(self: ResultValue) Error!f64 {
-        return switch (self.node.*) {
-            .float => |value| value,
-            else => Error.TypeMismatch,
-        };
-    }
-
-    pub fn head(self: ResultValue) Error!ResultValue {
-        return switch (self.node.*) {
-            .cons => |pair| .{ .node = pair.head },
-            else => Error.TypeMismatch,
-        };
-    }
-
-    pub fn tail(self: ResultValue) Error!ResultValue {
-        return switch (self.node.*) {
-            .cons => |pair| .{ .node = pair.tail },
-            else => Error.TypeMismatch,
-        };
-    }
-
-    pub fn formatAlloc(self: ResultValue, allocator: std.mem.Allocator) ![]u8 {
-        var output: std.Io.Writer.Allocating = .init(allocator);
-        defer output.deinit();
-        self.write(&output.writer) catch return error.OutOfMemory;
-        return output.toOwnedSlice();
-    }
-
-    pub fn write(self: ResultValue, writer: *std.Io.Writer) !void {
-        switch (self.node.*) {
-            .atom => |value| {
-                try scalar.writeAtom(writer, value);
-            },
-            .integer => |value| try writer.print("{d}", .{value}),
-            .float => |value| try scalar.writeFloat(writer, value),
-            .nil => try writer.writeAll("[]"),
-            .cons => |pair| if (isProperResultList(self.node)) {
-                try writer.writeByte('[');
-                var current = self.node;
-                var first = true;
-                while (current.* == .cons) {
-                    if (!first) try writer.writeAll(", ");
-                    try (ResultValue{ .node = current.cons.head }).write(writer);
-                    current = current.cons.tail;
-                    first = false;
-                }
-                try writer.writeByte(']');
-            } else {
-                try writer.writeAll("cons(");
-                try (ResultValue{ .node = pair.head }).write(writer);
-                try writer.writeAll(", ");
-                try (ResultValue{ .node = pair.tail }).write(writer);
-                try writer.writeByte(')');
-            },
-        }
-    }
-};
-
-fn isProperResultList(root: *const ResultNode) bool {
-    var current = root;
-    while (true) switch (current.*) {
-        .nil => return true,
-        .cons => |pair| current = pair.tail,
-        else => return false,
-    };
-}
-
-fn freeResultNode(allocator: std.mem.Allocator, node: *ResultNode) void {
-    switch (node.*) {
-        .atom => |atom| allocator.free(atom),
-        .integer, .float, .nil => {},
-        .cons => |pair| {
-            freeResultNode(allocator, pair.head);
-            freeResultNode(allocator, pair.tail);
-            allocator.destroy(pair);
-        },
-    }
-    allocator.destroy(node);
-}
-
-pub const Answer = struct {
-    allocator: std.mem.Allocator,
-    bindings: std.ArrayList(ResultBinding) = .empty,
-
-    pub const ResultBinding = struct {
-        name: []u8,
-        value: ResultValue,
-    };
-
-    fn deinit(self: *Answer) void {
-        for (self.bindings.items) |binding| {
-            self.allocator.free(binding.name);
-            freeResultNode(self.allocator, @constCast(binding.value.node));
-        }
-        self.bindings.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn getValue(self: *const Answer, variable: []const u8) Error!ResultValue {
-        for (self.bindings.items) |binding|
-            if (std.mem.eql(u8, binding.name, variable)) return binding.value;
-        return Error.UnknownVariable;
-    }
-
-    pub fn getAtom(self: *const Answer, variable: []const u8) Error![]const u8 {
-        return (try self.getValue(variable)).getAtom();
-    }
-
-    pub fn getInteger(self: *const Answer, variable: []const u8) Error!i64 {
-        return (try self.getValue(variable)).getInteger();
-    }
-
-    pub fn getFloat(self: *const Answer, variable: []const u8) Error!f64 {
-        return (try self.getValue(variable)).getFloat();
-    }
-};
-
-pub const QueryResult = struct {
-    allocator: std.mem.Allocator,
-    answers: std.ArrayList(Answer) = .empty,
-
-    pub fn deinit(self: *QueryResult) void {
-        for (self.answers.items) |*answer| answer.deinit();
-        self.answers.deinit(self.allocator);
-        self.* = undefined;
-    }
-};
-
 pub const MaintenanceStats = struct {
     closure_facts: usize,
     /// Facts added to the closure by incremental insertion propagation.
@@ -816,20 +373,6 @@ pub const MaintenanceStats = struct {
     /// and therefore need auxiliary derivation counts.
     projected_views: usize,
     auxiliary_tuples: usize,
-};
-
-pub const ExecutionResult = union(enum) {
-    none,
-    changed: bool,
-    query: QueryResult,
-
-    pub fn deinit(self: *ExecutionResult) void {
-        switch (self.*) {
-            .query => |*result| result.deinit(),
-            else => {},
-        }
-        self.* = undefined;
-    }
 };
 
 pub const Jatalog = struct {
@@ -2109,12 +1652,6 @@ pub const Jatalog = struct {
         }
     }
 
-    fn classifyExpr(self: *const Jatalog, expression: Expr) Clause {
-        if (expression.negated) return .{ .negated = expression };
-        if (isBuiltin(self, expression)) return .{ .builtin = expression };
-        return .{ .relational = expression };
-    }
-
     /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
     /// their structural terms remain caller-owned and may be freed immediately
     /// after this function returns.
@@ -2808,7 +2345,7 @@ pub const Jatalog = struct {
             .builtin => |value| value,
             .negated => |value| value,
         };
-        if (isBuiltin(self, expression)) {
+        if (isBuiltin(expression)) {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
             const matched = try self.evalBuiltin(expression, &next);
@@ -2968,7 +2505,7 @@ pub const Jatalog = struct {
     }
 
     fn validateRule(self: *Jatalog, head: Expr, body: []const Clause) !?usize {
-        if (body.len == 0 or head.negated or isBuiltin(self, head)) return Error.InvalidRule;
+        if (body.len == 0 or head.negated or isBuiltin(head)) return Error.InvalidRule;
         const recursive_seed = try admissibleSeedArgument(head, body);
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
@@ -3043,7 +2580,7 @@ pub const Jatalog = struct {
 
     fn validateRecursiveArithmetic(self: *Jatalog) !void {
         for (self.rules.items) |rule| {
-            if (!self.ruleContainsArithmetic(rule)) continue;
+            if (!ruleContainsArithmetic(rule)) continue;
             const head = predicateKey(rule.head);
             for (rule.body) |clause| {
                 const expression = switch (clause) {
@@ -3058,14 +2595,6 @@ pub const Jatalog = struct {
                     return Error.NotAdmissible;
             }
         }
-    }
-
-    fn ruleContainsArithmetic(self: *const Jatalog, rule: Rule) bool {
-        for (rule.body) |clause| switch (clause) {
-            .builtin => |expression| if (isArithmetic(self, expression)) return true,
-            else => {},
-        };
-        return false;
     }
 
     fn predicateReaches(
@@ -3103,7 +2632,7 @@ pub const Jatalog = struct {
             .negated => |expression| for (expression.terms) |term|
                 if (!termVariablesBound(term, bound)) return safety_error,
             .builtin => |expression| {
-                if (isArithmetic(self, expression)) {
+                if (isArithmetic(expression)) {
                     if (expression.terms.len != 3 or
                         !termVariablesBound(expression.terms[1], bound) or
                         !termVariablesBound(expression.terms[2], bound)) return safety_error;
@@ -3177,7 +2706,7 @@ pub const Jatalog = struct {
         };
         for (clauses) |clause| switch (clause) {
             .builtin => |expression| {
-                if (isArithmetic(self, expression)) {
+                if (isArithmetic(expression)) {
                     result[index] = clause;
                     index += 1;
                 }
@@ -3194,7 +2723,7 @@ pub const Jatalog = struct {
                 index += 1;
             },
             .builtin => |expression| if (expression.negated or
-                (expression.kind != .equality and !isArithmetic(self, expression)))
+                (expression.kind != .equality and !isArithmetic(expression)))
             {
                 result[index] = clause;
                 index += 1;
@@ -3243,7 +2772,7 @@ pub const Jatalog = struct {
     ) !void {
         switch (clause) {
             .relational => |expression| try levels.put(self.allocator, predicateKey(expression), 0),
-            .negated => |expression| if (!isBuiltin(self, expression))
+            .negated => |expression| if (!isBuiltin(expression))
                 try levels.put(self.allocator, predicateKey(expression), 0),
             .builtin => {},
             .aggregate => |aggregate| for (aggregate.body) |body_clause|
@@ -3260,7 +2789,7 @@ pub const Jatalog = struct {
         return switch (clause) {
             .relational => |expression| (levels.get(predicateKey(expression)) orelse 0) +
                 @intFromBool(aggregate_context),
-            .negated => |expression| if (isBuiltin(self, expression))
+            .negated => |expression| if (isBuiltin(expression))
                 0
             else
                 (levels.get(predicateKey(expression)) orelse 0) + 1,
@@ -3393,252 +2922,6 @@ pub const Jatalog = struct {
         }
     }
 };
-
-fn freeExpr(allocator: std.mem.Allocator, value: Expr) void {
-    for (value.terms) |term| freeTerm(allocator, term);
-    allocator.free(value.terms);
-}
-
-fn freeRule(allocator: std.mem.Allocator, rule: Rule) void {
-    freeExpr(allocator, rule.head);
-    for (rule.body) |clause| freeClauseTree(allocator, clause);
-    allocator.free(rule.body);
-}
-
-fn cloneTerm(allocator: std.mem.Allocator, term: Term) !Term {
-    return switch (term) {
-        .cons => |pair| blk: {
-            const copy = try allocator.create(Term.Cons);
-            errdefer allocator.destroy(copy);
-            copy.head = try cloneTerm(allocator, pair.head);
-            errdefer freeTerm(allocator, copy.head);
-            copy.tail = try cloneTerm(allocator, pair.tail);
-            break :blk .{ .cons = copy };
-        },
-        else => term,
-    };
-}
-
-fn cloneExpr(allocator: std.mem.Allocator, expression: Expr) !Expr {
-    const terms = try allocator.alloc(Term, expression.terms.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (terms[0..initialized]) |term| freeTerm(allocator, term);
-        allocator.free(terms);
-    }
-    for (expression.terms, terms) |term, *copy| {
-        copy.* = try cloneTerm(allocator, term);
-        initialized += 1;
-    }
-    return .{
-        .predicate = expression.predicate,
-        .terms = terms,
-        .negated = expression.negated,
-        .kind = expression.kind,
-    };
-}
-
-fn cloneClause(allocator: std.mem.Allocator, clause: Clause) !Clause {
-    return switch (clause) {
-        .relational => |expression| .{ .relational = try cloneExpr(allocator, expression) },
-        .builtin => |expression| .{ .builtin = try cloneExpr(allocator, expression) },
-        .negated => |expression| .{ .negated = try cloneExpr(allocator, expression) },
-        .aggregate => |aggregate| blk: {
-            const template = try cloneTerm(allocator, aggregate.template);
-            errdefer freeTerm(allocator, template);
-            const output = try cloneTerm(allocator, aggregate.output);
-            errdefer freeTerm(allocator, output);
-            const body = try allocator.alloc(Clause, aggregate.body.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (body[0..initialized]) |body_clause| freeClauseTree(allocator, body_clause);
-                allocator.free(body);
-            }
-            for (aggregate.body, body) |body_clause, *copy| {
-                copy.* = try cloneClause(allocator, body_clause);
-                initialized += 1;
-            }
-            break :blk .{ .aggregate = .{ .template = template, .body = body, .output = output } };
-        },
-    };
-}
-
-fn cloneRule(allocator: std.mem.Allocator, rule: Rule) !Rule {
-    const head = try cloneExpr(allocator, rule.head);
-    errdefer freeExpr(allocator, head);
-    const body = try allocator.alloc(Clause, rule.body.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (body[0..initialized]) |clause| freeClauseTree(allocator, clause);
-        allocator.free(body);
-    }
-    for (rule.body, body) |clause, *copy| {
-        copy.* = try cloneClause(allocator, clause);
-        initialized += 1;
-    }
-    return .{ .id = rule.id, .head = head, .body = body, .seed_argument = rule.seed_argument };
-}
-
-fn freeClauseTree(allocator: std.mem.Allocator, clause: Clause) void {
-    switch (clause) {
-        .relational, .builtin, .negated => |expression| freeExpr(allocator, expression),
-        .aggregate => |aggregate| {
-            freeTerm(allocator, aggregate.template);
-            for (aggregate.body) |body_clause| freeClauseTree(allocator, body_clause);
-            allocator.free(aggregate.body);
-            freeTerm(allocator, aggregate.output);
-        },
-    }
-}
-
-fn freeTerm(allocator: std.mem.Allocator, term: Term) void {
-    switch (term) {
-        .cons => |pair| {
-            freeTerm(allocator, pair.head);
-            freeTerm(allocator, pair.tail);
-            allocator.destroy(pair);
-        },
-        else => {},
-    }
-}
-
-fn termVariablesBound(term: Term, bound: *const std.AutoHashMapUnmanaged(Id, void)) bool {
-    return switch (term) {
-        .variable => |variable| bound.contains(variable),
-        .cons => |pair| termVariablesBound(pair.head, bound) and termVariablesBound(pair.tail, bound),
-        else => true,
-    };
-}
-
-fn bindTermVariables(
-    allocator: std.mem.Allocator,
-    term: Term,
-    bound: *std.AutoHashMapUnmanaged(Id, void),
-) !void {
-    switch (term) {
-        .variable => |variable| try bound.put(allocator, variable, {}),
-        .cons => |pair| {
-            try bindTermVariables(allocator, pair.head, bound);
-            try bindTermVariables(allocator, pair.tail, bound);
-        },
-        else => {},
-    }
-}
-
-fn collectTermVariables(
-    allocator: std.mem.Allocator,
-    term: Term,
-    variables: *std.AutoHashMapUnmanaged(Id, void),
-) !void {
-    try bindTermVariables(allocator, term, variables);
-}
-
-fn collectExprVariables(
-    allocator: std.mem.Allocator,
-    expression: Expr,
-    variables: *std.AutoHashMapUnmanaged(Id, void),
-) !void {
-    for (expression.terms) |term| try collectTermVariables(allocator, term, variables);
-}
-
-fn collectClauseSurfaceVariables(
-    allocator: std.mem.Allocator,
-    clause: Clause,
-    variables: *std.AutoHashMapUnmanaged(Id, void),
-) !void {
-    switch (clause) {
-        .relational, .builtin, .negated => |expression| try collectExprVariables(allocator, expression, variables),
-        .aggregate => |aggregate| try collectTermVariables(allocator, aggregate.output, variables),
-    }
-}
-
-fn collectClauseAllVariables(
-    allocator: std.mem.Allocator,
-    clause: Clause,
-    variables: *std.AutoHashMapUnmanaged(Id, void),
-) !void {
-    switch (clause) {
-        .relational, .builtin, .negated => |expression| try collectExprVariables(allocator, expression, variables),
-        .aggregate => |aggregate| {
-            try collectTermVariables(allocator, aggregate.template, variables);
-            try collectTermVariables(allocator, aggregate.output, variables);
-            for (aggregate.body) |body_clause|
-                try collectClauseAllVariables(allocator, body_clause, variables);
-        },
-    }
-}
-
-fn isVariable(string: []const u8) bool {
-    return string.len != 0 and std.ascii.isUpper(string[0]);
-}
-
-fn goalKind(operator: []const u8) ?GoalKind {
-    if (std.mem.eql(u8, operator, "=")) return .equality;
-    if (std.mem.eql(u8, operator, "!=") or std.mem.eql(u8, operator, "<>")) return .inequality;
-    if (std.mem.eql(u8, operator, "<")) return .less_than;
-    if (std.mem.eql(u8, operator, "<=")) return .less_or_equal;
-    if (std.mem.eql(u8, operator, ">")) return .greater_than;
-    if (std.mem.eql(u8, operator, ">=")) return .greater_or_equal;
-    if (std.mem.eql(u8, operator, "+")) return .add;
-    if (std.mem.eql(u8, operator, "-")) return .subtract;
-    return null;
-}
-
-fn goalOperator(kind: GoalKind) []const u8 {
-    return switch (kind) {
-        .relation => unreachable,
-        .equality => "=",
-        .inequality => "<>",
-        .less_than => "<",
-        .less_or_equal => "<=",
-        .greater_than => ">",
-        .greater_or_equal => ">=",
-        .add => "+",
-        .subtract => "-",
-    };
-}
-
-fn isBuiltin(_: *const Jatalog, value: Expr) bool {
-    return value.kind != .relation;
-}
-
-fn isArithmetic(_: *const Jatalog, value: Expr) bool {
-    return value.kind == .add or value.kind == .subtract;
-}
-
-fn termContainsCons(term: Term) bool {
-    return switch (term) {
-        .cons => true,
-        else => false,
-    };
-}
-
-fn termEqual(left: Term, right: Term) bool {
-    return switch (left) {
-        .scalar => |value| switch (right) {
-            .scalar => |other| value == other,
-            else => false,
-        },
-        .variable => |value| switch (right) {
-            .variable => |other| value == other,
-            else => false,
-        },
-        .nil => right == .nil,
-        .cons => |pair| switch (right) {
-            .cons => |other| termEqual(pair.head, other.head) and termEqual(pair.tail, other.tail),
-            else => false,
-        },
-    };
-}
-
-fn isTailDescendant(ancestor: Term, candidate: Term) bool {
-    var current = ancestor;
-    while (current == .cons) {
-        current = current.cons.tail;
-        if (termEqual(current, candidate)) return true;
-    }
-    return false;
-}
 
 const Parser = struct {
     jatalog: *Jatalog,
@@ -3780,7 +3063,7 @@ const Parser = struct {
         self.skipSpace();
         if (self.peekKeyword("setof")) return .{ .aggregate = try self.parseAggregate() };
         const expression = try self.parseExpr();
-        return self.jatalog.classifyExpr(expression);
+        return classifyExpr(expression);
     }
 
     fn parseAggregate(self: *Parser) anyerror!Aggregate {
@@ -4102,6 +3385,9 @@ test "a parse error after a query releases the previous result" {
 
 test {
     _ = relation_store;
+    _ = cost_model;
+    _ = syntax;
+    _ = results;
 }
 
 /// Compares the semi-naive closure against the naive reference closure on a
@@ -5486,24 +4772,6 @@ const cost_attribution_program =
     \\path(X, Y) :- edge(X, Y).
     \\path(X, Z) :- edge(X, Y), path(Y, Z).
 ;
-
-test "an empty update is not a maintenance decision" {
-    // Nothing to do costs nothing either way, so there is no cheaper path to
-    // pick and nothing to learn from having picked it. Asserted against the
-    // model directly: both callers wrap the decision in a transaction that is
-    // discarded when the update changes nothing, so a miscount there would
-    // never reach a committed database and no test through the public API can
-    // tell the two behaviours apart.
-    var model: CostModel = .{};
-    try std.testing.expectEqual(CostModel.Decision.maintain, model.decide(0));
-    try std.testing.expectEqual(@as(usize, 0), model.maintain_choices);
-    try std.testing.expectEqual(@as(usize, 0), model.recompute_choices);
-    try std.testing.expectEqual(@as(usize, 0), model.decisions);
-
-    // A real update is a decision and is counted.
-    _ = model.decide(1);
-    try std.testing.expectEqual(@as(usize, 1), model.maintain_choices);
-}
 
 test "the maintenance estimate counts facts changed, not facts named" {
     const new_edge = input.fact("edge", &.{ input.atom("c"), input.atom("d") });
