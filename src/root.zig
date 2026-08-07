@@ -8,6 +8,7 @@ const syntax = @import("syntax.zig");
 const results = @import("results.zig");
 const evaluator = @import("evaluator.zig");
 const maintenance = @import("maintenance.zig");
+const aggregate_view = @import("aggregate_view.zig");
 pub const Error = error{
     InvalidFact,
     InvalidRule,
@@ -28,6 +29,7 @@ pub const Error = error{
 };
 
 const Fact = relation_store.Fact;
+const AuxiliaryView = aggregate_view.AuxiliaryView;
 const StratumImpact = maintenance.StratumImpact;
 const copyFactInto = relation_store.copyFactInto;
 const appendFactCopy = relation_store.appendFactCopy;
@@ -170,49 +172,6 @@ const InputBuilder = struct {
 
     pub fn releaseTerm(self: *InputBuilder, term: Term) void { // ziglint-ignore: Z012
         freeTerm(self.database.allocator, term);
-    }
-};
-
-/// CReaM-style auxiliary view for a maintained aggregate rule whose head
-/// projects out some of its outer-goal variables. Each tuple retains those
-/// projected values followed by the head values they derive, so the number
-/// of auxiliary tuples carrying a head tuple is that tuple's derivation
-/// count. A projected head tuple becomes visible on a zero-to-one count
-/// transition and is deleted on a one-to-zero transition.
-const AuxiliaryView = struct {
-    rule_id: u32,
-    /// Outer-goal variables omitted from the head, in ascending id order.
-    projected: []Id,
-    head_arity: usize,
-    tuples: RelationStore,
-
-    fn deinit(self: *AuxiliaryView, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
-        allocator.free(self.projected);
-        self.tuples.deinit();
-        self.* = undefined;
-    }
-
-    fn clone(self: *const AuxiliaryView, allocator: std.mem.Allocator) !AuxiliaryView { // ziglint-ignore: Z023
-        const projected = try allocator.dupe(Id, self.projected);
-        errdefer allocator.free(projected);
-        return .{
-            .rule_id = self.rule_id,
-            .projected = projected,
-            .head_arity = self.head_arity,
-            .tuples = try self.tuples.clone(),
-        };
-    }
-
-    fn arity(self: *const AuxiliaryView) usize {
-        return self.projected.len + self.head_arity;
-    }
-
-    fn key(self: *const AuxiliaryView) PredicateKey {
-        return .{ .name = self.rule_id, .arity = self.arity() };
-    }
-
-    fn headTerms(self: *const AuxiliaryView, tuple: Fact) []const ValueId {
-        return tuple.terms[self.projected.len..];
     }
 };
 
@@ -369,7 +328,7 @@ pub const Jatalog = struct {
             defer touched.deinit();
             for (0..removed.len()) |position|
                 try copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
-            if (touched.len() > 0) try committed.maintainAggregates(&touched);
+            if (touched.len() > 0) try aggregate_view.maintainAggregates(&committed, &touched);
             committed.eval.cost.noteMaintenance(delta, span);
         } else {
             for (0..removed.len()) |position| {
@@ -488,7 +447,9 @@ pub const Jatalog = struct {
             closure.deinit();
             staging.closure = null;
         }
-        staging.dropAuxiliaryViews();
+        aggregate_view.dropAuxiliaryViews(
+            &staging,
+        );
         staging.materialization = .uninitialized;
         try staging.ensureMaterialized();
         self.commit(&staging);
@@ -550,7 +511,7 @@ pub const Jatalog = struct {
         defer touched.deinit();
         const deleted = try self.applyDeletions(deletions, maintain, &touched);
         const inserted = try self.applyInsertions(insertions, maintain, &touched);
-        if (touched.len() > 0) try self.maintainAggregates(&touched);
+        if (touched.len() > 0) try aggregate_view.maintainAggregates(self, &touched);
 
         const realized = deleted + inserted;
         if (maintain) self.eval.cost.noteMaintenance(realized, span);
@@ -632,434 +593,6 @@ pub const Jatalog = struct {
                 try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
         }
         return count;
-    }
-
-    /// Maintains rules containing one unnested `setof` after a batch changed
-    /// the aggregate's inner relations. Only groups reachable from a changed
-    /// inner fact are recomputed. A group whose canonical list changed emits
-    /// its stale head tuples as deletions and its recomputed tuple as an
-    /// insertion, which then cascade through the ordinary deletion and
-    /// insertion maintenance. Rounds repeat while aggregate results keep
-    /// changing, with a bounded fallback to a full rebuild.
-    fn maintainAggregates(self: *Jatalog, touched: *RelationStore) !void {
-        if (self.closure == null or self.materialization != .clean) return;
-        const round_cap = (try self.eval.ensureAnalysis()).max_level + 4;
-        var round: usize = 0;
-        while (true) {
-            round += 1;
-            if (round > round_cap) {
-                self.rebuild_fallbacks += 1;
-                self.markDirty(0);
-                return self.ensureMaterialized();
-            }
-            var removals: RelationStore = .init(self.allocator);
-            defer removals.deinit();
-            var additions: std.ArrayList(Fact) = .empty;
-            defer {
-                for (additions.items) |fact| self.allocator.free(fact.terms);
-                additions.deinit(self.allocator);
-            }
-            var changed: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
-            defer changed.deinit(self.allocator);
-            try collectPredicateKeys(self.allocator, touched, 0, &changed);
-            for (self.eval.rules.items) |rule| {
-                const clause_index = maintainableAggregateIndex(rule) orelse continue;
-                // A projected view also reacts to outer-goal changes, which
-                // create and destroy whole groups.
-                const trigger = if (self.auxiliaryFor(rule.id) == null)
-                    rule.body[clause_index].aggregate.body
-                else
-                    rule.body;
-                if (!clausesReadGrownAnywhere(trigger, &changed)) continue;
-                try self.maintainAggregateRule(rule, clause_index, touched, &removals, &additions);
-            }
-            if (removals.len() == 0 and additions.items.len == 0) return;
-
-            touched.clear();
-            if (removals.len() > 0) {
-                try maintenance.propagateDeletions(self, &removals);
-                for (0..removals.len()) |index|
-                    try copyFactInto(self.allocator, touched, removals.factAt(index), false);
-            }
-            if (self.materialization != .clean) return;
-            const batch_start = self.closure.?.len();
-            for (additions.items) |fact| {
-                if (try self.closure.?.contains(fact)) continue;
-                try copyFactInto(self.allocator, &self.closure.?, fact, true);
-            }
-            if (self.closure.?.len() > batch_start) {
-                try maintenance.propagateInsertions(self, batch_start);
-                if (self.materialization != .clean) return;
-                for (batch_start..self.closure.?.len()) |index|
-                    try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
-            }
-        }
-    }
-
-    fn maintainAggregateRule(
-        self: *Jatalog,
-        rule: Rule,
-        clause_index: usize,
-        touched: *RelationStore,
-        removals: *RelationStore,
-        additions: *std.ArrayList(Fact),
-    ) !void {
-        const aggregate = rule.body[clause_index].aggregate;
-        const outer = try outerClauses(self.allocator, rule, clause_index);
-        defer self.allocator.free(outer);
-
-        // Only variables the outer goals or the head can constrain identify a
-        // group; variables local to the aggregate body must stay free.
-        var scope: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer scope.deinit(self.allocator);
-        for (outer) |clause|
-            try collectClauseSurfaceVariables(self.allocator, clause, &scope);
-        for (rule.head.terms) |term| try collectTermVariables(self.allocator, term, &scope);
-
-        var groups: std.ArrayList(Binding) = .empty;
-        defer {
-            for (groups.items) |*group| group.deinit(self.allocator);
-            groups.deinit(self.allocator);
-        }
-        // A changed fact reaches a group either through the aggregate's
-        // inner goals (its member set changed) or through the outer goals
-        // (the group itself appeared or disappeared).
-        const view = self.auxiliaryFor(rule.id);
-        for (0..touched.len()) |index| {
-            const fact = touched.factAt(index);
-            for ([_][]const Clause{ aggregate.body, outer }) |clauses| {
-                for (clauses) |candidate| {
-                    const expression = switch (candidate) {
-                        .relational => |value| value,
-                        else => continue,
-                    };
-                    if (expression.predicate != fact.predicate or
-                        expression.terms.len != fact.terms.len) continue;
-                    var seed: Binding = .{};
-                    defer seed.deinit(self.allocator);
-                    if (!try self.eval.unify(fact, expression, &seed)) continue;
-                    var restricted: Binding = .{};
-                    defer restricted.deinit(self.allocator);
-                    for (seed.values.keys(), seed.values.values()) |variable, value| {
-                        if (scope.contains(variable))
-                            try restricted.values.put(self.allocator, variable, value);
-                    }
-                    try self.collectAggregateGroups(outer, &restricted, &groups);
-                }
-            }
-        }
-
-        self.maintained_groups += groups.items.len;
-        for (groups.items) |*group| {
-            if (view) |projected| {
-                try self.maintainProjectedGroup(rule, projected, group, removals, additions);
-            } else {
-                try self.maintainAggregateGroup(rule, group, removals, additions);
-            }
-        }
-        if (view) |projected|
-            try self.sweepVanishedGroups(rule, clause_index, projected, touched, removals);
-    }
-
-    /// Maintains one group of a projected view through its derivation
-    /// counts: an auxiliary tuple that no longer holds is retracted, and its
-    /// head tuple is deleted only on the resulting one-to-zero transition;
-    /// a newly derived auxiliary tuple makes its head tuple visible only on
-    /// the zero-to-one transition. A group whose aggregate list changed
-    /// therefore transfers support from the old head tuple to the new one
-    /// within a single batch.
-    fn maintainProjectedGroup(
-        self: *Jatalog,
-        rule: Rule,
-        view: *AuxiliaryView,
-        group: *const Binding,
-        removals: *RelationStore,
-        additions: *std.ArrayList(Fact),
-    ) !void {
-        var derived: RelationStore = .init(self.allocator);
-        defer derived.deinit();
-        try self.deriveGroupHeads(rule, group, &derived);
-
-        // Auxiliary tuples this group currently contributes.
-        var mask: u64 = 0;
-        var bound: [64]ValueId = undefined;
-        for (view.projected, 0..) |variable, index| {
-            bound[index] = group.values.get(variable) orelse return;
-            mask |= @as(u64, 1) << @intCast(index);
-        }
-        var stale: std.ArrayList(Fact) = .empty;
-        defer {
-            for (stale.items) |fact| self.allocator.free(fact.terms);
-            stale.deinit(self.allocator);
-        }
-        {
-            const candidates = try view.tuples.lookup(view.key(), mask, bound[0..view.projected.len]);
-            for (candidates) |candidate| {
-                const tuple = view.tuples.factAt(candidate);
-                if (!std.mem.eql(ValueId, tuple.terms[0..view.projected.len], bound[0..view.projected.len]))
-                    continue;
-                const head: Fact = .{
-                    .predicate = rule.head.predicate,
-                    .terms = @constCast(view.headTerms(tuple)),
-                };
-                // Projected values alone do not identify a group: head
-                // variables the group binds must agree as well, or the
-                // tuple belongs to a different group sharing these values.
-                var owner = try group.clone(self.allocator);
-                defer owner.deinit(self.allocator);
-                if (!try self.eval.unify(head, rule.head, &owner)) continue;
-                if (try derived.contains(head)) continue;
-                try appendFactCopy(self.allocator, &stale, tuple);
-            }
-        }
-        for (stale.items) |tuple| {
-            const head = view.headTerms(tuple);
-            const before = try self.derivationCount(view, head);
-            if (!try view.tuples.removeFact(tuple)) continue;
-            if (before == 1) try self.recordHeadRemoval(rule, head, removals);
-        }
-
-        for (0..derived.len()) |index| {
-            const head = derived.factAt(index);
-            const terms = (try self.auxiliaryTerms(view, group, head)) orelse continue;
-            var owned = true;
-            defer if (owned) self.allocator.free(terms);
-            const tuple: Fact = .{ .predicate = view.rule_id, .terms = terms };
-            if (try view.tuples.contains(tuple)) continue;
-            const before = try self.derivationCount(view, view.headTerms(tuple));
-            owned = false;
-            _ = view.tuples.insert(tuple, false) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
-            if (before == 0 and !try self.closure.?.contains(head))
-                try appendFactCopy(self.allocator, additions, head);
-        }
-    }
-
-    /// Retracts auxiliary tuples whose group no longer has any solution of
-    /// the rule's outer goals, deleting the head tuple on a one-to-zero
-    /// derivation-count transition. Only groups a changed outer-goal fact
-    /// can reach are examined: a group can vanish only when an outer fact
-    /// disappears, so batches that touch just the aggregate's members do no
-    /// sweeping at all.
-    fn sweepVanishedGroups(
-        self: *Jatalog,
-        rule: Rule,
-        clause_index: usize,
-        view: *AuxiliaryView,
-        touched: *RelationStore,
-        removals: *RelationStore,
-    ) !void {
-        const outer = try outerClauses(self.allocator, rule, clause_index);
-        defer self.allocator.free(outer);
-
-        var candidates: RelationStore = .init(self.allocator);
-        defer candidates.deinit();
-        try self.collectSweepCandidates(rule, view, outer, touched, &candidates);
-
-        for (0..candidates.len()) |index| {
-            const tuple = candidates.factAt(index);
-            var seed: Binding = .{};
-            defer seed.deinit(self.allocator);
-            // The group is identified by its projected values together with
-            // the head variables the outer goals bind.
-            const stored: Fact = .{
-                .predicate = rule.head.predicate,
-                .terms = @constCast(view.headTerms(tuple)),
-            };
-            if (!try self.eval.unify(stored, rule.head, &seed)) continue;
-            for (view.projected, 0..) |variable, position|
-                try seed.values.put(self.allocator, variable, tuple.terms[position]);
-            var solutions: std.ArrayList(Binding) = .empty;
-            defer {
-                for (solutions.items) |*solution| solution.deinit(self.allocator);
-                solutions.deinit(self.allocator);
-            }
-            self.eval.matchClauses(
-                outer,
-                &self.closure.?,
-                0,
-                &seed,
-                &solutions,
-                null,
-            ) catch |err| switch (err) {
-                Error.NumericType, Error.NumericOverflow => continue,
-                else => return err,
-            };
-            if (solutions.items.len > 0) continue;
-            const head = view.headTerms(tuple);
-            const before = try self.derivationCount(view, head);
-            if (!try view.tuples.removeFact(tuple)) continue;
-            if (before == 1) try self.recordHeadRemoval(rule, head, removals);
-        }
-    }
-
-    /// Auxiliary tuples a changed outer-goal fact could have invalidated,
-    /// found by binding the fact against each outer goal and looking up the
-    /// auxiliary columns that binding determines.
-    fn collectSweepCandidates(
-        self: *Jatalog,
-        rule: Rule,
-        view: *AuxiliaryView,
-        outer: []const Clause,
-        touched: *RelationStore,
-        candidates: *RelationStore,
-    ) !void {
-        for (0..touched.len()) |index| {
-            const fact = touched.factAt(index);
-            for (outer) |clause| {
-                const expression = switch (clause) {
-                    .relational => |value| value,
-                    else => continue,
-                };
-                if (expression.predicate != fact.predicate or
-                    expression.terms.len != fact.terms.len) continue;
-                var binding: Binding = .{};
-                defer binding.deinit(self.allocator);
-                if (!try self.eval.unify(fact, expression, &binding)) continue;
-
-                var mask: u64 = 0;
-                var bound: [64]ValueId = undefined;
-                var count: usize = 0;
-                for (view.projected, 0..) |variable, position| {
-                    const value = binding.values.get(variable) orelse continue;
-                    mask |= @as(u64, 1) << @intCast(position);
-                    bound[count] = value;
-                    count += 1;
-                }
-                for (rule.head.terms, 0..) |term, position| {
-                    const variable = switch (term) {
-                        .variable => |name| name,
-                        else => continue,
-                    };
-                    const value = binding.values.get(variable) orelse continue;
-                    mask |= @as(u64, 1) << @intCast(view.projected.len + position);
-                    bound[count] = value;
-                    count += 1;
-                }
-                for (try view.tuples.lookup(view.key(), mask, bound[0..count])) |candidate| {
-                    const tuple = view.tuples.factAt(candidate);
-                    if (try candidates.contains(tuple)) continue;
-                    try copyFactInto(self.allocator, candidates, tuple, false);
-                }
-            }
-        }
-    }
-
-    fn recordHeadRemoval(
-        self: *Jatalog,
-        rule: Rule,
-        head: []const ValueId,
-        removals: *RelationStore,
-    ) !void {
-        const fact: Fact = .{ .predicate = rule.head.predicate, .terms = @constCast(head) };
-        if (!try self.closure.?.contains(fact)) return;
-        if (try removals.contains(fact)) return;
-        try copyFactInto(self.allocator, removals, fact, true);
-    }
-
-    fn deriveGroupHeads(
-        self: *Jatalog,
-        rule: Rule,
-        group: *const Binding,
-        derived: *RelationStore,
-    ) !void {
-        var answers: std.ArrayList(Binding) = .empty;
-        defer {
-            for (answers.items) |*answer| answer.deinit(self.allocator);
-            answers.deinit(self.allocator);
-        }
-        self.eval.matchClauses(
-            rule.body,
-            &self.closure.?,
-            0,
-            group,
-            &answers,
-            null,
-        ) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => return,
-            else => return err,
-        };
-        for (answers.items) |*answer| {
-            const fact = try self.eval.deriveFact(rule.head, answer);
-            _ = derived.insert(fact, true) catch |err| {
-                self.allocator.free(fact.terms);
-                return err;
-            };
-        }
-    }
-
-    fn collectAggregateGroups(
-        self: *Jatalog,
-        outer: []const Clause,
-        seed: *const Binding,
-        groups: *std.ArrayList(Binding),
-    ) !void {
-        var solutions: std.ArrayList(Binding) = .empty;
-        defer {
-            for (solutions.items) |*solution| solution.deinit(self.allocator);
-            solutions.deinit(self.allocator);
-        }
-        self.eval.matchClauses(
-            outer,
-            &self.closure.?,
-            0,
-            seed,
-            &solutions,
-            null,
-        ) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => return,
-            else => return err,
-        };
-        for (solutions.items) |*solution| {
-            var duplicate = false;
-            for (groups.items) |*existing| {
-                if (bindingsEqual(existing, solution)) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (duplicate) continue;
-            var copy = try solution.clone(self.allocator);
-            groups.append(self.allocator, copy) catch |err| {
-                copy.deinit(self.allocator);
-                return err;
-            };
-        }
-    }
-
-    /// Recomputes one group: the head tuples currently stored for it become
-    /// deletions unless the recomputation still derives them, and newly
-    /// derived tuples become insertions.
-    fn maintainAggregateGroup(
-        self: *Jatalog,
-        rule: Rule,
-        group: *const Binding,
-        removals: *RelationStore,
-        additions: *std.ArrayList(Fact),
-    ) !void {
-        var derived: RelationStore = .init(self.allocator);
-        defer derived.deinit();
-        try self.deriveGroupHeads(rule, group, &derived);
-
-        // Stale stored tuples for this group: head matches under the group
-        // binding but the recomputation no longer derives them.
-        for (try self.eval.lookupCandidates(&self.closure.?, rule.head, group)) |candidate| {
-            const stored = self.closure.?.factAt(candidate);
-            var matched = try group.clone(self.allocator);
-            defer matched.deinit(self.allocator);
-            if (!try self.eval.unify(stored, rule.head, &matched)) continue;
-            if (try derived.contains(stored)) continue;
-            if (try removals.contains(stored)) continue;
-            try copyFactInto(self.allocator, removals, stored, true);
-        }
-
-        for (0..derived.len()) |index| {
-            const fact = derived.factAt(index);
-            if (try self.closure.?.contains(fact)) continue;
-            try appendFactCopy(self.allocator, additions, fact);
-        }
     }
 
     fn compileRelation(
@@ -1339,179 +872,9 @@ pub const Jatalog = struct {
     /// stratification and the auxiliary views built from it.
     fn invalidateAnalysis(self: *Jatalog) void {
         self.eval.invalidateAnalysis();
-        self.dropAuxiliaryViews();
-    }
-
-    fn dropAuxiliaryViews(self: *Jatalog) void {
-        for (self.auxiliary.items) |*view| view.deinit(self.allocator);
-        self.auxiliary.clearRetainingCapacity();
-    }
-
-    fn auxiliaryFor(self: *Jatalog, rule_id: u32) ?*AuxiliaryView {
-        for (self.auxiliary.items) |*view| if (view.rule_id == rule_id) return view;
-        return null;
-    }
-
-    /// Rebuilds every projected aggregate view from the materialized
-    /// closure. Views are built into a temporary list and installed only on
-    /// success, so a failure leaves the previous views in place.
-    fn rebuildAuxiliaryViews(self: *Jatalog) !void {
-        var built: std.ArrayList(AuxiliaryView) = .empty;
-        errdefer {
-            for (built.items) |*view| view.deinit(self.allocator);
-            built.deinit(self.allocator);
-        }
-        for (self.eval.rules.items) |rule| {
-            const clause_index = maintainableAggregateIndex(rule) orelse continue;
-            var view = (try self.buildAuxiliaryView(rule, clause_index)) orelse continue;
-            built.append(self.allocator, view) catch |err| {
-                view.deinit(self.allocator);
-                return err;
-            };
-        }
-        for (self.auxiliary.items) |*view| view.deinit(self.allocator);
-        self.auxiliary.deinit(self.allocator);
-        self.auxiliary = built;
-    }
-
-    /// Returns the projected variables of a maintained aggregate rule: the
-    /// outer-goal variables its head omits. An empty result means the head
-    /// retains every outer variable, so each head tuple already belongs to
-    /// exactly one group and no auxiliary view is needed.
-    fn projectedVariables(self: *Jatalog, rule: Rule, clause_index: usize) ![]Id {
-        const outer = try outerClauses(self.allocator, rule, clause_index);
-        defer self.allocator.free(outer);
-        var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer outer_variables.deinit(self.allocator);
-        for (outer) |clause|
-            try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
-        var head_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer head_variables.deinit(self.allocator);
-        for (rule.head.terms) |term| try collectTermVariables(self.allocator, term, &head_variables);
-
-        var projected: std.ArrayList(Id) = .empty;
-        errdefer projected.deinit(self.allocator);
-        var iterator = outer_variables.keyIterator();
-        while (iterator.next()) |variable| {
-            if (!head_variables.contains(variable.*))
-                try projected.append(self.allocator, variable.*);
-        }
-        std.mem.sort(Id, projected.items, {}, std.sort.asc(Id));
-        return projected.toOwnedSlice(self.allocator);
-    }
-
-    fn buildAuxiliaryView(self: *Jatalog, rule: Rule, clause_index: usize) !?AuxiliaryView {
-        const projected = try self.projectedVariables(rule, clause_index);
-        var projected_owned = true;
-        defer if (projected_owned) self.allocator.free(projected);
-        if (projected.len == 0) return null;
-        // The lookup mask addresses one bit per auxiliary column.
-        if (projected.len + rule.head.terms.len > 64) return null;
-
-        var view: AuxiliaryView = .{
-            .rule_id = rule.id,
-            .projected = projected,
-            .head_arity = rule.head.terms.len,
-            .tuples = .init(self.allocator),
-        };
-        projected_owned = false;
-        errdefer view.deinit(self.allocator);
-
-        const outer = try outerClauses(self.allocator, rule, clause_index);
-        defer self.allocator.free(outer);
-        var groups: std.ArrayList(Binding) = .empty;
-        defer {
-            for (groups.items) |*group| group.deinit(self.allocator);
-            groups.deinit(self.allocator);
-        }
-        var initial: Binding = .{};
-        defer initial.deinit(self.allocator);
-        self.eval.matchClauses(
-            outer,
-            &self.closure.?,
-            0,
-            &initial,
-            &groups,
-            null,
-        ) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => return view,
-            else => return err,
-        };
-        for (groups.items) |*group| try self.recordGroupTuples(rule, &view, group);
-        return view;
-    }
-
-    /// Records the auxiliary tuples one group contributes: its projected
-    /// values followed by each head tuple the rule derives for it.
-    fn recordGroupTuples(
-        self: *Jatalog,
-        rule: Rule,
-        view: *AuxiliaryView,
-        group: *const Binding,
-    ) !void {
-        var answers: std.ArrayList(Binding) = .empty;
-        defer {
-            for (answers.items) |*answer| answer.deinit(self.allocator);
-            answers.deinit(self.allocator);
-        }
-        self.eval.matchClauses(
-            rule.body,
-            &self.closure.?,
-            0,
-            group,
-            &answers,
-            null,
-        ) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => return,
-            else => return err,
-        };
-        for (answers.items) |*answer| {
-            const head_fact = try self.eval.deriveFact(rule.head, answer);
-            defer self.allocator.free(head_fact.terms);
-            const terms = (try self.auxiliaryTerms(view, group, head_fact)) orelse continue;
-            _ = view.tuples.insert(.{ .predicate = view.rule_id, .terms = terms }, false) catch |err| {
-                self.allocator.free(terms);
-                return err;
-            };
-        }
-    }
-
-    fn auxiliaryTerms(
-        self: *Jatalog,
-        view: *const AuxiliaryView,
-        group: *const Binding,
-        head: Fact,
-    ) !?[]ValueId {
-        const terms = try self.allocator.alloc(ValueId, view.arity());
-        var owned = true;
-        defer if (owned) self.allocator.free(terms);
-        for (view.projected, 0..) |variable, index| {
-            terms[index] = group.values.get(variable) orelse return null;
-        }
-        @memcpy(terms[view.projected.len..], head.terms);
-        owned = false;
-        return terms;
-    }
-
-    /// Number of auxiliary tuples deriving one projected head tuple. The
-    /// count is derived from the auxiliary view itself rather than stored
-    /// separately, so it cannot drift, and it is reported as an overflow
-    /// rather than wrapped when it exceeds the counter width.
-    fn derivationCount(self: *Jatalog, view: *AuxiliaryView, head: []const ValueId) !u32 {
-        _ = self;
-        var mask: u64 = 0;
-        var bound: [64]ValueId = undefined;
-        for (head, 0..) |term, index| {
-            mask |= @as(u64, 1) << @intCast(view.projected.len + index);
-            bound[index] = term;
-        }
-        const candidates = try view.tuples.lookup(view.key(), mask, bound[0..head.len]);
-        var count: usize = 0;
-        for (candidates) |candidate| {
-            const tuple = view.tuples.factAt(candidate);
-            if (std.mem.eql(ValueId, view.headTerms(tuple), head)) count += 1;
-        }
-        return std.math.cast(u32, count) orelse Error.NumericOverflow;
+        aggregate_view.dropAuxiliaryViews(
+            self,
+        );
     }
 
     pub fn markDirty(self: *Jatalog, level: usize) void {
@@ -1557,7 +920,9 @@ pub const Jatalog = struct {
         if (self.closure) |*old| old.deinit();
         self.closure = closure;
         self.materialization = .clean;
-        try self.rebuildAuxiliaryViews();
+        try aggregate_view.rebuildAuxiliaryViews(
+            self,
+        );
         // This also runs as the fallback inside a maintenance attempt, where
         // claiming the work keeps it out of the maintenance estimate.
         if (repairs_update) self.eval.cost.noteRebuild(span);
@@ -2397,6 +1762,7 @@ test {
     _ = results;
     _ = evaluator;
     _ = maintenance;
+    _ = aggregate_view;
 }
 
 /// Compares the semi-naive closure against the naive reference closure on a
@@ -3359,12 +2725,12 @@ fn derivationCountOf(
     const first_value = try db.eval.values.intern(.{ .scalar = scalar_id });
     for (db.eval.rules.items) |rule| {
         if (rule.head.predicate != predicate_id) continue;
-        const view = db.auxiliaryFor(rule.id) orelse return error.NotProjected;
+        const view = aggregate_view.auxiliaryFor(db, rule.id) orelse return error.NotProjected;
         const closure = &db.closure.?;
         for (0..closure.len()) |index| {
             const fact = closure.factAt(index);
             if (fact.predicate != predicate_id or fact.terms[0] != first_value) continue;
-            return db.derivationCount(view, fact.terms);
+            return view.derivationCount(fact.terms);
         }
         return 0;
     }
