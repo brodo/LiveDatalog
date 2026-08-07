@@ -25,6 +25,10 @@ const maintenance = @import("maintenance.zig");
 
 const Jatalog = root.Jatalog;
 const Error = root.Error;
+const input = root.input;
+const expectClosureMatchesRebuild = @import("test_support.zig").expectClosureMatchesRebuild;
+const expectBindingValue = @import("test_support.zig").expectBindingValue;
+const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
 const Fact = relation_store.Fact;
 const PredicateKey = relation_store.PredicateKey;
 const RelationStore = relation_store.RelationStore;
@@ -667,4 +671,601 @@ fn auxiliaryTerms(
     @memcpy(terms[view.projected.len..], head.terms);
     owned = false;
     return terms;
+}
+
+test "aggregate groups are maintained incrementally across member changes" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2).
+        \\member(g1, b). member(g1, a). member(g2, z).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
+    initial.deinit();
+    const expansions_after_build = db.eval.expansions;
+
+    // Member insertion updates only the affected group, with no rebuild.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("c") }),
+    }, &.{}));
+    try std.testing.expect(db.materialization == .clean);
+    try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
+    var inserted = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&inserted.query.answers.items[0], "S", "[a, b, c]");
+    inserted.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // The untouched group keeps its list and there is exactly one tuple
+    // per group after the change.
+    var untouched = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&untouched.query.answers.items[0], "S", "[z]");
+    untouched.deinit();
+    try expectAnswerCount(&db, "collected(G, S)?", 2);
+
+    // Member deletion shrinks the list.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+    }));
+    var deleted = try db.execute("collected(g1, S)?");
+    try expectBindingValue(&deleted.query.answers.items[0], "S", "[b, c]");
+    deleted.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting the last member leaves the enumerated group with an empty
+    // list, because its outer goal still derives the group.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g2"), input.atom("z") }),
+    }));
+    var emptied = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&emptied.query.answers.items[0], "S", "[]");
+    emptied.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting the group key removes the tuple entirely.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("group", &.{input.atom("g2")}),
+    }));
+    try expectAnswerCount(&db, "collected(g2, S)?", 0);
+    try expectAnswerCount(&db, "collected(G, S)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // Restoring the group key brings back an empty group.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("group", &.{input.atom("g2")}),
+    }, &.{}));
+    var restored = try db.execute("collected(g2, S)?");
+    try expectBindingValue(&restored.query.answers.items[0], "S", "[]");
+    restored.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "duplicate member derivations do not disturb a maintained group" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g). direct(g, a). mirrored(g, a). direct(g, b).
+        \\member(G, X) :- direct(G, X).
+        \\member(G, X) :- mirrored(G, X).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("collected(g, S)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
+    initial.deinit();
+
+    // Removing one of two derivations of member(g, a) keeps the member.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("mirrored", &.{ input.atom("g"), input.atom("a") }),
+    }));
+    var kept = try db.execute("collected(g, S)?");
+    try expectBindingValue(&kept.query.answers.items[0], "S", "[a, b]");
+    kept.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Removing the last derivation drops it from the list.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("direct", &.{ input.atom("g"), input.atom("a") }),
+    }));
+    var dropped = try db.execute("collected(g, S)?");
+    try expectBindingValue(&dropped.query.answers.items[0], "S", "[b]");
+    dropped.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "canonical aggregate lists are independent of update order" {
+    const orders = [_][3][]const u8{
+        .{ "c", "a", "b" },
+        .{ "b", "c", "a" },
+        .{ "a", "b", "c" },
+    };
+    for (orders) |order| {
+        var db: Jatalog = .init(std.testing.allocator);
+        defer db.deinit();
+        var setup = try db.execute(
+            \\group(g).
+            \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        );
+        setup.deinit();
+        var empty = try db.execute("collected(g, S)?");
+        try expectBindingValue(&empty.query.answers.items[0], "S", "[]");
+        empty.deinit();
+
+        for (order) |name| {
+            _ = try db.applyChanges(&.{
+                input.fact("member", &.{ input.atom("g"), input.atom(name) }),
+            }, &.{});
+        }
+        var result = try db.execute("collected(g, S)?");
+        try expectBindingValue(&result.query.answers.items[0], "S", "[a, b, c]");
+        result.deinit();
+        try expectClosureMatchesRebuild(&db);
+    }
+}
+
+test "bag emulation retains equal values with distinct discriminators" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g). reading(g, r1, 5). reading(g, r2, 5). reading(g, r3, 7).
+        \\bag(G, S) :- group(G), setof([V, D], reading(G, D, V), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &initial.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r2], [7, r3]]",
+    );
+    initial.deinit();
+
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("reading", &.{ input.atom("g"), input.atom("r4"), input.integer(5) }),
+    }, &.{}));
+    var added = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &added.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r2], [5, r4], [7, r3]]",
+    );
+    added.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    // Removing one duplicate value keeps the others.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("reading", &.{ input.atom("g"), input.atom("r2"), input.integer(5) }),
+    }));
+    var removed = try db.execute("bag(g, S)?");
+    try expectBindingValue(
+        &removed.query.answers.items[0],
+        "S",
+        "[[5, r1], [5, r4], [7, r3]]",
+    );
+    removed.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "maintained aggregates feed downstream strata and recursive consumers" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\person(alice). person(bob).
+        \\parent(alice, bob).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+    );
+    setup.deinit();
+    var initial = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
+    initial.deinit();
+
+    // A new child changes the aggregate list, which must flow through the
+    // downstream structural list function.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("person", &.{input.atom("carol")}),
+        input.fact("parent", &.{ input.atom("alice"), input.atom("carol") }),
+    }, &.{}));
+    var grown = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
+    grown.deinit();
+    try expectAnswerCount(&db, "numchildren(X, N)?", 3);
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }),
+    }));
+    var shrunk = try db.execute("numchildren(alice, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try shrunk.query.answers.items[0].getInteger("N"));
+    shrunk.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "multiple and nested aggregates stay correct through the rebuild path" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2). item(g1, a). item(g2, b). tag(g1, t1). tag(g2, t2).
+        \\both(G, S, T) :- group(G), setof(X, item(G, X), S), setof(Y, tag(G, Y), T).
+        \\nested(S) :- group(g1), setof([G, T], (group(G), setof(X, item(G, X), T)), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[a]");
+    try expectBindingValue(&initial.query.answers.items[0], "T", "[t1]");
+    initial.deinit();
+
+    // Rules outside the maintainable class fall back to the stratum
+    // rebuild, which must still produce rebuild-equivalent results.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("item", &.{ input.atom("g1"), input.atom("c") }),
+        input.fact("tag", &.{ input.atom("g1"), input.atom("t3") }),
+    }, &.{}));
+    var updated = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&updated.query.answers.items[0], "S", "[a, c]");
+    try expectBindingValue(&updated.query.answers.items[0], "T", "[t1, t3]");
+    updated.deinit();
+    var nested = try db.execute("nested(S)?");
+    try expectBindingValue(
+        &nested.query.answers.items[0],
+        "S",
+        "[[g1, [a, c]], [g2, [b]]]",
+    );
+    nested.deinit();
+    try expectClosureMatchesRebuild(&db);
+
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("item", &.{ input.atom("g1"), input.atom("a") }),
+    }));
+    var reduced = try db.execute("both(g1, S, T)?");
+    try expectBindingValue(&reduced.query.answers.items[0], "S", "[c]");
+    reduced.deinit();
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "random aggregate update traces match a clean rebuild after every batch" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
+    var setup = try db.execute(
+        \\group(g1). group(g2). group(g3).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(G, N) :- collected(G, S), length(S, N).
+        \\empty(G) :- group(G), not member(G, m1), not member(G, m2), not member(G, m3).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "size(G, N)?", 3);
+
+    const groups = [_][]const u8{ "g1", "g2", "g3" };
+    const members = [_][]const u8{ "m1", "m2", "m3" };
+    var prng = std.Random.DefaultPrng.init(0xa99a6a7e5eed);
+    const random = prng.random();
+    for (0..40) |_| {
+        var insert_buffer: [2][2]input.Term = undefined;
+        var inserts: [2]input.Relation = undefined;
+        const insert_count = random.uintLessThan(usize, 3);
+        for (0..insert_count) |slot| {
+            insert_buffer[slot] = .{
+                input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                input.atom(members[random.uintLessThan(usize, members.len)]),
+            };
+            inserts[slot] = input.fact("member", &insert_buffer[slot]);
+        }
+        var delete_buffer: [2][2]input.Term = undefined;
+        var deletes: [2]input.Relation = undefined;
+        const delete_count = random.uintLessThan(usize, 3);
+        for (0..delete_count) |slot| {
+            delete_buffer[slot] = .{
+                input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                input.atom(members[random.uintLessThan(usize, members.len)]),
+            };
+            deletes[slot] = input.fact("member", &delete_buffer[slot]);
+        }
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try std.testing.expect(db.materialization == .clean);
+        try expectClosureMatchesRebuild(&db);
+    }
+}
+
+/// Derivation count the auxiliary view records for the single tuple of
+/// `predicate` whose first argument is the atom `first_atom`.
+fn derivationCountOf(
+    db: *Jatalog,
+    predicate: []const u8,
+    first_atom: []const u8,
+) !u32 {
+    const predicate_id = db.strings.get(predicate) orelse return error.MissingPredicate;
+    const scalar_id = try db.eval.scalars.internAtom(first_atom);
+    const first_value = try db.eval.values.intern(.{ .scalar = scalar_id });
+    for (db.eval.rules.items) |rule| {
+        if (rule.head.predicate != predicate_id) continue;
+        const view = auxiliaryFor(db, rule.id) orelse return error.NotProjected;
+        const closure = &db.closure.?;
+        for (0..closure.len()) |index| {
+            const fact = closure.factAt(index);
+            if (fact.predicate != predicate_id or fact.terms[0] != first_value) continue;
+            return view.derivationCount(fact.terms);
+        }
+        return 0;
+    }
+    return error.MissingPredicate;
+}
+
+test "Chapter 5 Example 5.2.1 maintains a view without projections" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\p(a). p(b). r(a, 1). r(c, 3).
+        \\v(X, S) :- p(X), setof(Y, r(X, Y), S).
+    );
+    setup.deinit();
+
+    // The materialization contains v(a, [1]) and v(b, []).
+    var initial = try db.execute("v(a, S)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
+    initial.deinit();
+    var empty = try db.execute("v(b, S)?");
+    try expectBindingValue(&empty.query.answers.items[0], "S", "[]");
+    empty.deinit();
+    try expectAnswerCount(&db, "v(X, S)?", 2);
+
+    // Deleting p(a) and inserting r(b, 2) deletes v(a, [1]) and updates
+    // v(b, []) to v(b, [2]).
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("r", &.{ input.atom("b"), input.integer(2) }),
+    }, &.{
+        input.fact("p", &.{input.atom("a")}),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    try expectAnswerCount(&db, "v(a, S)?", 0);
+    var updated = try db.execute("v(b, S)?");
+    try expectBindingValue(&updated.query.answers.items[0], "S", "[2]");
+    updated.deinit();
+    try expectAnswerCount(&db, "v(X, S)?", 1);
+    try expectClosureMatchesRebuild(&db);
+
+    // This view retains every outer variable, so it is self-maintainable and
+    // needs no auxiliary derivation counts.
+    const stats = db.maintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.self_maintainable_views);
+    try std.testing.expectEqual(@as(usize, 0), stats.projected_views);
+    try std.testing.expectEqual(@as(usize, 0), stats.auxiliary_tuples);
+}
+
+test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\p(a, 1). p(a, 2). p(b, 1). r(a, 1). r(a, 2). r(b, 2).
+        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
+    );
+    setup.deinit();
+
+    var initial = try db.execute("v(a, S)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[1, 2]");
+    initial.deinit();
+    var other = try db.execute("v(b, S)?");
+    try expectBindingValue(&other.query.answers.items[0], "S", "[2]");
+    other.deinit();
+
+    // The auxiliary counting view holds v(a, [1, 2]) with two derivations
+    // and v(b, [2]) with one, matching the chapter's v_c extension.
+    const stats = db.maintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.projected_views);
+    try std.testing.expectEqual(@as(usize, 0), stats.self_maintainable_views);
+    try std.testing.expectEqual(@as(usize, 3), stats.auxiliary_tuples);
+    try std.testing.expectEqual(@as(u32, 2), try derivationCountOf(&db, "v", "a"));
+    try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "b"));
+
+    // Deleting p(a, 2) removes one of two derivations, so the tuple stays.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("p", &.{ input.atom("a"), input.integer(2) }),
+    }));
+    try std.testing.expect(db.materialization == .clean);
+    var retained = try db.execute("v(a, S)?");
+    try expectBindingValue(&retained.query.answers.items[0], "S", "[1, 2]");
+    retained.deinit();
+    try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "a"));
+    try expectClosureMatchesRebuild(&db);
+
+    // Deleting p(a, 1) removes the last derivation, so the tuple goes.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("p", &.{ input.atom("a"), input.integer(1) }),
+    }));
+    try expectAnswerCount(&db, "v(a, S)?", 0);
+    try std.testing.expectEqual(@as(u32, 0), try derivationCountOf(&db, "v", "a"));
+    try expectAnswerCount(&db, "v(X, S)?", 1);
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "a changed aggregate list transfers support to the new tuple" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\p(a, 1). p(a, 2). p(a, 3). r(a, 1).
+        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
+    );
+    setup.deinit();
+    var initial = try db.execute("v(a, S)?");
+    try expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
+    initial.deinit();
+    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
+
+    // Growing the member set replaces the old tuple with the new one and
+    // carries all three derivations across in the same batch.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("r", &.{ input.atom("a"), input.integer(2) }),
+    }, &.{}));
+    try std.testing.expect(db.materialization == .clean);
+    var moved = try db.execute("v(a, S)?");
+    try expectBindingValue(&moved.query.answers.items[0], "S", "[1, 2]");
+    moved.deinit();
+    try expectAnswerCount(&db, "v(a, S)?", 1);
+    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
+    try std.testing.expectEqual(@as(usize, 3), db.maintenanceStats().auxiliary_tuples);
+    try expectClosureMatchesRebuild(&db);
+
+    // Shrinking it back transfers the support again.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("r", &.{ input.atom("a"), input.integer(1) }),
+    }));
+    var shrunk = try db.execute("v(a, S)?");
+    try expectBindingValue(&shrunk.query.answers.items[0], "S", "[2]");
+    shrunk.deinit();
+    try expectAnswerCount(&db, "v(a, S)?", 1);
+    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
+    try expectClosureMatchesRebuild(&db);
+}
+
+test "projected view counts agree with explicit proof enumeration" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
+    var setup = try db.execute(
+        \\p(a, 1). r(a, 1).
+        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
+    );
+    setup.deinit();
+    try expectAnswerCount(&db, "v(X, S)?", 1);
+
+    const keys = [_][]const u8{ "a", "b", "c" };
+    var prng = std.Random.DefaultPrng.init(0xc0107501c0107);
+    const random = prng.random();
+    for (0..40) |_| {
+        var insert_buffer: [2][2]input.Term = undefined;
+        var inserts: [2]input.Relation = undefined;
+        const insert_count = random.uintLessThan(usize, 3);
+        for (0..insert_count) |slot| {
+            const key = keys[random.uintLessThan(usize, keys.len)];
+            const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
+            insert_buffer[slot] = .{ input.atom(key), input.integer(number) };
+            inserts[slot] = input.fact(
+                if (random.boolean()) "p" else "r",
+                &insert_buffer[slot],
+            );
+        }
+        var delete_buffer: [2][2]input.Term = undefined;
+        var deletes: [2]input.Relation = undefined;
+        const delete_count = random.uintLessThan(usize, 3);
+        for (0..delete_count) |slot| {
+            const key = keys[random.uintLessThan(usize, keys.len)];
+            const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
+            delete_buffer[slot] = .{ input.atom(key), input.integer(number) };
+            deletes[slot] = input.fact(
+                if (random.boolean()) "p" else "r",
+                &delete_buffer[slot],
+            );
+        }
+        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
+        try std.testing.expect(db.materialization == .clean);
+        try expectClosureMatchesRebuild(&db);
+
+        // Every proof of v(k, S) comes from one p(k, Z) fact, so the stored
+        // derivation count must equal the number of such base facts.
+        for (keys) |key| {
+            var proofs = try db.execute("p(K, Z)?");
+            defer proofs.deinit();
+            var expected: u32 = 0;
+            for (proofs.query.answers.items) |*answer| {
+                const bound = try answer.getAtom("K");
+                if (std.mem.eql(u8, bound, key)) expected += 1;
+            }
+            try std.testing.expectEqual(expected, try derivationCountOf(&db, "v", key));
+        }
+    }
+}
+
+test "aggregate changes propagate through downstream list functions and arithmetic" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    // Pinned: this test asserts the incremental mechanism itself.
+    db.setMaintenancePolicy(.incremental);
+    db.setShadowVerification(true);
+    var setup = try db.execute(
+        \\team(red). team(blue).
+        \\roster(T, S) :- team(T), setof(P, plays(T, P), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\size(T, N) :- roster(T, S), length(S, N).
+        \\headcount(T, N) :- size(T, M), N = M + 1.
+        \\staffed(T) :- size(T, N), N > 1.
+    );
+    setup.deinit();
+    try db.materialize();
+
+    // Empty rosters flow through length, arithmetic, and the comparison.
+    var initial = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
+    initial.deinit();
+    try expectAnswerCount(&db, "staffed(T)?", 0);
+
+    // Growing one group must reach every downstream stratum.
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("plays", &.{ input.atom("red"), input.atom("ann") }),
+        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+    }, &.{}));
+    var grown = try db.execute("size(red, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
+    grown.deinit();
+    var counted = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 3), try counted.query.answers.items[0].getInteger("N"));
+    counted.deinit();
+    try expectAnswerCount(&db, "staffed(red)?", 1);
+    try expectAnswerCount(&db, "staffed(blue)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // Shrinking it retracts the downstream conclusions again.
+    try std.testing.expect(try db.applyChanges(&.{}, &.{
+        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+    }));
+    var shrunk = try db.execute("headcount(red, N)?");
+    try std.testing.expectEqual(@as(i64, 2), try shrunk.query.answers.items[0].getInteger("N"));
+    shrunk.deinit();
+    try expectAnswerCount(&db, "staffed(T)?", 0);
+    try expectClosureMatchesRebuild(&db);
+
+    // A downstream structural-recursive component recomputes within its own
+    // stratum rather than forcing a whole-closure rebuild.
+    const stats = db.maintenanceStats();
+    try std.testing.expect(stats.maintained_groups > 0);
+}
+
+fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\group(g1). group(g2). member(g1, a).
+        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
+    );
+    setup.deinit();
+    var first = try db.execute("collected(G, S)?");
+    first.deinit();
+    _ = try db.applyChanges(&.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
+        input.fact("member", &.{ input.atom("g2"), input.atom("c") }),
+    }, &.{});
+    _ = try db.applyChanges(&.{}, &.{
+        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+    });
+    var second = try db.execute("collected(g1, S)?");
+    defer second.deinit();
+    const formatted = try (try second.query.answers.items[0].getValue("S"))
+        .formatAlloc(allocator);
+    defer allocator.free(formatted);
+    if (!std.mem.eql(u8, formatted, "[b]")) return error.UnexpectedAggregate;
+}
+
+test "aggregate maintenance releases every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        aggregateMaintenanceAllocationScenario,
+        .{},
+    );
 }

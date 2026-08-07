@@ -7,6 +7,8 @@ const cost_model = @import("cost_model.zig");
 const syntax = @import("syntax.zig");
 const results = @import("results.zig");
 const evaluator = @import("evaluator.zig");
+const test_support = @import("test_support.zig");
+const expectBindingValue = test_support.expectBindingValue;
 const maintenance = @import("maintenance.zig");
 const aggregate_view = @import("aggregate_view.zig");
 pub const Error = error{
@@ -128,7 +130,7 @@ const StringTable = struct {
         return id;
     }
 
-    fn get(self: *const StringTable, string: []const u8) ?Id {
+    pub fn get(self: *const StringTable, string: []const u8) ?Id {
         return self.strings.get(string);
     }
 
@@ -255,7 +257,7 @@ pub const Jatalog = struct {
         self.* = undefined;
     }
 
-    fn clone(self: *const Jatalog) !Jatalog {
+    pub fn clone(self: *const Jatalog) !Jatalog {
         var result: Jatalog = .{
             .allocator = self.allocator,
             .strings = try self.strings.clone(),
@@ -947,7 +949,7 @@ pub const Jatalog = struct {
         return closure;
     }
 
-    fn expand(self: *Jatalog, facts: *RelationStore) !void {
+    pub fn expand(self: *Jatalog, facts: *RelationStore) !void {
         try self.eval.expandFrom(facts, 0);
     }
 
@@ -1763,111 +1765,7 @@ test {
     _ = evaluator;
     _ = maintenance;
     _ = aggregate_view;
-}
-
-/// Compares the semi-naive closure against the naive reference closure on a
-/// staging clone, so the database under test is left untouched.
-fn expectSemiNaiveMatchesNaive(db: *Jatalog) !void {
-    var staging = try db.clone();
-    defer staging.deinit();
-    var semi = try staging.facts.clone();
-    defer semi.deinit();
-    try staging.expand(&semi);
-    var naive = try staging.facts.clone();
-    defer naive.deinit();
-    try staging.eval.expandNaive(&naive);
-    try std.testing.expectEqual(naive.len(), semi.len());
-    for (0..naive.len()) |index|
-        try std.testing.expect(try semi.contains(naive.factAt(index)));
-}
-
-test "semi-naive and naive closures agree across rule classes" {
-    // Non-recursive joins.
-    var joins: Jatalog = .init(std.testing.allocator);
-    defer joins.deinit();
-    var joins_setup = try joins.execute(
-        \\parent(a, b). parent(b, c). parent(c, d).
-        \\grand(X, Z) :- parent(X, Y), parent(Y, Z).
-    );
-    joins_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&joins);
-
-    // Direct recursion.
-    var direct: Jatalog = .init(std.testing.allocator);
-    defer direct.deinit();
-    var direct_setup = try direct.execute(
-        \\edge(a, b). edge(b, c). edge(c, d). edge(d, a).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    direct_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&direct);
-
-    // Mutual recursion across two predicates in one stratum.
-    var mutual: Jatalog = .init(std.testing.allocator);
-    defer mutual.deinit();
-    var mutual_setup = try mutual.execute(
-        \\start(n0). step(n0, n1). step(n1, n2). step(n2, n3). step(n3, n4).
-        \\even(X) :- start(X).
-        \\even(X) :- odd(Y), step(Y, X).
-        \\odd(X) :- even(Y), step(Y, X).
-    );
-    mutual_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&mutual);
-
-    // Seeded structural recursion feeding a same-stratum consumer.
-    var structural: Jatalog = .init(std.testing.allocator);
-    defer structural.deinit();
-    var structural_setup = try structural.execute(
-        \\person(alice). person(bob). parent(alice, bob).
-        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\numchildren(X, N) :- children(X, S), length(S, N).
-    );
-    structural_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&structural);
-
-    // Stratified negation above a recursive stratum.
-    var negated: Jatalog = .init(std.testing.allocator);
-    defer negated.deinit();
-    var negated_setup = try negated.execute(
-        \\node(a). node(b). node(c). edge(a, b).
-        \\reachable(X) :- edge(a, X).
-        \\reachable(X) :- reachable(Y), edge(Y, X).
-        \\isolated(X) :- node(X), not reachable(X).
-    );
-    negated_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&negated);
-
-    // Aggregation over a recursive relation.
-    var aggregated: Jatalog = .init(std.testing.allocator);
-    defer aggregated.deinit();
-    var aggregated_setup = try aggregated.execute(
-        \\edge(a, b). edge(b, c).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
-    );
-    aggregated_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&aggregated);
-}
-
-test "multiple recursive body occurrences miss no derivations" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(n1, n2). edge(n2, n3). edge(n3, n4). edge(n4, n5).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- path(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectSemiNaiveMatchesNaive(&db);
-
-    // The doubling rule needs delta joins on both occurrences: n1 to n5
-    // only exists by combining two derived paths.
-    try expectAnswerCount(&db, "path(n1, n5)?", 1);
-    try expectAnswerCount(&db, "path(X, Y)?", 10);
+    _ = test_support;
 }
 
 test "repeated queries reuse the persistent closure without expansion" {
@@ -1881,12 +1779,12 @@ test "repeated queries reuse the persistent closure without expansion" {
     setup.deinit();
     try std.testing.expectEqual(@as(usize, 0), db.eval.expansions);
 
-    try expectAnswerCount(&db, "path(a, X)?", 3);
+    try test_support.expectAnswerCount(&db, "path(a, X)?", 3);
     const after_first = db.eval.expansions;
     try std.testing.expect(after_first > 0);
     try std.testing.expect(db.materialization == .clean);
 
-    for (0..3) |_| try expectAnswerCount(&db, "path(a, X)?", 3);
+    for (0..3) |_| try test_support.expectAnswerCount(&db, "path(a, X)?", 3);
     var typed = try db.query(&.{input.relation("path", &.{
         input.atom("a"),
         input.variable("target"),
@@ -1912,7 +1810,7 @@ test "persistent closure equals a fresh naive rebuild" {
         \\numchildren(X, N) :- children(X, S), length(S, N).
     );
     setup.deinit();
-    try expectAnswerCount(&db, "numchildren(alice, 1)?", 1);
+    try test_support.expectAnswerCount(&db, "numchildren(alice, 1)?", 1);
     try std.testing.expect(db.materialization == .clean);
 
     var staging = try db.clone();
@@ -1934,34 +1832,34 @@ test "base updates and rule additions rebuild the closure correctly" {
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
     );
     setup.deinit();
-    try expectAnswerCount(&db, "path(a, c)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, c)?", 1);
 
     // A base insertion marks the closure dirty and the next query repairs it.
     var inserted = try db.execute("edge(c, d).");
     inserted.deinit();
     try std.testing.expect(db.materialization == .dirty_from_stratum);
-    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, d)?", 1);
     try std.testing.expect(db.materialization == .clean);
 
     // Retraction removes derived consequences through the dirty rebuild.
     var retracted = try db.execute("edge(a, b)~");
     retracted.deinit();
-    try expectAnswerCount(&db, "path(a, c)?", 0);
-    try expectAnswerCount(&db, "path(b, d)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, c)?", 0);
+    try test_support.expectAnswerCount(&db, "path(b, d)?", 1);
 
     // Typed updates take the same paths.
     try db.addFact("edge", &.{ input.atom("d"), input.atom("e") });
-    try expectAnswerCount(&db, "path(b, e)?", 1);
+    try test_support.expectAnswerCount(&db, "path(b, e)?", 1);
     try std.testing.expect(try db.retract(&.{
         input.relation("edge", &.{ input.atom("d"), input.atom("e") }),
     }));
-    try expectAnswerCount(&db, "path(b, e)?", 0);
+    try test_support.expectAnswerCount(&db, "path(b, e)?", 0);
 
     // Rule addition invalidates from the new head's stratum.
     var extended = try db.execute("reach(X) :- path(b, X).");
     extended.deinit();
     try std.testing.expect(db.materialization == .dirty_from_stratum);
-    try expectAnswerCount(&db, "reach(d)?", 1);
+    try test_support.expectAnswerCount(&db, "reach(d)?", 1);
 }
 
 test "dirty stratum rebuild skips clean lower strata" {
@@ -1975,20 +1873,20 @@ test "dirty stratum rebuild skips clean lower strata" {
     );
     setup.deinit();
     // First materialization runs both strata.
-    try expectAnswerCount(&db, "note(a)?", 1);
+    try test_support.expectAnswerCount(&db, "note(a)?", 1);
     const full_build = db.eval.expansions;
     try std.testing.expectEqual(@as(usize, 2), full_build);
 
     // Only the negation stratum reads flag, so its update rebuilds one level.
     var flagged = try db.execute("flag(c).");
     flagged.deinit();
-    try expectAnswerCount(&db, "note(X)?", 1);
+    try test_support.expectAnswerCount(&db, "note(X)?", 1);
     try std.testing.expectEqual(full_build + 1, db.eval.expansions);
 
     // An edge update dirties the recursive stratum and rebuilds both levels.
     var edged = try db.execute("edge(c, d).");
     edged.deinit();
-    try expectAnswerCount(&db, "note(X)?", 1);
+    try test_support.expectAnswerCount(&db, "note(X)?", 1);
     try std.testing.expectEqual(full_build + 3, db.eval.expansions);
 }
 
@@ -1996,7 +1894,7 @@ test "a database without rules allocates no derived machinery" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     try db.addFact("kept", &.{input.integer(1)});
-    try expectAnswerCount(&db, "kept(1)?", 1);
+    try test_support.expectAnswerCount(&db, "kept(1)?", 1);
     var typed = try db.query(&.{input.relation("kept", &.{input.variable("n")})});
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.answers.items.len);
@@ -2037,1332 +1935,6 @@ test "materialization lifecycle releases every allocation on failure" {
     );
 }
 
-/// Compares the database's materialized closure against a fresh naive
-/// rebuild from its current base facts and rules.
-fn expectClosureMatchesRebuild(db: *Jatalog) !void {
-    var staging = try db.clone();
-    defer staging.deinit();
-    var rebuilt = try staging.facts.clone();
-    defer rebuilt.deinit();
-    try staging.eval.expandNaive(&rebuilt);
-    const closure = &db.closure.?;
-    try std.testing.expectEqual(rebuilt.len(), closure.len());
-    for (0..rebuilt.len()) |index|
-        try std.testing.expect(try closure.contains(rebuilt.factAt(index)));
-}
-
-test "insert-only batches propagate incrementally and match full rebuild" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\edge(n0, n1). edge(n1, n2).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "path(n0, n2)?", 1);
-    const expansions_after_build = db.eval.expansions;
-
-    // Each batch extends the chain; the closure stays clean and matches a
-    // full rebuild after every batch without any stratum expansion.
-    var name_buffer: [16]u8 = undefined;
-    var next_buffer: [16]u8 = undefined;
-    for (2..6) |index| {
-        const from = try std.fmt.bufPrint(&name_buffer, "n{d}", .{index});
-        const to = try std.fmt.bufPrint(&next_buffer, "n{d}", .{index + 1});
-        try std.testing.expect(try db.applyChanges(&.{
-            input.fact("edge", &.{ input.atom(from), input.atom(to) }),
-        }, &.{}));
-        try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
-    }
-    try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
-    try std.testing.expect(db.propagated_facts > 0);
-    try expectAnswerCount(&db, "path(n0, n6)?", 1);
-    try expectAnswerCount(&db, "path(X, Y)?", 21);
-}
-
-test "one inserted edge propagates each recursive consequence exactly once" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c). edge(c, d).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "path(X, Y)?", 6);
-
-    // Inserting edge(d, e) derives exactly the four new paths a-e, b-e,
-    // c-e, and d-e; each is propagated and counted exactly once.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
-    }, &.{}));
-    try std.testing.expectEqual(@as(usize, 4), db.propagated_facts);
-    try expectAnswerCount(&db, "path(X, Y)?", 10);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "duplicate base insertions produce no derived delta" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "path(a, b)?", 1);
-    const closure_len = db.closure.?.len();
-    const propagated = db.propagated_facts;
-
-    try std.testing.expect(!try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }, &.{}));
-    try std.testing.expectEqual(closure_len, db.closure.?.len());
-    try std.testing.expectEqual(propagated, db.propagated_facts);
-    try std.testing.expect(db.materialization == .clean);
-}
-
-test "propagation reaching negation or setof falls back to dirty rebuild" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\edge(a, b). flag(a). flag(b).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\note(X) :- flag(X), not path(a, X).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "note(X)?", 1);
-    const expansions_after_build = db.eval.expansions;
-
-    // flag is only read positively, so its insertion propagates through the
-    // negation stratum without any rebuild.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("flag", &.{input.atom("c")}),
-    }, &.{}));
-    try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
-    try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "note(c)?", 1);
-    try expectClosureMatchesRebuild(&db);
-
-    // An edge insertion grows path, which the negation reads, so the
-    // negation stratum rebuilds while the positive stratum stays
-    // incremental.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("b"), input.atom("c") }),
-    }, &.{}));
-    try std.testing.expectEqual(expansions_after_build + 1, db.eval.expansions);
-    try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "note(c)?", 0);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "batch deletions and mixed batches maintain the closure correctly" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "path(a, c)?", 1);
-
-    // Deleting an absent fact alone is a no-op that commits nothing.
-    try std.testing.expect(!try db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.atom("x"), input.atom("y") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-
-    // A mixed batch deletes one edge and inserts another as one transition.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
-    }, &.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }));
-    try expectAnswerCount(&db, "path(a, c)?", 0);
-    try expectAnswerCount(&db, "path(b, d)?", 1);
-    try expectClosureMatchesRebuild(&db);
-
-    try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{
-        input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
-    }, &.{}));
-    try std.testing.expectError(Error.InvalidFact, db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.variable("x"), input.atom("y") }),
-    }));
-}
-
-test "deleting the only base support removes the entire unsupported cycle" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c). edge(c, a).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    // The full cycle reaches every node from every node.
-    try expectAnswerCount(&db, "path(X, Y)?", 9);
-    const expansions_after_build = db.eval.expansions;
-
-    // After deleting edge(a, b) the cyclically self-supporting facts such
-    // as path(a, a) must all disappear; reference counts alone would keep
-    // them alive. The deletion is incremental: no stratum expansion runs.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
-    try std.testing.expect(db.removed_facts > 0);
-    try expectAnswerCount(&db, "path(a, a)?", 0);
-    try expectAnswerCount(&db, "path(X, Y)?", 3);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "alternative recursive and non-recursive derivations preserve facts" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(a, c). edge(b, d). edge(c, d).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\marked(a).
-        \\special(X) :- marked(X).
-        \\special(X) :- path(X, d).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "path(a, d)?", 1);
-    try expectAnswerCount(&db, "special(b)?", 1);
-
-    // path(a, d) survives the deletion through the c branch of the diamond,
-    // while path(b, d) and with it special(b) lose their only support.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.atom("b"), input.atom("d") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "path(a, d)?", 1);
-    try expectAnswerCount(&db, "special(b)?", 0);
-    try expectClosureMatchesRebuild(&db);
-
-    // special(a) loses its non-recursive derivation but survives through
-    // the recursive path(a, d) alternative.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("marked", &.{input.atom("a")}),
-    }));
-    try expectAnswerCount(&db, "special(a)?", 1);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "a deletion falling back to rebuild leaves the batch's insertions a clean closure" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\node(a). node(b). node(c). edge(a, b).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\isolated(X) :- node(X), not path(a, X).
-    );
-    setup.deinit();
-    try db.materialize();
-    try expectAnswerCount(&db, "isolated(b)?", 0);
-
-    // Deleting the edge over-deletes path(a, b), which reaches `isolated`
-    // through negation and forces delete-and-rederive to abandon the
-    // incremental path. The insertion in the same batch then has to find a
-    // clean closure to propagate into: the fallback repairs the closure
-    // through `ensureMaterialized` rather than leaving it dirty, which is
-    // the invariant `applyInsertions` asserts.
-    const before = db.maintenanceStats().rebuild_fallbacks;
-    try std.testing.expect(try db.applyChanges(
-        &.{input.fact("edge", &.{ input.atom("b"), input.atom("c") })},
-        &.{input.fact("edge", &.{ input.atom("a"), input.atom("b") })},
-    ));
-    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > before);
-
-    try expectAnswerCount(&db, "isolated(b)?", 1);
-    try expectAnswerCount(&db, "path(b, c)?", 1);
-    try expectAnswerCount(&db, "path(a, c)?", 0);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "adding and removing a fact toggles negation-dependent conclusions" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\item(a). item(b).
-        \\blocked(b).
-        \\allowed(X) :- item(X), not blocked(X).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "allowed(a)?", 1);
-    try expectAnswerCount(&db, "allowed(b)?", 0);
-
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("blocked", &.{input.atom("a")}),
-    }, &.{}));
-    try expectAnswerCount(&db, "allowed(a)?", 0);
-    try expectClosureMatchesRebuild(&db);
-
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("blocked", &.{input.atom("a")}),
-    }));
-    try expectAnswerCount(&db, "allowed(a)?", 1);
-    try expectAnswerCount(&db, "allowed(b)?", 0);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "projection counts change without prematurely deleting supported tuples" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\holds(a, b1). holds(a, b2).
-        \\present(X) :- holds(X, Y).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "present(a)?", 1);
-    const present_id = db.strings.get("present").?;
-    const support_before = blk: {
-        for (0..db.closure.?.len()) |index| {
-            const fact = db.closure.?.factAt(index);
-            if (fact.predicate == present_id) break :blk db.closure.?.supportAt(index);
-        }
-        return error.MissingFact;
-    };
-    try std.testing.expect(support_before >= 2);
-
-    // Removing one of two supports keeps the tuple with changed support.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("holds", &.{ input.atom("a"), input.atom("b1") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "present(a)?", 1);
-    const support_after = blk: {
-        for (0..db.closure.?.len()) |index| {
-            const fact = db.closure.?.factAt(index);
-            if (fact.predicate == present_id) break :blk db.closure.?.supportAt(index);
-        }
-        return error.MissingFact;
-    };
-    try std.testing.expect(support_after != support_before);
-    try expectClosureMatchesRebuild(&db);
-
-    // Removing the last support deletes the tuple.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("holds", &.{ input.atom("a"), input.atom("b2") }),
-    }));
-    try expectAnswerCount(&db, "present(a)?", 0);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "random mixed update traces match a clean rebuild after every batch" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\node(a). node(b). node(c). node(d). node(e).
-        \\edge(a, b). edge(b, c).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\isolated(X) :- node(X), not path(a, X).
-        \\summary(S) :- node(a), setof([X, Y], path(X, Y), S).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "summary(S)?", 1);
-
-    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
-    var prng = std.Random.DefaultPrng.init(0x5eed5eed5eed5eed);
-    const random = prng.random();
-    for (0..40) |_| {
-        var insert_buffer: [3][2]input.Term = undefined;
-        var inserts: [3]input.Relation = undefined;
-        const insert_count = random.uintLessThan(usize, 3);
-        for (0..insert_count) |slot| {
-            insert_buffer[slot] = .{
-                input.atom(names[random.uintLessThan(usize, names.len)]),
-                input.atom(names[random.uintLessThan(usize, names.len)]),
-            };
-            inserts[slot] = input.fact("edge", &insert_buffer[slot]);
-        }
-        var delete_buffer: [3][2]input.Term = undefined;
-        var deletes: [3]input.Relation = undefined;
-        const delete_count = random.uintLessThan(usize, 3);
-        for (0..delete_count) |slot| {
-            delete_buffer[slot] = .{
-                input.atom(names[random.uintLessThan(usize, names.len)]),
-                input.atom(names[random.uintLessThan(usize, names.len)]),
-            };
-            deletes[slot] = input.fact("edge", &delete_buffer[slot]);
-        }
-        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
-        try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
-    }
-}
-
-test "aggregate groups are maintained incrementally across member changes" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\group(g1). group(g2).
-        \\member(g1, b). member(g1, a). member(g2, z).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
-    setup.deinit();
-    var initial = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a, b]");
-    initial.deinit();
-    const expansions_after_build = db.eval.expansions;
-
-    // Member insertion updates only the affected group, with no rebuild.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("c") }),
-    }, &.{}));
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
-    var inserted = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&db, &inserted.query.answers.items[0], "S", "[a, b, c]");
-    inserted.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // The untouched group keeps its list and there is exactly one tuple
-    // per group after the change.
-    var untouched = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&db, &untouched.query.answers.items[0], "S", "[z]");
-    untouched.deinit();
-    try expectAnswerCount(&db, "collected(G, S)?", 2);
-
-    // Member deletion shrinks the list.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
-    }));
-    var deleted = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&db, &deleted.query.answers.items[0], "S", "[b, c]");
-    deleted.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Deleting the last member leaves the enumerated group with an empty
-    // list, because its outer goal still derives the group.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g2"), input.atom("z") }),
-    }));
-    var emptied = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&db, &emptied.query.answers.items[0], "S", "[]");
-    emptied.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Deleting the group key removes the tuple entirely.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("group", &.{input.atom("g2")}),
-    }));
-    try expectAnswerCount(&db, "collected(g2, S)?", 0);
-    try expectAnswerCount(&db, "collected(G, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
-
-    // Restoring the group key brings back an empty group.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("group", &.{input.atom("g2")}),
-    }, &.{}));
-    var restored = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&db, &restored.query.answers.items[0], "S", "[]");
-    restored.deinit();
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "duplicate member derivations do not disturb a maintained group" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\group(g). direct(g, a). mirrored(g, a). direct(g, b).
-        \\member(G, X) :- direct(G, X).
-        \\member(G, X) :- mirrored(G, X).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
-    setup.deinit();
-    var initial = try db.execute("collected(g, S)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a, b]");
-    initial.deinit();
-
-    // Removing one of two derivations of member(g, a) keeps the member.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("mirrored", &.{ input.atom("g"), input.atom("a") }),
-    }));
-    var kept = try db.execute("collected(g, S)?");
-    try expectBindingValue(&db, &kept.query.answers.items[0], "S", "[a, b]");
-    kept.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Removing the last derivation drops it from the list.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("direct", &.{ input.atom("g"), input.atom("a") }),
-    }));
-    var dropped = try db.execute("collected(g, S)?");
-    try expectBindingValue(&db, &dropped.query.answers.items[0], "S", "[b]");
-    dropped.deinit();
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "canonical aggregate lists are independent of update order" {
-    const orders = [_][3][]const u8{
-        .{ "c", "a", "b" },
-        .{ "b", "c", "a" },
-        .{ "a", "b", "c" },
-    };
-    for (orders) |order| {
-        var db: Jatalog = .init(std.testing.allocator);
-        defer db.deinit();
-        var setup = try db.execute(
-            \\group(g).
-            \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        );
-        setup.deinit();
-        var empty = try db.execute("collected(g, S)?");
-        try expectBindingValue(&db, &empty.query.answers.items[0], "S", "[]");
-        empty.deinit();
-
-        for (order) |name| {
-            _ = try db.applyChanges(&.{
-                input.fact("member", &.{ input.atom("g"), input.atom(name) }),
-            }, &.{});
-        }
-        var result = try db.execute("collected(g, S)?");
-        try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a, b, c]");
-        result.deinit();
-        try expectClosureMatchesRebuild(&db);
-    }
-}
-
-test "bag emulation retains equal values with distinct discriminators" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\group(g). reading(g, r1, 5). reading(g, r2, 5). reading(g, r3, 7).
-        \\bag(G, S) :- group(G), setof([V, D], reading(G, D, V), S).
-    );
-    setup.deinit();
-    var initial = try db.execute("bag(g, S)?");
-    try expectBindingValue(
-        &db,
-        &initial.query.answers.items[0],
-        "S",
-        "[[5, r1], [5, r2], [7, r3]]",
-    );
-    initial.deinit();
-
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("reading", &.{ input.atom("g"), input.atom("r4"), input.integer(5) }),
-    }, &.{}));
-    var added = try db.execute("bag(g, S)?");
-    try expectBindingValue(
-        &db,
-        &added.query.answers.items[0],
-        "S",
-        "[[5, r1], [5, r2], [5, r4], [7, r3]]",
-    );
-    added.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Removing one duplicate value keeps the others.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("reading", &.{ input.atom("g"), input.atom("r2"), input.integer(5) }),
-    }));
-    var removed = try db.execute("bag(g, S)?");
-    try expectBindingValue(
-        &db,
-        &removed.query.answers.items[0],
-        "S",
-        "[[5, r1], [5, r4], [7, r3]]",
-    );
-    removed.deinit();
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "maintained aggregates feed downstream strata and recursive consumers" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\person(alice). person(bob).
-        \\parent(alice, bob).
-        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\numchildren(X, N) :- children(X, S), length(S, N).
-    );
-    setup.deinit();
-    var initial = try db.execute("numchildren(alice, N)?");
-    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
-    initial.deinit();
-
-    // A new child changes the aggregate list, which must flow through the
-    // downstream structural list function.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("person", &.{input.atom("carol")}),
-        input.fact("parent", &.{ input.atom("alice"), input.atom("carol") }),
-    }, &.{}));
-    var grown = try db.execute("numchildren(alice, N)?");
-    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
-    grown.deinit();
-    try expectAnswerCount(&db, "numchildren(X, N)?", 3);
-    try expectClosureMatchesRebuild(&db);
-
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }),
-    }));
-    var shrunk = try db.execute("numchildren(alice, N)?");
-    try std.testing.expectEqual(@as(i64, 1), try shrunk.query.answers.items[0].getInteger("N"));
-    shrunk.deinit();
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "multiple and nested aggregates stay correct through the rebuild path" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\group(g1). group(g2). item(g1, a). item(g2, b). tag(g1, t1). tag(g2, t2).
-        \\both(G, S, T) :- group(G), setof(X, item(G, X), S), setof(Y, tag(G, Y), T).
-        \\nested(S) :- group(g1), setof([G, T], (group(G), setof(X, item(G, X), T)), S).
-    );
-    setup.deinit();
-    var initial = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[a]");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "T", "[t1]");
-    initial.deinit();
-
-    // Rules outside the maintainable class fall back to the stratum
-    // rebuild, which must still produce rebuild-equivalent results.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("item", &.{ input.atom("g1"), input.atom("c") }),
-        input.fact("tag", &.{ input.atom("g1"), input.atom("t3") }),
-    }, &.{}));
-    var updated = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&db, &updated.query.answers.items[0], "S", "[a, c]");
-    try expectBindingValue(&db, &updated.query.answers.items[0], "T", "[t1, t3]");
-    updated.deinit();
-    var nested = try db.execute("nested(S)?");
-    try expectBindingValue(
-        &db,
-        &nested.query.answers.items[0],
-        "S",
-        "[[g1, [a, c]], [g2, [b]]]",
-    );
-    nested.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("item", &.{ input.atom("g1"), input.atom("a") }),
-    }));
-    var reduced = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&db, &reduced.query.answers.items[0], "S", "[c]");
-    reduced.deinit();
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "random aggregate update traces match a clean rebuild after every batch" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\group(g1). group(g2). group(g3).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\size(G, N) :- collected(G, S), length(S, N).
-        \\empty(G) :- group(G), not member(G, m1), not member(G, m2), not member(G, m3).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "size(G, N)?", 3);
-
-    const groups = [_][]const u8{ "g1", "g2", "g3" };
-    const members = [_][]const u8{ "m1", "m2", "m3" };
-    var prng = std.Random.DefaultPrng.init(0xa99a6a7e5eed);
-    const random = prng.random();
-    for (0..40) |_| {
-        var insert_buffer: [2][2]input.Term = undefined;
-        var inserts: [2]input.Relation = undefined;
-        const insert_count = random.uintLessThan(usize, 3);
-        for (0..insert_count) |slot| {
-            insert_buffer[slot] = .{
-                input.atom(groups[random.uintLessThan(usize, groups.len)]),
-                input.atom(members[random.uintLessThan(usize, members.len)]),
-            };
-            inserts[slot] = input.fact("member", &insert_buffer[slot]);
-        }
-        var delete_buffer: [2][2]input.Term = undefined;
-        var deletes: [2]input.Relation = undefined;
-        const delete_count = random.uintLessThan(usize, 3);
-        for (0..delete_count) |slot| {
-            delete_buffer[slot] = .{
-                input.atom(groups[random.uintLessThan(usize, groups.len)]),
-                input.atom(members[random.uintLessThan(usize, members.len)]),
-            };
-            deletes[slot] = input.fact("member", &delete_buffer[slot]);
-        }
-        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
-        try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
-    }
-}
-
-/// Derivation count the auxiliary view records for the single tuple of
-/// `predicate` whose first argument is the atom `first_atom`.
-fn derivationCountOf(
-    db: *Jatalog,
-    predicate: []const u8,
-    first_atom: []const u8,
-) !u32 {
-    const predicate_id = db.strings.get(predicate) orelse return error.MissingPredicate;
-    const scalar_id = try db.eval.scalars.internAtom(first_atom);
-    const first_value = try db.eval.values.intern(.{ .scalar = scalar_id });
-    for (db.eval.rules.items) |rule| {
-        if (rule.head.predicate != predicate_id) continue;
-        const view = aggregate_view.auxiliaryFor(db, rule.id) orelse return error.NotProjected;
-        const closure = &db.closure.?;
-        for (0..closure.len()) |index| {
-            const fact = closure.factAt(index);
-            if (fact.predicate != predicate_id or fact.terms[0] != first_value) continue;
-            return view.derivationCount(fact.terms);
-        }
-        return 0;
-    }
-    return error.MissingPredicate;
-}
-
-test "Chapter 5 Example 5.2.1 maintains a view without projections" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\p(a). p(b). r(a, 1). r(c, 3).
-        \\v(X, S) :- p(X), setof(Y, r(X, Y), S).
-    );
-    setup.deinit();
-
-    // The materialization contains v(a, [1]) and v(b, []).
-    var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[1]");
-    initial.deinit();
-    var empty = try db.execute("v(b, S)?");
-    try expectBindingValue(&db, &empty.query.answers.items[0], "S", "[]");
-    empty.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 2);
-
-    // Deleting p(a) and inserting r(b, 2) deletes v(a, [1]) and updates
-    // v(b, []) to v(b, [2]).
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("r", &.{ input.atom("b"), input.integer(2) }),
-    }, &.{
-        input.fact("p", &.{input.atom("a")}),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "v(a, S)?", 0);
-    var updated = try db.execute("v(b, S)?");
-    try expectBindingValue(&db, &updated.query.answers.items[0], "S", "[2]");
-    updated.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
-
-    // This view retains every outer variable, so it is self-maintainable and
-    // needs no auxiliary derivation counts.
-    const stats = db.maintenanceStats();
-    try std.testing.expectEqual(@as(usize, 1), stats.self_maintainable_views);
-    try std.testing.expectEqual(@as(usize, 0), stats.projected_views);
-    try std.testing.expectEqual(@as(usize, 0), stats.auxiliary_tuples);
-}
-
-test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\p(a, 1). p(a, 2). p(b, 1). r(a, 1). r(a, 2). r(b, 2).
-        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
-    setup.deinit();
-
-    var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[1, 2]");
-    initial.deinit();
-    var other = try db.execute("v(b, S)?");
-    try expectBindingValue(&db, &other.query.answers.items[0], "S", "[2]");
-    other.deinit();
-
-    // The auxiliary counting view holds v(a, [1, 2]) with two derivations
-    // and v(b, [2]) with one, matching the chapter's v_c extension.
-    const stats = db.maintenanceStats();
-    try std.testing.expectEqual(@as(usize, 1), stats.projected_views);
-    try std.testing.expectEqual(@as(usize, 0), stats.self_maintainable_views);
-    try std.testing.expectEqual(@as(usize, 3), stats.auxiliary_tuples);
-    try std.testing.expectEqual(@as(u32, 2), try derivationCountOf(&db, "v", "a"));
-    try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "b"));
-
-    // Deleting p(a, 2) removes one of two derivations, so the tuple stays.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("p", &.{ input.atom("a"), input.integer(2) }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    var retained = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &retained.query.answers.items[0], "S", "[1, 2]");
-    retained.deinit();
-    try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "a"));
-    try expectClosureMatchesRebuild(&db);
-
-    // Deleting p(a, 1) removes the last derivation, so the tuple goes.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("p", &.{ input.atom("a"), input.integer(1) }),
-    }));
-    try expectAnswerCount(&db, "v(a, S)?", 0);
-    try std.testing.expectEqual(@as(u32, 0), try derivationCountOf(&db, "v", "a"));
-    try expectAnswerCount(&db, "v(X, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "a changed aggregate list transfers support to the new tuple" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\p(a, 1). p(a, 2). p(a, 3). r(a, 1).
-        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
-    setup.deinit();
-    var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &initial.query.answers.items[0], "S", "[1]");
-    initial.deinit();
-    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
-
-    // Growing the member set replaces the old tuple with the new one and
-    // carries all three derivations across in the same batch.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("r", &.{ input.atom("a"), input.integer(2) }),
-    }, &.{}));
-    try std.testing.expect(db.materialization == .clean);
-    var moved = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &moved.query.answers.items[0], "S", "[1, 2]");
-    moved.deinit();
-    try expectAnswerCount(&db, "v(a, S)?", 1);
-    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
-    try std.testing.expectEqual(@as(usize, 3), db.maintenanceStats().auxiliary_tuples);
-    try expectClosureMatchesRebuild(&db);
-
-    // Shrinking it back transfers the support again.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("r", &.{ input.atom("a"), input.integer(1) }),
-    }));
-    var shrunk = try db.execute("v(a, S)?");
-    try expectBindingValue(&db, &shrunk.query.answers.items[0], "S", "[2]");
-    shrunk.deinit();
-    try expectAnswerCount(&db, "v(a, S)?", 1);
-    try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "projected view counts agree with explicit proof enumeration" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\p(a, 1). r(a, 1).
-        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
-    setup.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 1);
-
-    const keys = [_][]const u8{ "a", "b", "c" };
-    var prng = std.Random.DefaultPrng.init(0xc0107501c0107);
-    const random = prng.random();
-    for (0..40) |_| {
-        var insert_buffer: [2][2]input.Term = undefined;
-        var inserts: [2]input.Relation = undefined;
-        const insert_count = random.uintLessThan(usize, 3);
-        for (0..insert_count) |slot| {
-            const key = keys[random.uintLessThan(usize, keys.len)];
-            const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
-            insert_buffer[slot] = .{ input.atom(key), input.integer(number) };
-            inserts[slot] = input.fact(
-                if (random.boolean()) "p" else "r",
-                &insert_buffer[slot],
-            );
-        }
-        var delete_buffer: [2][2]input.Term = undefined;
-        var deletes: [2]input.Relation = undefined;
-        const delete_count = random.uintLessThan(usize, 3);
-        for (0..delete_count) |slot| {
-            const key = keys[random.uintLessThan(usize, keys.len)];
-            const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
-            delete_buffer[slot] = .{ input.atom(key), input.integer(number) };
-            deletes[slot] = input.fact(
-                if (random.boolean()) "p" else "r",
-                &delete_buffer[slot],
-            );
-        }
-        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
-        try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
-
-        // Every proof of v(k, S) comes from one p(k, Z) fact, so the stored
-        // derivation count must equal the number of such base facts.
-        for (keys) |key| {
-            var proofs = try db.execute("p(K, Z)?");
-            defer proofs.deinit();
-            var expected: u32 = 0;
-            for (proofs.query.answers.items) |*answer| {
-                const bound = try answer.getAtom("K");
-                if (std.mem.eql(u8, bound, key)) expected += 1;
-            }
-            try std.testing.expectEqual(expected, try derivationCountOf(&db, "v", key));
-        }
-    }
-}
-
-test "retraction maintains the closure incrementally" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c). edge(c, a). edge(x, y).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try db.materialize();
-    try expectAnswerCount(&db, "path(X, Y)?", 10);
-    const after_build = db.maintenanceStats();
-
-    // A typed retraction runs delete-and-rederive rather than dirtying the
-    // stratum, so no rule expansion happens and the closure stays clean.
-    try std.testing.expect(try db.retract(&.{
-        input.relation("edge", &.{ input.atom("x"), input.atom("y") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
-    try std.testing.expect(db.maintenanceStats().removed_facts > after_build.removed_facts);
-    try expectAnswerCount(&db, "path(x, y)?", 0);
-    try expectClosureMatchesRebuild(&db);
-
-    // Retracting the only base support of a cycle removes the whole
-    // unsupported cycle, still without a rebuild.
-    const before_cycle = db.maintenanceStats();
-    try std.testing.expect(try db.retract(&.{
-        input.relation("edge", &.{ input.atom("c"), input.atom("a") }),
-    }));
-    try std.testing.expectEqual(before_cycle.stratum_expansions, db.maintenanceStats().stratum_expansions);
-    try expectAnswerCount(&db, "path(a, a)?", 0);
-    try expectAnswerCount(&db, "path(a, c)?", 1);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "pattern retraction removes every matching fact incrementally" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\edge(a, b). edge(a, c). edge(a, d). edge(b, e).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try db.materialize();
-    const after_build = db.maintenanceStats();
-
-    // One goal with a variable retracts all three outgoing edges of a.
-    try std.testing.expect(try db.retract(&.{
-        input.relation("edge", &.{ input.atom("a"), input.variable("target") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
-    try expectAnswerCount(&db, "edge(a, X)?", 0);
-    try expectAnswerCount(&db, "path(a, X)?", 0);
-    try expectAnswerCount(&db, "path(b, e)?", 1);
-    try expectClosureMatchesRebuild(&db);
-
-    // Source-level retraction takes the same path.
-    const before_source = db.maintenanceStats();
-    var retracted = try db.execute("edge(b, e)~");
-    retracted.deinit();
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(before_source.stratum_expansions, db.maintenanceStats().stratum_expansions);
-    try expectAnswerCount(&db, "path(X, Y)?", 0);
-    try expectClosureMatchesRebuild(&db);
-}
-
-test "retraction maintains aggregate groups and negation strata" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\group(g1). group(g2). member(g1, a). member(g1, b). member(g2, z).
-        \\banned(g2).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        \\allowed(G) :- group(G), not banned(G).
-    );
-    setup.deinit();
-    try db.materialize();
-    const after_build = db.maintenanceStats();
-
-    // Retracting a member updates only the affected group's list.
-    try std.testing.expect(try db.retract(&.{
-        input.relation("member", &.{ input.atom("g1"), input.atom("a") }),
-    }));
-    try std.testing.expect(db.materialization == .clean);
-    try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
-    try std.testing.expect(db.maintenanceStats().maintained_groups > after_build.maintained_groups);
-    var collected = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&db, &collected.query.answers.items[0], "S", "[b]");
-    collected.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Retracting the last member leaves the enumerated group empty.
-    try std.testing.expect(try db.retract(&.{
-        input.relation("member", &.{ input.atom("g1"), input.atom("b") }),
-    }));
-    var emptied = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&db, &emptied.query.answers.items[0], "S", "[]");
-    emptied.deinit();
-    try expectClosureMatchesRebuild(&db);
-
-    // Retracting a negated predicate is the documented rebuild category.
-    const before_negation = db.maintenanceStats();
-    try expectAnswerCount(&db, "allowed(g2)?", 0);
-    try std.testing.expect(try db.retract(&.{
-        input.relation("banned", &.{input.atom("g2")}),
-    }));
-    try expectAnswerCount(&db, "allowed(g2)?", 1);
-    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > before_negation.rebuild_fallbacks);
-    try expectClosureMatchesRebuild(&db);
-}
-
-fn retractionAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(a, c). edge(b, c). group(g). member(g, m1). member(g, m2).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
-    setup.deinit();
-    try db.materialize();
-    _ = try db.retract(&.{
-        input.relation("edge", &.{ input.atom("a"), input.variable("target") }),
-    });
-    _ = try db.retract(&.{
-        input.relation("member", &.{ input.atom("g"), input.atom("m1") }),
-    });
-    var result = try db.execute("collected(g, S)?");
-    defer result.deinit();
-    const formatted = try (try result.query.answers.items[0].getValue("S")).formatAlloc(allocator);
-    defer allocator.free(formatted);
-    if (!std.mem.eql(u8, formatted, "[m2]")) return error.UnexpectedAggregate;
-}
-
-test "incremental retraction releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        retractionAllocationScenario,
-        .{},
-    );
-}
-
-/// Runs one deterministic update trace under a fixed policy and returns the
-/// materialized database for comparison.
-fn runPolicyTrace(db: *Jatalog, policy: MaintenancePolicy) !void {
-    db.setMaintenancePolicy(policy);
-    var setup = try db.execute(
-        \\node(a). node(b). node(c). group(g1). group(g2).
-        \\edge(a, b). member(g1, m1). member(g2, m2).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\size(G, N) :- collected(G, S), length(S, N).
-        \\isolated(X) :- node(X), not path(a, X).
-    );
-    setup.deinit();
-    try db.materialize();
-
-    const nodes = [_][]const u8{ "a", "b", "c" };
-    const groups = [_][]const u8{ "g1", "g2" };
-    const members = [_][]const u8{ "m1", "m2", "m3" };
-    var prng = std.Random.DefaultPrng.init(0xc05715c05715);
-    const random = prng.random();
-    for (0..40) |step| {
-        var edge_terms: [2]input.Term = .{
-            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
-            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
-        };
-        var member_terms: [2]input.Term = .{
-            input.atom(groups[random.uintLessThan(usize, groups.len)]),
-            input.atom(members[random.uintLessThan(usize, members.len)]),
-        };
-        if (step % 4 == 3) {
-            // Exercise pattern retraction as well as the batch API.
-            _ = try db.retract(&.{input.relation("member", &.{
-                input.atom(groups[random.uintLessThan(usize, groups.len)]),
-                input.variable("any"),
-            })});
-            continue;
-        }
-        var inserts: [2]input.Relation = undefined;
-        var deletes: [2]input.Relation = undefined;
-        var insert_count: usize = 0;
-        var delete_count: usize = 0;
-        if (random.boolean()) {
-            inserts[insert_count] = input.fact("edge", &edge_terms);
-            insert_count += 1;
-        } else {
-            deletes[delete_count] = input.fact("edge", &edge_terms);
-            delete_count += 1;
-        }
-        if (random.boolean()) {
-            inserts[insert_count] = input.fact("member", &member_terms);
-            insert_count += 1;
-        } else {
-            deletes[delete_count] = input.fact("member", &member_terms);
-            delete_count += 1;
-        }
-        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
-    }
-    try db.materialize();
-}
-
-/// Program used by the cost-attribution tests below: a transitive closure
-/// small enough that one edge change is cheap to maintain.
-const cost_attribution_program =
-    \\edge(a, b). edge(b, c).
-    \\path(X, Y) :- edge(X, Y).
-    \\path(X, Z) :- edge(X, Y), path(Y, Z).
-;
-
-test "the maintenance estimate counts facts changed, not facts named" {
-    const new_edge = input.fact("edge", &.{ input.atom("c"), input.atom("d") });
-
-    var lean: Jatalog = .init(std.testing.allocator);
-    defer lean.deinit();
-    lean.setMaintenancePolicy(.incremental);
-    var lean_setup = try lean.execute(cost_attribution_program);
-    lean_setup.deinit();
-    try lean.materialize();
-    _ = try lean.applyChanges(&.{new_edge}, &.{});
-
-    var padded: Jatalog = .init(std.testing.allocator);
-    defer padded.deinit();
-    padded.setMaintenancePolicy(.incremental);
-    var padded_setup = try padded.execute(cost_attribution_program);
-    padded_setup.deinit();
-    try padded.materialize();
-    // The same single real insertion, named alongside deletions of facts the
-    // database does not hold. Deleting an absent fact is a no-op, so the cost
-    // per changed fact must match the lean batch rather than being divided by
-    // the number of relations the caller happened to name.
-    _ = try padded.applyChanges(&.{new_edge}, &.{
-        input.fact("edge", &.{ input.atom("p"), input.atom("q") }),
-        input.fact("edge", &.{ input.atom("q"), input.atom("r") }),
-        input.fact("edge", &.{ input.atom("r"), input.atom("s") }),
-        input.fact("edge", &.{ input.atom("s"), input.atom("t") }),
-        input.fact("edge", &.{ input.atom("t"), input.atom("u") }),
-        input.fact("edge", &.{ input.atom("u"), input.atom("v") }),
-        input.fact("edge", &.{ input.atom("v"), input.atom("w") }),
-    });
-
-    try std.testing.expectEqual(
-        lean.maintenanceStats().maintenance_work_per_fact,
-        padded.maintenanceStats().maintenance_work_per_fact,
-    );
-}
-
-test "a rebuild fallback is charged to the rebuild estimate, not to maintenance" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    db.setMaintenancePolicy(.incremental);
-    var setup = try db.execute(
-        \\node(a). node(b). node(c). node(d). node(e). edge(a, b). edge(b, c).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\isolated(X) :- node(X), not path(a, X).
-    );
-    setup.deinit();
-    try db.materialize();
-
-    // Deleting this edge over-deletes path facts that reach `isolated`
-    // through negation, so delete-and-rederive abandons the incremental path
-    // and rebuilds. The rebuild is real work, but it is recomputation work:
-    // charging it to the maintenance estimate as well would let one event
-    // push both estimates in opposite directions.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }));
-    const stats = db.maintenanceStats();
-    try std.testing.expect(stats.rebuild_fallbacks > 0);
-    try std.testing.expect(stats.rebuild_work != null);
-    try std.testing.expect(stats.maintenance_work_per_fact != null);
-    // One base fact changed, so the per-fact estimate is the whole measured
-    // maintenance cost. With the rebuild excluded it is only the abandoned
-    // over-deletion attempt, which is far cheaper than the rebuild itself.
-    try std.testing.expect(stats.maintenance_work_per_fact.? < stats.rebuild_work.?);
-}
-
-test "the cost model changes the path taken but never the result" {
-    var automatic: Jatalog = .init(std.testing.allocator);
-    defer automatic.deinit();
-    try runPolicyTrace(&automatic, .automatic);
-
-    var incremental: Jatalog = .init(std.testing.allocator);
-    defer incremental.deinit();
-    try runPolicyTrace(&incremental, .incremental);
-
-    var recompute: Jatalog = .init(std.testing.allocator);
-    defer recompute.deinit();
-    try runPolicyTrace(&recompute, .recompute);
-
-    // Every policy must leave the same base facts and the same closure.
-    for ([_]*Jatalog{ &incremental, &recompute }) |other| {
-        try std.testing.expectEqual(automatic.facts.len(), other.facts.len());
-        for (0..automatic.facts.len()) |index|
-            try std.testing.expect(try other.facts.contains(automatic.facts.factAt(index)));
-        try std.testing.expectEqual(automatic.closure.?.len(), other.closure.?.len());
-        for (0..automatic.closure.?.len()) |index|
-            try std.testing.expect(try other.closure.?.contains(automatic.closure.?.factAt(index)));
-    }
-    try expectClosureMatchesRebuild(&automatic);
-
-    // The pinned policies really did take different paths, and the
-    // automatic one made a real decision rather than defaulting.
-    const automatic_stats = automatic.maintenanceStats();
-    try std.testing.expectEqual(@as(usize, 0), incremental.maintenanceStats().recompute_choices);
-    try std.testing.expectEqual(@as(usize, 0), recompute.maintenanceStats().maintain_choices);
-    try std.testing.expect(automatic_stats.maintain_choices > 0);
-    try std.testing.expect(automatic_stats.rebuild_work != null);
-    try std.testing.expect(automatic_stats.maintenance_work_per_fact != null);
-}
-
-test "the cost model learns to prefer the cheaper path per workload" {
-    // A recursive closure over a chain: one new edge derives a handful of
-    // paths, while recomputing re-derives the entire transitive closure.
-    var closure_db: Jatalog = .init(std.testing.allocator);
-    defer closure_db.deinit();
-    var chain_source: std.ArrayList(u8) = .empty;
-    defer chain_source.deinit(std.testing.allocator);
-    for (0..30) |index| {
-        var buffer: [64]u8 = undefined;
-        const line = try std.fmt.bufPrint(&buffer, "edge(n{d}, n{d}). ", .{ index, index + 1 });
-        try chain_source.appendSlice(std.testing.allocator, line);
-    }
-    try chain_source.appendSlice(
-        std.testing.allocator,
-        "path(X, Y) :- edge(X, Y). path(X, Z) :- edge(X, Y), path(Y, Z).",
-    );
-    var chain_setup = try closure_db.execute(chain_source.items);
-    chain_setup.deinit();
-    try closure_db.materialize();
-    for (0..8) |index| {
-        var from: [16]u8 = undefined;
-        var to: [16]u8 = undefined;
-        const source = try std.fmt.bufPrint(&from, "s{d}", .{index});
-        const target = try std.fmt.bufPrint(&to, "n{d}", .{index});
-        const terms: [2]input.Term = .{ input.atom(source), input.atom(target) };
-        _ = try closure_db.applyChanges(&.{input.fact("edge", &terms)}, &.{});
-        // Query between batches so a recompute decision is actually paid and
-        // the closure is clean again when the next decision is made.
-        var query = try closure_db.execute("path(n0, X)?");
-        query.deinit();
-    }
-    const closure_stats = closure_db.maintenanceStats();
-    try std.testing.expect(closure_stats.maintain_choices > closure_stats.recompute_choices);
-    try expectClosureMatchesRebuild(&closure_db);
-
-    // A shallow program whose closure is cheap to recompute: maintenance
-    // has no recursion to save and the model should stop choosing it.
-    var flat_db: Jatalog = .init(std.testing.allocator);
-    defer flat_db.deinit();
-    var flat_setup = try flat_db.execute(
-        \\item(a). item(b). item(c).
-        \\present(X) :- item(X).
-    );
-    flat_setup.deinit();
-    try flat_db.materialize();
-    for (0..8) |index| {
-        var buffer: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buffer, "i{d}", .{index});
-        const terms: [1]input.Term = .{input.atom(name)};
-        _ = try flat_db.applyChanges(&.{input.fact("item", &terms)}, &.{});
-        var query = try flat_db.execute("present(X)?");
-        query.deinit();
-    }
-    try expectClosureMatchesRebuild(&flat_db);
-    const flat_stats = flat_db.maintenanceStats();
-    try std.testing.expect(flat_stats.recompute_choices > 0);
-}
-
-test "aggregate changes propagate through downstream list functions and arithmetic" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\team(red). team(blue).
-        \\roster(T, S) :- team(T), setof(P, plays(T, P), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\size(T, N) :- roster(T, S), length(S, N).
-        \\headcount(T, N) :- size(T, M), N = M + 1.
-        \\staffed(T) :- size(T, N), N > 1.
-    );
-    setup.deinit();
-    try db.materialize();
-
-    // Empty rosters flow through length, arithmetic, and the comparison.
-    var initial = try db.execute("headcount(red, N)?");
-    try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
-    initial.deinit();
-    try expectAnswerCount(&db, "staffed(T)?", 0);
-
-    // Growing one group must reach every downstream stratum.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("plays", &.{ input.atom("red"), input.atom("ann") }),
-        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
-    }, &.{}));
-    var grown = try db.execute("size(red, N)?");
-    try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
-    grown.deinit();
-    var counted = try db.execute("headcount(red, N)?");
-    try std.testing.expectEqual(@as(i64, 3), try counted.query.answers.items[0].getInteger("N"));
-    counted.deinit();
-    try expectAnswerCount(&db, "staffed(red)?", 1);
-    try expectAnswerCount(&db, "staffed(blue)?", 0);
-    try expectClosureMatchesRebuild(&db);
-
-    // Shrinking it retracts the downstream conclusions again.
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
-    }));
-    var shrunk = try db.execute("headcount(red, N)?");
-    try std.testing.expectEqual(@as(i64, 2), try shrunk.query.answers.items[0].getInteger("N"));
-    shrunk.deinit();
-    try expectAnswerCount(&db, "staffed(T)?", 0);
-    try expectClosureMatchesRebuild(&db);
-
-    // A downstream structural-recursive component recomputes within its own
-    // stratum rather than forcing a whole-closure rebuild.
-    const stats = db.maintenanceStats();
-    try std.testing.expect(stats.maintained_groups > 0);
-}
-
 test "materialize rebuild and stats form the explicit maintenance API" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -3398,21 +1970,21 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     try db.rebuild();
     try std.testing.expect(db.materialization == .clean);
     try std.testing.expectEqual(after_materialize.closure_facts, db.maintenanceStats().closure_facts);
-    try expectClosureMatchesRebuild(&db);
-    try expectAnswerCount(&db, "path(a, c)?", 1);
+    try test_support.expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "path(a, c)?", 1);
 
     // The single-statement entry points keep working alongside the batch
     // API. Pattern retraction is not a subset of it: it deletes every base
     // fact matching a goal, which exact-fact batch deletion cannot express.
     try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
-    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, d)?", 1);
     var executed = try db.execute("edge(d, e).");
     executed.deinit();
-    try expectAnswerCount(&db, "path(a, e)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, e)?", 1);
     try std.testing.expect(try db.retract(&.{
         input.relation("edge", &.{ input.atom("d"), input.atom("e") }),
     }));
-    try expectAnswerCount(&db, "path(a, e)?", 0);
+    try test_support.expectAnswerCount(&db, "path(a, e)?", 0);
 
     // Retraction takes the same incremental deletion path as a batch, so
     // the closure stays clean and this materialize is a no-op.
@@ -3429,7 +2001,7 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     try std.testing.expect(try db.applyChanges(&.{
         input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
     }, &.{}));
-    try expectAnswerCount(&db, "path(a, e)?", 1);
+    try test_support.expectAnswerCount(&db, "path(a, e)?", 1);
     try std.testing.expect(db.maintenanceStats().propagated_facts > before_edge.propagated_facts);
 
     // An inserted member recomputes exactly the affected aggregate group.
@@ -3438,18 +2010,18 @@ test "materialize rebuild and stats form the explicit maintenance API" {
         input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
     }, &.{}));
     var collected = try db.execute("collected(g, S)?");
-    try expectBindingValue(&db, &collected.query.answers.items[0], "S", "[m1, m2]");
+    try expectBindingValue(&collected.query.answers.items[0], "S", "[m1, m2]");
     collected.deinit();
     try std.testing.expect(db.maintenanceStats().maintained_groups > before_member.maintained_groups);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     const before_delete = db.maintenanceStats();
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("edge", &.{ input.atom("b"), input.atom("c") }),
     }));
-    try expectAnswerCount(&db, "path(a, c)?", 0);
+    try test_support.expectAnswerCount(&db, "path(a, c)?", 0);
     try std.testing.expect(db.maintenanceStats().removed_facts > before_delete.removed_facts);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Every update category is accounted for by one of the documented
     // paths: incremental propagation, delete-and-rederive, or rebuild.
@@ -3457,264 +2029,6 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     try std.testing.expect(stats.propagated_facts > 0);
     try std.testing.expect(stats.removed_facts > 0);
     try std.testing.expectEqual(@as(usize, 1), stats.self_maintainable_views);
-}
-
-test "shadow verification accepts maintained closures and reports corruption" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c). group(g). member(g, m1).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        \\reachable(X) :- path(a, X).
-        \\unreachable(X) :- edge(X, Y), not reachable(X).
-    );
-    setup.deinit();
-    try db.materialize();
-
-    // Insertions, deletions, and aggregate changes all pass verification.
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
-        input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
-    }, &.{}));
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }));
-    try std.testing.expect(try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    }, &.{
-        input.fact("member", &.{ input.atom("g"), input.atom("m1") }),
-    }));
-    try expectClosureMatchesRebuild(&db);
-
-    // A closure corrupted behind the maintenance engine's back is caught:
-    // this path tuple has no derivation from any base fact.
-    const terms = try std.testing.allocator.alloc(ValueId, 2);
-    var terms_owned = true;
-    defer if (terms_owned) std.testing.allocator.free(terms);
-    terms[0] = try db.eval.values.intern(.{ .scalar = try db.eval.scalars.internAtom("phantom1") });
-    terms[1] = try db.eval.values.intern(.{ .scalar = try db.eval.scalars.internAtom("phantom2") });
-    const added = try db.closure.?.insert(.{
-        .predicate = db.strings.get("path").?,
-        .terms = terms,
-    }, true);
-    terms_owned = false;
-    try std.testing.expect(added);
-    try std.testing.expectError(Error.MaintenanceMismatch, db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
-    }, &.{}));
-}
-
-test "randomized mixed traces hold under shadow verification" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // Pinned: this test asserts the incremental mechanism itself.
-    db.setMaintenancePolicy(.incremental);
-    db.setShadowVerification(true);
-    var setup = try db.execute(
-        \\node(a). node(b). node(c). group(g1). group(g2).
-        \\edge(a, b).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        \\length([], 0).
-        \\length(H!T, N) :- length(T, M), N = M + 1.
-        \\size(G, N) :- collected(G, S), length(S, N).
-        \\quiet(G) :- group(G), not member(G, m1).
-    );
-    setup.deinit();
-    try db.materialize();
-
-    const nodes = [_][]const u8{ "a", "b", "c" };
-    const groups = [_][]const u8{ "g1", "g2" };
-    const members = [_][]const u8{ "m1", "m2" };
-    var prng = std.Random.DefaultPrng.init(0x5ade0e5ade0e);
-    const random = prng.random();
-    for (0..30) |_| {
-        var edge_terms: [2]input.Term = .{
-            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
-            input.atom(nodes[random.uintLessThan(usize, nodes.len)]),
-        };
-        var member_terms: [2]input.Term = .{
-            input.atom(groups[random.uintLessThan(usize, groups.len)]),
-            input.atom(members[random.uintLessThan(usize, members.len)]),
-        };
-        const insert_edge = random.boolean();
-        var inserts: [2]input.Relation = undefined;
-        var deletes: [2]input.Relation = undefined;
-        var insert_count: usize = 0;
-        var delete_count: usize = 0;
-        if (insert_edge) {
-            inserts[insert_count] = input.fact("edge", &edge_terms);
-            insert_count += 1;
-        } else {
-            deletes[delete_count] = input.fact("edge", &edge_terms);
-            delete_count += 1;
-        }
-        if (random.boolean()) {
-            inserts[insert_count] = input.fact("member", &member_terms);
-            insert_count += 1;
-        } else {
-            deletes[delete_count] = input.fact("member", &member_terms);
-            delete_count += 1;
-        }
-        // Shadow verification asserts rebuild equality inside the call.
-        _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
-        try expectClosureMatchesRebuild(&db);
-    }
-}
-
-fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\group(g1). group(g2). member(g1, a).
-        \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
-    setup.deinit();
-    var first = try db.execute("collected(G, S)?");
-    first.deinit();
-    _ = try db.applyChanges(&.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
-        input.fact("member", &.{ input.atom("g2"), input.atom("c") }),
-    }, &.{});
-    _ = try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
-    });
-    var second = try db.execute("collected(g1, S)?");
-    defer second.deinit();
-    const formatted = try (try second.query.answers.items[0].getValue("S"))
-        .formatAlloc(allocator);
-    defer allocator.free(formatted);
-    if (!std.mem.eql(u8, formatted, "[b]")) return error.UnexpectedAggregate;
-}
-
-test "aggregate maintenance releases every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        aggregateMaintenanceAllocationScenario,
-        .{},
-    );
-}
-
-fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    var first = try db.execute("path(a, c)?");
-    first.deinit();
-    _ = try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
-    }, &.{});
-    _ = try db.applyChanges(&.{
-        input.fact("edge", &.{ input.atom("d"), input.atom("e") }),
-    }, &.{
-        input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
-    });
-    var second = try db.execute("path(b, e)?");
-    defer second.deinit();
-    if (second.query.answers.items.len != 1) return error.UnexpectedAnswer;
-}
-
-test "batch updates roll back completely on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        batchUpdateAllocationScenario,
-        .{},
-    );
-}
-
-test "duplicate derivations create no duplicate facts or endless rounds" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    // A diamond plus a cycle derives many facts through multiple proofs.
-    var setup = try db.execute(
-        \\edge(a, b). edge(a, c). edge(b, d). edge(c, d). edge(d, a).
-        \\path(X, Y) :- edge(X, Y).
-        \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
-    setup.deinit();
-    try expectSemiNaiveMatchesNaive(&db);
-    // Every node reaches every node exactly once in the answer set.
-    try expectAnswerCount(&db, "path(X, Y)?", 16);
-    try expectAnswerCount(&db, "path(a, d)?", 1);
-}
-
-test "indexed lookups match every structural binding pattern deterministically" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var setup = try db.execute(
-        \\edge(a, b). edge(b, c). edge(a, c).
-        \\holds([1, 2], a). holds([1, [2, 3]], b). holds(cons(1, 2), c). holds([], d).
-        \\p(a). p(a, b).
-    );
-    setup.deinit();
-
-    // Bound-position patterns over atoms.
-    try expectAnswerCount(&db, "edge(a, X)?", 2);
-    try expectAnswerCount(&db, "edge(X, Y)?", 3);
-    try expectAnswerCount(&db, "edge(a, b)?", 1);
-    try expectAnswerCount(&db, "edge(c, X)?", 0);
-
-    // Answers arrive in fact insertion order.
-    var ordered = try db.execute("edge(X, c)?");
-    defer ordered.deinit();
-    try std.testing.expectEqual(@as(usize, 2), ordered.query.answers.items.len);
-    try std.testing.expectEqualStrings("b", try ordered.query.answers.items[0].getAtom("X"));
-    try std.testing.expectEqualStrings("a", try ordered.query.answers.items[1].getAtom("X"));
-
-    // Bound structural values: proper, nested, improper, and empty lists.
-    var proper = try db.execute("holds([1, 2], X)?");
-    defer proper.deinit();
-    try std.testing.expectEqualStrings("a", try proper.query.answers.items[0].getAtom("X"));
-    var nested = try db.execute("holds([1, [2, 3]], X)?");
-    defer nested.deinit();
-    try std.testing.expectEqualStrings("b", try nested.query.answers.items[0].getAtom("X"));
-    var improper = try db.execute("holds(cons(1, 2), X)?");
-    defer improper.deinit();
-    try std.testing.expectEqualStrings("c", try improper.query.answers.items[0].getAtom("X"));
-    var empty = try db.execute("holds([], X)?");
-    defer empty.deinit();
-    try std.testing.expectEqualStrings("d", try empty.query.answers.items[0].getAtom("X"));
-
-    // A structural value bound through the second position.
-    var reverse = try db.execute("holds(X, c)?");
-    defer reverse.deinit();
-    try expectBindingValue(&db, &reverse.query.answers.items[0], "X", "cons(1, 2)");
-
-    // A partially ground structure is unbound for indexing and still unifies.
-    try expectAnswerCount(&db, "holds([1, T], X)?", 2);
-
-    // One predicate name at two arities never shares matches.
-    try expectAnswerCount(&db, "p(X)?", 1);
-    try expectAnswerCount(&db, "p(X, Y)?", 1);
-
-    // Retraction through the same lookup interface removes exactly one fact.
-    var retract = try db.execute("edge(a, X)~");
-    defer retract.deinit();
-    try expectAnswerCount(&db, "edge(X, Y)?", 1);
-    try expectAnswerCount(&db, "edge(b, c)?", 1);
-}
-
-fn expectBindingValue(
-    _: *const Jatalog,
-    binding: *const Answer,
-    variable: []const u8,
-    expected: []const u8,
-) !void {
-    const value = try binding.getValue(variable);
-    const formatted = try value.formatAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(formatted);
-    try std.testing.expectEqualStrings(expected, formatted);
 }
 
 test "lists round trip through queries and nested terms unify structurally" {
@@ -3726,7 +2040,7 @@ test "lists round trip through queries and nested terms unify structurally" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "X", "[a, [b, []]]");
+    try expectBindingValue(&result.query.answers.items[0], "X", "[a, [b, []]]");
 }
 
 test "head tail patterns work in rules and cons syntax is equivalent" {
@@ -3739,7 +2053,7 @@ test "head tail patterns work in rules and cons syntax is equivalent" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "X", "[b]");
+    try expectBindingValue(&result.query.answers.items[0], "X", "[b]");
 }
 
 test "repeated variables inside structures enforce equality" {
@@ -3762,7 +2076,7 @@ test "facts reject variables at every structural depth" {
 
     var result = try db.execute("improper(a!b). improper(X)?");
     defer result.deinit();
-    try expectBindingValue(&db, &result.query.answers.items[0], "X", "cons(a, b)");
+    try expectBindingValue(&result.query.answers.items[0], "X", "cons(a, b)");
 }
 
 test "structural equality binds variables recursively and parse errors clean up" {
@@ -3786,7 +2100,6 @@ test "ground values have a deterministic structural total order" {
     );
     defer result.deinit();
     try expectBindingValue(
-        &db,
         &result.query.answers.items[0],
         "S",
         "[-2, 2, 10, '1', a, z, [], [-1], cons(a, z), [a], [a, b]]",
@@ -3951,9 +2264,9 @@ test "grouped setof is sorted, deduplicated, and includes empty groups" {
     for (result.query.answers.items) |*answer| {
         const person = try answer.getAtom("X");
         if (std.mem.eql(u8, person, "alice")) {
-            try expectBindingValue(&db, answer, "S", "[bob, carol]");
+            try expectBindingValue(answer, "S", "[bob, carol]");
         } else if (std.mem.eql(u8, person, "bob")) {
-            try expectBindingValue(&db, answer, "S", "[]");
+            try expectBindingValue(answer, "S", "[]");
         } else return error.UnexpectedPerson;
     }
 }
@@ -3964,7 +2277,7 @@ test "setof evaluates directly in queries" {
     var result = try db.execute("item(c). item(a). setof(X, item(X), S)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a, c]");
+    try expectBindingValue(&result.query.answers.items[0], "S", "[a, c]");
 }
 
 test "setof sees completed recursive strata and preserves structural templates" {
@@ -3980,7 +2293,6 @@ test "setof sees completed recursive strata and preserves structural templates" 
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try expectBindingValue(
-        &db,
         &result.query.answers.items[0],
         "S",
         "[[b, a], [c, a], [c, b], [d, a], [d, b], [d, c]]",
@@ -3998,8 +2310,8 @@ test "nested and multiple setof goals evaluate from correlated bindings" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "All", "[a, b]");
-    try expectBindingValue(&db, &result.query.answers.items[0], "Groups", "[[g1, [a, b]], [g2, []]]");
+    try expectBindingValue(&result.query.answers.items[0], "All", "[a, b]");
+    try expectBindingValue(&result.query.answers.items[0], "Groups", "[[g1, [a, b]], [g2, []]]");
 }
 
 test "setof recomputes after retraction" {
@@ -4014,7 +2326,7 @@ test "setof recomputes after retraction" {
     result = try db.execute("items(S)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[a]");
+    try expectBindingValue(&result.query.answers.items[0], "S", "[a]");
 }
 
 test "setof ordering is independent of insertion and rule order" {
@@ -4214,13 +2526,13 @@ test "ground list query inputs seed recursive evaluation" {
     var open_result = try db.execute("sum(Input, Total)?");
     defer open_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), open_result.query.answers.items.len);
-    try expectBindingValue(&db, &open_result.query.answers.items[0], "Input", "[]");
+    try expectBindingValue(&open_result.query.answers.items[0], "Input", "[]");
     try std.testing.expectEqual(@as(i64, 0), try open_result.query.answers.items[0].getInteger("Total"));
 
     var structural_result = try db.execute("Value = [a, b]?");
     defer structural_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), structural_result.query.answers.items.len);
-    try expectBindingValue(&db, &structural_result.query.answers.items[0], "Value", "[a, b]");
+    try expectBindingValue(&structural_result.query.answers.items[0], "Value", "[a, b]");
 }
 
 test "member and collectfirst are ordinary admissible list relations" {
@@ -4265,7 +2577,7 @@ test "non-recursive rules may construct structural head values" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "Value", "[a]");
+    try expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
 }
 
 test "structurally recursive rules retain their proven input seed" {
@@ -4279,7 +2591,7 @@ test "structurally recursive rules retain their proven input seed" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "Value", "[a]");
+    try expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
 }
 
 test "recursive arithmetic generators are not admissible" {
@@ -4322,19 +2634,6 @@ test "recursive arithmetic rejection is allocation safe" {
     );
 }
 
-test "stratification distinguishes predicate arities" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\p(a, b). seed(k).
-        \\p(S) :- seed(k), setof([X, Y], p(X, Y), S).
-        \\p(S)?
-    );
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[[a, b]]");
-}
-
 test "embedding API constructs structural aggregate rules and queries" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -4360,10 +2659,10 @@ test "embedding API constructs structural aggregate rules and queries" {
     for (result.answers.items) |*answer| {
         const person_name = try answer.getAtom("x");
         if (std.mem.eql(u8, person_name, "alice")) {
-            try expectBindingValue(&db, answer, "children", "[bob]");
+            try expectBindingValue(answer, "children", "[bob]");
         } else {
             try std.testing.expectEqualStrings("bob", person_name);
-            try expectBindingValue(&db, answer, "children", "[]");
+            try expectBindingValue(answer, "children", "[]");
         }
     }
 }
@@ -4391,7 +2690,6 @@ test "typed nested setof matches source aggregate semantics" {
     )});
     defer result.deinit();
     try expectBindingValue(
-        &db,
         &result.answers.items[0],
         "groups",
         "[[g1, [a]], [g2, []]]",
@@ -4409,7 +2707,7 @@ fn embeddedAggregateAllocationScenario(allocator: std.mem.Allocator) !void {
     const body = [_]input.Goal{input.relation("item", &.{x})};
     var result = try db.query(&.{input.setof(input.list(&.{x}), &body, output)});
     defer result.deinit();
-    try expectBindingValue(&db, &result.answers.items[0], "output", "[[a], [b]]");
+    try expectBindingValue(&result.answers.items[0], "output", "[[a], [b]]");
 }
 
 test "embedding aggregate ownership is allocation safe" {
@@ -4441,7 +2739,7 @@ test "aggregate retraction is correct across the complete language tour" {
     result = try db.execute("children(alice, S), numchildren(alice, N)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[]");
+    try expectBindingValue(&result.query.answers.items[0], "S", "[]");
     try std.testing.expectEqual(@as(i64, 0), try result.query.answers.items[0].getInteger("N"));
 }
 
@@ -4475,7 +2773,6 @@ test "public source interface canonicalizes the complete i64 domain" {
     );
     defer result.deinit();
     try expectBindingValue(
-        &db,
         &result.query.answers.items[0],
         "Values",
         "[-9223372036854775808, 0, 1, 9223372036854775807]",
@@ -4490,7 +2787,7 @@ test "quoted numeric atoms remain distinct from numeric scalars" {
     defer db.deinit();
     var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
     defer result.deinit();
-    try expectBindingValue(&db, &result.query.answers.items[0], "S", "[1, '1', '1.0']");
+    try expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
 
     var inequality = try db.execute("1 = '1'?");
     defer inequality.deinit();
@@ -4506,7 +2803,7 @@ test "quoted numeric atoms remain distinct from numeric scalars" {
 
     var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
     defer quoted_setof.deinit();
-    try expectBindingValue(&db, &quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
+    try expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
 
     var arithmetic = try db.execute("01 = +0 + 1?");
     defer arithmetic.deinit();
@@ -4526,7 +2823,6 @@ test "float literals parse and integral values canonicalize to integers" {
     );
     defer result.deinit();
     try expectBindingValue(
-        &db,
         &result.query.answers.items[0],
         "S",
         "[-0.025, 0, 0.5, 1, 2.5, 1000]",
@@ -4556,7 +2852,6 @@ test "float extremes format deterministically and round-trip" {
     );
     defer result.deinit();
     try expectBindingValue(
-        &db,
         &result.query.answers.items[0],
         "S",
         "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
@@ -4624,12 +2919,6 @@ test "mixed numeric comparison and query-local float literals" {
     try std.testing.expectEqual(scalar_count, db.eval.scalars.values.items.len);
 }
 
-fn expectAnswerCount(db: *Jatalog, source: []const u8, expected: usize) !void {
-    var result = try db.execute(source);
-    defer result.deinit();
-    try std.testing.expectEqual(expected, result.query.answers.items.len);
-}
-
 test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -4656,18 +2945,18 @@ test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
     );
 
     // Bound-output success, mismatch, and subtraction with both signs.
-    try expectAnswerCount(&db, "4 = 1.5 + 2.5?", 1);
-    try expectAnswerCount(&db, "5 = 1.5 + 2?", 0);
-    try expectAnswerCount(&db, "-2.5 = -1.5 - 1?", 1);
-    try expectAnswerCount(&db, "2.5 = 1 - -1.5?", 1);
+    try test_support.expectAnswerCount(&db, "4 = 1.5 + 2.5?", 1);
+    try test_support.expectAnswerCount(&db, "5 = 1.5 + 2?", 0);
+    try test_support.expectAnswerCount(&db, "-2.5 = -1.5 - 1?", 1);
+    try test_support.expectAnswerCount(&db, "2.5 = 1 - -1.5?", 1);
 
     // Gradual underflow keeps exact subnormal results.
-    try expectAnswerCount(
+    try test_support.expectAnswerCount(
         &db,
         "1.1125369292536007e-308 = 2.2250738585072014e-308 - 1.1125369292536007e-308?",
         1,
     );
-    try expectAnswerCount(&db, "0 = 5e-324 - 5e-324?", 1);
+    try test_support.expectAnswerCount(&db, "0 = 5e-324 - 5e-324?", 1);
 
     // A mixed operation on an i64 extreme produces the rounded f64, which
     // stays a float because its integral value is outside the i64 range.
@@ -4698,19 +2987,19 @@ test "mixed equality and ordering are exact at numeric boundaries" {
 
     // Around 2^53: float literals canonicalize to their exact integer, so
     // nearby odd integers stay distinct.
-    try expectAnswerCount(&db, "9007199254740993 > 9.007199254740992e15?", 1);
-    try expectAnswerCount(&db, "9007199254740993 = 9.007199254740993e15?", 0);
-    try expectAnswerCount(&db, "9007199254740992 = 9.007199254740992e15?", 1);
+    try test_support.expectAnswerCount(&db, "9007199254740993 > 9.007199254740992e15?", 1);
+    try test_support.expectAnswerCount(&db, "9007199254740993 = 9.007199254740993e15?", 0);
+    try test_support.expectAnswerCount(&db, "9007199254740992 = 9.007199254740992e15?", 1);
 
     // Both i64 limits against the adjacent representable floats.
-    try expectAnswerCount(&db, "9223372036854775807 < 9.223372036854776e18?", 1);
-    try expectAnswerCount(&db, "-9223372036854775808 = -9.223372036854775808e18?", 1);
-    try expectAnswerCount(&db, "-9223372036854775807 > -9.223372036854776e18?", 1);
+    try test_support.expectAnswerCount(&db, "9223372036854775807 < 9.223372036854776e18?", 1);
+    try test_support.expectAnswerCount(&db, "-9223372036854775808 = -9.223372036854775808e18?", 1);
+    try test_support.expectAnswerCount(&db, "-9223372036854775807 > -9.223372036854776e18?", 1);
 
     // Adjacent representable floats around 1.
-    try expectAnswerCount(&db, "1.0000000000000002 > 1?", 1);
-    try expectAnswerCount(&db, "0.9999999999999999 < 1?", 1);
-    try expectAnswerCount(&db, "1.0000000000000002 = 1?", 0);
+    try test_support.expectAnswerCount(&db, "1.0000000000000002 > 1?", 1);
+    try test_support.expectAnswerCount(&db, "0.9999999999999999 < 1?", 1);
+    try test_support.expectAnswerCount(&db, "1.0000000000000002 = 1?", 0);
 
     var ordered = try db.execute(
         \\near(0.9999999999999999). near(1). near(1.0000000000000002).
@@ -4718,7 +3007,6 @@ test "mixed equality and ordering are exact at numeric boundaries" {
     );
     defer ordered.deinit();
     try expectBindingValue(
-        &db,
         &ordered.query.answers.items[0],
         "S",
         "[0.9999999999999999, 1, 1.0000000000000002]",
@@ -4734,10 +3022,10 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
         \\setof(X, one(X), S)?
     );
     defer dedup.deinit();
-    try expectBindingValue(&db, &dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
+    try expectBindingValue(&dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
 
-    try expectAnswerCount(&db, "nested([1.0, 2.5]). nested([1, 2.5])?", 1);
-    try expectAnswerCount(&db, "pair(cons(0.5, 1.0)). pair(cons(0.5, 1))?", 1);
+    try test_support.expectAnswerCount(&db, "nested([1.0, 2.5]). nested([1, 2.5])?", 1);
+    try test_support.expectAnswerCount(&db, "pair(cons(0.5, 1.0)). pair(cons(0.5, 1))?", 1);
 
     var grouped = try db.execute(
         \\kind(g). kind(h). item(g, 0.5). item(g, 1.0). item(g, 1). item(h, 2.5).
@@ -4746,7 +3034,6 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
     );
     defer grouped.deinit();
     try expectBindingValue(
-        &db,
         &grouped.query.answers.items[0],
         "Out",
         "[[g, [0.5, 1]], [h, [2.5]]]",
@@ -4841,10 +3128,10 @@ test "typed float descriptors canonicalize and getters never coerce" {
     try std.testing.expectError(Error.TypeMismatch, canonical.answers.items[0].getFloat("v"));
 
     // Identity across construction paths: source literals match typed facts.
-    try expectAnswerCount(&db, "measure(a, 2.5)?", 1);
-    try expectAnswerCount(&db, "measure(b, 1)?", 1);
-    try expectAnswerCount(&db, "measure(c, 0)?", 1);
-    try expectAnswerCount(&db, "items([0.5, 2])?", 1);
+    try test_support.expectAnswerCount(&db, "measure(a, 2.5)?", 1);
+    try test_support.expectAnswerCount(&db, "measure(b, 1)?", 1);
+    try test_support.expectAnswerCount(&db, "measure(c, 0)?", 1);
+    try test_support.expectAnswerCount(&db, "items([0.5, 2])?", 1);
 
     // Typed retraction matches a fact added from source, and vice versa.
     var added = try db.execute("measure(d, 3.5).");
@@ -4852,7 +3139,7 @@ test "typed float descriptors canonicalize and getters never coerce" {
     try std.testing.expect(try db.retract(&.{
         input.relation("measure", &.{ input.atom("d"), input.float(3.5) }),
     }));
-    try expectAnswerCount(&db, "measure(d, X)?", 0);
+    try test_support.expectAnswerCount(&db, "measure(d, X)?", 0);
 }
 
 test "non-finite typed floats fail compilation transactionally" {
@@ -4890,8 +3177,8 @@ test "non-finite typed floats fail compilation transactionally" {
     try std.testing.expectEqual(scalar_count, db.eval.scalars.values.items.len);
     try std.testing.expectEqual(fact_count, db.facts.len());
     try std.testing.expectEqual(@as(usize, 0), db.eval.rules.items.len);
-    try expectAnswerCount(&db, "kept(1)?", 1);
-    try expectAnswerCount(&db, "bad(X)?", 0);
+    try test_support.expectAnswerCount(&db, "kept(1)?", 1);
+    try test_support.expectAnswerCount(&db, "bad(X)?", 0);
 }
 
 fn typedFloatAllocationScenario(allocator: std.mem.Allocator) !void {
@@ -4982,7 +3269,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
     const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
     try db.addFact("improper", &.{input.cons(&pair)});
     result = try db.query(&.{input.relation("improper", &.{input.variable("value")})});
-    try expectBindingValue(&db, &result.answers.items[0], "value", "cons(head, tail)");
+    try expectBindingValue(&result.answers.items[0], "value", "cons(head, tail)");
     result.deinit();
 
     try db.addFact("items", &.{input.list(&.{ input.integer(1), input.integer(2) })});
@@ -4994,7 +3281,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
         &.{input.relation("items", &.{input.cons(&list_pair)})},
     );
     result = try db.query(&.{input.relation("tail", &.{input.variable("result")})});
-    try expectBindingValue(&db, &result.answers.items[0], "result", "[2]");
+    try expectBindingValue(&result.answers.items[0], "result", "[2]");
     result.deinit();
 
     try std.testing.expect(try db.retract(&.{input.relation("age", &.{

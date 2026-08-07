@@ -21,6 +21,12 @@ const relation_store = @import("relation_store.zig");
 const cost_model = @import("cost_model.zig");
 
 const Error = @import("root.zig").Error;
+const root_mod = @import("root.zig");
+const Jatalog = root_mod.Jatalog;
+const input = root_mod.input;
+const expectSemiNaiveMatchesNaive = @import("test_support.zig").expectSemiNaiveMatchesNaive;
+const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
+const expectBindingValue = @import("test_support.zig").expectBindingValue;
 const CostModel = cost_model.CostModel;
 const Fact = relation_store.Fact;
 const PredicateKey = relation_store.PredicateKey;
@@ -741,3 +747,177 @@ pub const Evaluator = struct {
         }
     }
 };
+
+test "semi-naive and naive closures agree across rule classes" {
+    // Non-recursive joins.
+    var joins: Jatalog = .init(std.testing.allocator);
+    defer joins.deinit();
+    var joins_setup = try joins.execute(
+        \\parent(a, b). parent(b, c). parent(c, d).
+        \\grand(X, Z) :- parent(X, Y), parent(Y, Z).
+    );
+    joins_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&joins);
+
+    // Direct recursion.
+    var direct: Jatalog = .init(std.testing.allocator);
+    defer direct.deinit();
+    var direct_setup = try direct.execute(
+        \\edge(a, b). edge(b, c). edge(c, d). edge(d, a).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    direct_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&direct);
+
+    // Mutual recursion across two predicates in one stratum.
+    var mutual: Jatalog = .init(std.testing.allocator);
+    defer mutual.deinit();
+    var mutual_setup = try mutual.execute(
+        \\start(n0). step(n0, n1). step(n1, n2). step(n2, n3). step(n3, n4).
+        \\even(X) :- start(X).
+        \\even(X) :- odd(Y), step(Y, X).
+        \\odd(X) :- even(Y), step(Y, X).
+    );
+    mutual_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&mutual);
+
+    // Seeded structural recursion feeding a same-stratum consumer.
+    var structural: Jatalog = .init(std.testing.allocator);
+    defer structural.deinit();
+    var structural_setup = try structural.execute(
+        \\person(alice). person(bob). parent(alice, bob).
+        \\children(X, S) :- person(X), setof(Y, parent(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\numchildren(X, N) :- children(X, S), length(S, N).
+    );
+    structural_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&structural);
+
+    // Stratified negation above a recursive stratum.
+    var negated: Jatalog = .init(std.testing.allocator);
+    defer negated.deinit();
+    var negated_setup = try negated.execute(
+        \\node(a). node(b). node(c). edge(a, b).
+        \\reachable(X) :- edge(a, X).
+        \\reachable(X) :- reachable(Y), edge(Y, X).
+        \\isolated(X) :- node(X), not reachable(X).
+    );
+    negated_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&negated);
+
+    // Aggregation over a recursive relation.
+    var aggregated: Jatalog = .init(std.testing.allocator);
+    defer aggregated.deinit();
+    var aggregated_setup = try aggregated.execute(
+        \\edge(a, b). edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
+    );
+    aggregated_setup.deinit();
+    try expectSemiNaiveMatchesNaive(&aggregated);
+}
+
+test "multiple recursive body occurrences miss no derivations" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(n1, n2). edge(n2, n3). edge(n3, n4). edge(n4, n5).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- path(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectSemiNaiveMatchesNaive(&db);
+
+    // The doubling rule needs delta joins on both occurrences: n1 to n5
+    // only exists by combining two derived paths.
+    try expectAnswerCount(&db, "path(n1, n5)?", 1);
+    try expectAnswerCount(&db, "path(X, Y)?", 10);
+}
+
+test "duplicate derivations create no duplicate facts or endless rounds" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    // A diamond plus a cycle derives many facts through multiple proofs.
+    var setup = try db.execute(
+        \\edge(a, b). edge(a, c). edge(b, d). edge(c, d). edge(d, a).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    );
+    setup.deinit();
+    try expectSemiNaiveMatchesNaive(&db);
+    // Every node reaches every node exactly once in the answer set.
+    try expectAnswerCount(&db, "path(X, Y)?", 16);
+    try expectAnswerCount(&db, "path(a, d)?", 1);
+}
+
+test "indexed lookups match every structural binding pattern deterministically" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). edge(a, c).
+        \\holds([1, 2], a). holds([1, [2, 3]], b). holds(cons(1, 2), c). holds([], d).
+        \\p(a). p(a, b).
+    );
+    setup.deinit();
+
+    // Bound-position patterns over atoms.
+    try expectAnswerCount(&db, "edge(a, X)?", 2);
+    try expectAnswerCount(&db, "edge(X, Y)?", 3);
+    try expectAnswerCount(&db, "edge(a, b)?", 1);
+    try expectAnswerCount(&db, "edge(c, X)?", 0);
+
+    // Answers arrive in fact insertion order.
+    var ordered = try db.execute("edge(X, c)?");
+    defer ordered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), ordered.query.answers.items.len);
+    try std.testing.expectEqualStrings("b", try ordered.query.answers.items[0].getAtom("X"));
+    try std.testing.expectEqualStrings("a", try ordered.query.answers.items[1].getAtom("X"));
+
+    // Bound structural values: proper, nested, improper, and empty lists.
+    var proper = try db.execute("holds([1, 2], X)?");
+    defer proper.deinit();
+    try std.testing.expectEqualStrings("a", try proper.query.answers.items[0].getAtom("X"));
+    var nested = try db.execute("holds([1, [2, 3]], X)?");
+    defer nested.deinit();
+    try std.testing.expectEqualStrings("b", try nested.query.answers.items[0].getAtom("X"));
+    var improper = try db.execute("holds(cons(1, 2), X)?");
+    defer improper.deinit();
+    try std.testing.expectEqualStrings("c", try improper.query.answers.items[0].getAtom("X"));
+    var empty = try db.execute("holds([], X)?");
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("d", try empty.query.answers.items[0].getAtom("X"));
+
+    // A structural value bound through the second position.
+    var reverse = try db.execute("holds(X, c)?");
+    defer reverse.deinit();
+    try expectBindingValue(&reverse.query.answers.items[0], "X", "cons(1, 2)");
+
+    // A partially ground structure is unbound for indexing and still unifies.
+    try expectAnswerCount(&db, "holds([1, T], X)?", 2);
+
+    // One predicate name at two arities never shares matches.
+    try expectAnswerCount(&db, "p(X)?", 1);
+    try expectAnswerCount(&db, "p(X, Y)?", 1);
+
+    // Retraction through the same lookup interface removes exactly one fact.
+    var retract = try db.execute("edge(a, X)~");
+    defer retract.deinit();
+    try expectAnswerCount(&db, "edge(X, Y)?", 1);
+    try expectAnswerCount(&db, "edge(b, c)?", 1);
+}
+
+test "stratification distinguishes predicate arities" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\p(a, b). seed(k).
+        \\p(S) :- seed(k), setof([X, Y], p(X, Y), S).
+        \\p(S)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&result.query.answers.items[0], "S", "[[a, b]]");
+}
