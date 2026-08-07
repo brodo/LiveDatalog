@@ -18,35 +18,12 @@
 //! the database because the views it maintains are the database's own state.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 const root = @import("root.zig");
 const materialization = @import("materialization.zig");
 const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 const maintenance = @import("maintenance.zig");
-
-const Jatalog = root.Jatalog;
-const Error = root.Error;
-const input = root.input;
-const expectClosureMatchesRebuild = @import("test_support.zig").expectClosureMatchesRebuild;
-const expectBindingValue = @import("test_support.zig").expectBindingValue;
-const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
-const Fact = relation_store.Fact;
-const PredicateKey = relation_store.PredicateKey;
-const RelationStore = relation_store.RelationStore;
-const ValueId = relation_store.ValueId;
-const copyFactInto = relation_store.copyFactInto;
-const appendFactCopy = relation_store.appendFactCopy;
-const collectPredicateKeys = relation_store.collectPredicateKeys;
-const Id = syntax.Id;
-const Rule = syntax.Rule;
-const Clause = syntax.Clause;
-const Binding = syntax.Binding;
-const outerClauses = syntax.outerClauses;
-const maintainableAggregateIndex = syntax.maintainableAggregateIndex;
-const clausesReadGrownAnywhere = syntax.clausesReadGrownAnywhere;
-const collectTermVariables = syntax.collectTermVariables;
-const collectClauseSurfaceVariables = syntax.collectClauseSurfaceVariables;
-const bindingsEqual = syntax.bindingsEqual;
 
 /// CReaM-style auxiliary view for a maintained aggregate rule whose head
 /// projects out some of its outer-goal variables. Each tuple retains those
@@ -57,9 +34,9 @@ const bindingsEqual = syntax.bindingsEqual;
 pub const AuxiliaryView = struct {
     rule_id: u32,
     /// Outer-goal variables omitted from the head, in ascending id order.
-    projected: []Id,
+    projected: []syntax.Id,
     head_arity: usize,
-    tuples: RelationStore,
+    tuples: relation_store.RelationStore,
 
     pub fn deinit(self: *AuxiliaryView, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
         allocator.free(self.projected);
@@ -68,7 +45,7 @@ pub const AuxiliaryView = struct {
     }
 
     pub fn clone(self: *const AuxiliaryView, allocator: std.mem.Allocator) !AuxiliaryView { // ziglint-ignore: Z023
-        const projected = try allocator.dupe(Id, self.projected);
+        const projected = try allocator.dupe(syntax.Id, self.projected);
         errdefer allocator.free(projected);
         return .{
             .rule_id = self.rule_id,
@@ -82,16 +59,16 @@ pub const AuxiliaryView = struct {
         return self.projected.len + self.head_arity;
     }
 
-    pub fn key(self: *const AuxiliaryView) PredicateKey {
+    pub fn key(self: *const AuxiliaryView) relation_store.PredicateKey {
         return .{ .name = self.rule_id, .arity = self.arity() };
     }
 
     /// How many auxiliary tuples carry `head`, which is its derivation count:
     /// the head tuple is visible exactly while this is non-zero. Reports
     /// `NumericOverflow` rather than wrapping when it exceeds the counter.
-    pub fn derivationCount(self: *AuxiliaryView, head: []const ValueId) !u32 {
+    pub fn derivationCount(self: *AuxiliaryView, head: []const relation_store.ValueId) !u32 {
         var mask: u64 = 0;
-        var bound: [64]ValueId = undefined;
+        var bound: [64]relation_store.ValueId = undefined;
         for (head, 0..) |term, index| {
             mask |= @as(u64, 1) << @intCast(self.projected.len + index);
             bound[index] = term;
@@ -100,12 +77,12 @@ pub const AuxiliaryView = struct {
         var count: usize = 0;
         for (candidates) |candidate| {
             const tuple = self.tuples.factAt(candidate);
-            if (std.mem.eql(ValueId, self.headTerms(tuple), head)) count += 1;
+            if (std.mem.eql(relation_store.ValueId, self.headTerms(tuple), head)) count += 1;
         }
-        return std.math.cast(u32, count) orelse Error.NumericOverflow;
+        return std.math.cast(u32, count) orelse root.Error.NumericOverflow;
     }
 
-    pub fn headTerms(self: *const AuxiliaryView, tuple: Fact) []const ValueId {
+    pub fn headTerms(self: *const AuxiliaryView, tuple: relation_store.Fact) []const relation_store.ValueId {
         return tuple.terms[self.projected.len..];
     }
 };
@@ -117,7 +94,7 @@ pub const AuxiliaryView = struct {
 /// insertion, which then cascade through the ordinary deletion and
 /// insertion maintenance. Rounds repeat while aggregate results keep
 /// changing, with a bounded fallback to a full rebuild.
-pub fn maintainAggregates(db: *Jatalog, touched: *RelationStore) !void {
+pub fn maintainAggregates(db: *root.Jatalog, touched: *relation_store.RelationStore) !void {
     if (db.closure == null or db.materialization != .clean) return;
     const round_cap = (try db.eval.ensureAnalysis()).max_level + 4;
     var round: usize = 0;
@@ -128,25 +105,25 @@ pub fn maintainAggregates(db: *Jatalog, touched: *RelationStore) !void {
             materialization.markDirty(db, 0);
             return materialization.ensureMaterialized(db);
         }
-        var removals: RelationStore = .init(db.allocator);
+        var removals: relation_store.RelationStore = .init(db.allocator);
         defer removals.deinit();
-        var additions: std.ArrayList(Fact) = .empty;
+        var additions: std.ArrayList(relation_store.Fact) = .empty;
         defer {
             for (additions.items) |fact| db.allocator.free(fact.terms);
             additions.deinit(db.allocator);
         }
-        var changed: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+        var changed: std.AutoHashMapUnmanaged(relation_store.PredicateKey, void) = .empty;
         defer changed.deinit(db.allocator);
-        try collectPredicateKeys(db.allocator, touched, 0, &changed);
+        try relation_store.collectPredicateKeys(db.allocator, touched, 0, &changed);
         for (db.eval.rules.items) |rule| {
-            const clause_index = maintainableAggregateIndex(rule) orelse continue;
+            const clause_index = syntax.maintainableAggregateIndex(rule) orelse continue;
             // A projected view also reacts to outer-goal changes, which
             // create and destroy whole groups.
             const trigger = if (auxiliaryFor(db, rule.id) == null)
                 rule.body[clause_index].aggregate.body
             else
                 rule.body;
-            if (!clausesReadGrownAnywhere(trigger, &changed)) continue;
+            if (!syntax.clausesReadGrownAnywhere(trigger, &changed)) continue;
             try maintainAggregateRule(db, rule, clause_index, touched, &removals, &additions);
         }
         if (removals.len() == 0 and additions.items.len == 0) return;
@@ -155,43 +132,43 @@ pub fn maintainAggregates(db: *Jatalog, touched: *RelationStore) !void {
         if (removals.len() > 0) {
             try maintenance.propagateDeletions(db, &removals);
             for (0..removals.len()) |index|
-                try copyFactInto(db.allocator, touched, removals.factAt(index), false);
+                try relation_store.copyFactInto(db.allocator, touched, removals.factAt(index), false);
         }
         if (db.materialization != .clean) return;
         const batch_start = db.closure.?.len();
         for (additions.items) |fact| {
             if (try db.closure.?.contains(fact)) continue;
-            try copyFactInto(db.allocator, &db.closure.?, fact, true);
+            try relation_store.copyFactInto(db.allocator, &db.closure.?, fact, true);
         }
         if (db.closure.?.len() > batch_start) {
             try maintenance.propagateInsertions(db, batch_start);
             if (db.materialization != .clean) return;
             for (batch_start..db.closure.?.len()) |index|
-                try copyFactInto(db.allocator, touched, db.closure.?.factAt(index), false);
+                try relation_store.copyFactInto(db.allocator, touched, db.closure.?.factAt(index), false);
         }
     }
 }
 fn maintainAggregateRule(
-    db: *Jatalog,
-    rule: Rule,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
     clause_index: usize,
-    touched: *RelationStore,
-    removals: *RelationStore,
-    additions: *std.ArrayList(Fact),
+    touched: *relation_store.RelationStore,
+    removals: *relation_store.RelationStore,
+    additions: *std.ArrayList(relation_store.Fact),
 ) !void {
     const aggregate = rule.body[clause_index].aggregate;
-    const outer = try outerClauses(db.allocator, rule, clause_index);
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
     defer db.allocator.free(outer);
 
     // Only variables the outer goals or the head can constrain identify a
     // group; variables local to the aggregate body must stay free.
-    var scope: std.AutoHashMapUnmanaged(Id, void) = .empty;
+    var scope: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
     defer scope.deinit(db.allocator);
     for (outer) |clause|
-        try collectClauseSurfaceVariables(db.allocator, clause, &scope);
-    for (rule.head.terms) |term| try collectTermVariables(db.allocator, term, &scope);
+        try syntax.collectClauseSurfaceVariables(db.allocator, clause, &scope);
+    for (rule.head.terms) |term| try syntax.collectTermVariables(db.allocator, term, &scope);
 
-    var groups: std.ArrayList(Binding) = .empty;
+    var groups: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (groups.items) |*group| group.deinit(db.allocator);
         groups.deinit(db.allocator);
@@ -202,7 +179,7 @@ fn maintainAggregateRule(
     const view = auxiliaryFor(db, rule.id);
     for (0..touched.len()) |index| {
         const fact = touched.factAt(index);
-        for ([_][]const Clause{ aggregate.body, outer }) |clauses| {
+        for ([_][]const syntax.Clause{ aggregate.body, outer }) |clauses| {
             for (clauses) |candidate| {
                 const expression = switch (candidate) {
                     .relational => |value| value,
@@ -210,10 +187,10 @@ fn maintainAggregateRule(
                 };
                 if (expression.predicate != fact.predicate or
                     expression.terms.len != fact.terms.len) continue;
-                var seed: Binding = .{};
+                var seed: syntax.Binding = .{};
                 defer seed.deinit(db.allocator);
                 if (!try db.eval.unify(fact, expression, &seed)) continue;
-                var restricted: Binding = .{};
+                var restricted: syntax.Binding = .{};
                 defer restricted.deinit(db.allocator);
                 for (seed.values.keys(), seed.values.values()) |variable, value| {
                     if (scope.contains(variable))
@@ -243,25 +220,25 @@ fn maintainAggregateRule(
 /// therefore transfers support from the old head tuple to the new one
 /// within a single batch.
 fn maintainProjectedGroup(
-    db: *Jatalog,
-    rule: Rule,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
     view: *AuxiliaryView,
-    group: *const Binding,
-    removals: *RelationStore,
-    additions: *std.ArrayList(Fact),
+    group: *const syntax.Binding,
+    removals: *relation_store.RelationStore,
+    additions: *std.ArrayList(relation_store.Fact),
 ) !void {
-    var derived: RelationStore = .init(db.allocator);
+    var derived: relation_store.RelationStore = .init(db.allocator);
     defer derived.deinit();
     try deriveGroupHeads(db, rule, group, &derived);
 
     // Auxiliary tuples this group currently contributes.
     var mask: u64 = 0;
-    var bound: [64]ValueId = undefined;
+    var bound: [64]relation_store.ValueId = undefined;
     for (view.projected, 0..) |variable, index| {
         bound[index] = group.values.get(variable) orelse return;
         mask |= @as(u64, 1) << @intCast(index);
     }
-    var stale: std.ArrayList(Fact) = .empty;
+    var stale: std.ArrayList(relation_store.Fact) = .empty;
     defer {
         for (stale.items) |fact| db.allocator.free(fact.terms);
         stale.deinit(db.allocator);
@@ -270,9 +247,9 @@ fn maintainProjectedGroup(
         const candidates = try view.tuples.lookup(view.key(), mask, bound[0..view.projected.len]);
         for (candidates) |candidate| {
             const tuple = view.tuples.factAt(candidate);
-            if (!std.mem.eql(ValueId, tuple.terms[0..view.projected.len], bound[0..view.projected.len]))
+            if (!std.mem.eql(relation_store.ValueId, tuple.terms[0..view.projected.len], bound[0..view.projected.len]))
                 continue;
-            const head: Fact = .{
+            const head: relation_store.Fact = .{
                 .predicate = rule.head.predicate,
                 .terms = @constCast(view.headTerms(tuple)),
             };
@@ -283,7 +260,7 @@ fn maintainProjectedGroup(
             defer owner.deinit(db.allocator);
             if (!try db.eval.unify(head, rule.head, &owner)) continue;
             if (try derived.contains(head)) continue;
-            try appendFactCopy(db.allocator, &stale, tuple);
+            try relation_store.appendFactCopy(db.allocator, &stale, tuple);
         }
     }
     for (stale.items) |tuple| {
@@ -298,7 +275,7 @@ fn maintainProjectedGroup(
         const terms = (try auxiliaryTerms(db, view, group, head)) orelse continue;
         var owned = true;
         defer if (owned) db.allocator.free(terms);
-        const tuple: Fact = .{ .predicate = view.rule_id, .terms = terms };
+        const tuple: relation_store.Fact = .{ .predicate = view.rule_id, .terms = terms };
         if (try view.tuples.contains(tuple)) continue;
         const before = try view.derivationCount(view.headTerms(tuple));
         owned = false;
@@ -307,7 +284,7 @@ fn maintainProjectedGroup(
             return err;
         };
         if (before == 0 and !try db.closure.?.contains(head))
-            try appendFactCopy(db.allocator, additions, head);
+            try relation_store.appendFactCopy(db.allocator, additions, head);
     }
 }
 /// Retracts auxiliary tuples whose group no longer has any solution of
@@ -317,34 +294,34 @@ fn maintainProjectedGroup(
 /// disappears, so batches that touch just the aggregate's members do no
 /// sweeping at all.
 fn sweepVanishedGroups(
-    db: *Jatalog,
-    rule: Rule,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
     clause_index: usize,
     view: *AuxiliaryView,
-    touched: *RelationStore,
-    removals: *RelationStore,
+    touched: *relation_store.RelationStore,
+    removals: *relation_store.RelationStore,
 ) !void {
-    const outer = try outerClauses(db.allocator, rule, clause_index);
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
     defer db.allocator.free(outer);
 
-    var candidates: RelationStore = .init(db.allocator);
+    var candidates: relation_store.RelationStore = .init(db.allocator);
     defer candidates.deinit();
     try collectSweepCandidates(db, rule, view, outer, touched, &candidates);
 
     for (0..candidates.len()) |index| {
         const tuple = candidates.factAt(index);
-        var seed: Binding = .{};
+        var seed: syntax.Binding = .{};
         defer seed.deinit(db.allocator);
         // The group is identified by its projected values together with
         // the head variables the outer goals bind.
-        const stored: Fact = .{
+        const stored: relation_store.Fact = .{
             .predicate = rule.head.predicate,
             .terms = @constCast(view.headTerms(tuple)),
         };
         if (!try db.eval.unify(stored, rule.head, &seed)) continue;
         for (view.projected, 0..) |variable, position|
             try seed.values.put(db.allocator, variable, tuple.terms[position]);
-        var solutions: std.ArrayList(Binding) = .empty;
+        var solutions: std.ArrayList(syntax.Binding) = .empty;
         defer {
             for (solutions.items) |*solution| solution.deinit(db.allocator);
             solutions.deinit(db.allocator);
@@ -357,7 +334,7 @@ fn sweepVanishedGroups(
             &solutions,
             null,
         ) catch |err| switch (err) {
-            Error.NumericType, Error.NumericOverflow => continue,
+            root.Error.NumericType, root.Error.NumericOverflow => continue,
             else => return err,
         };
         if (solutions.items.len > 0) continue;
@@ -371,12 +348,12 @@ fn sweepVanishedGroups(
 /// found by binding the fact against each outer goal and looking up the
 /// auxiliary columns that binding determines.
 fn collectSweepCandidates(
-    db: *Jatalog,
-    rule: Rule,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
     view: *AuxiliaryView,
-    outer: []const Clause,
-    touched: *RelationStore,
-    candidates: *RelationStore,
+    outer: []const syntax.Clause,
+    touched: *relation_store.RelationStore,
+    candidates: *relation_store.RelationStore,
 ) !void {
     for (0..touched.len()) |index| {
         const fact = touched.factAt(index);
@@ -387,12 +364,12 @@ fn collectSweepCandidates(
             };
             if (expression.predicate != fact.predicate or
                 expression.terms.len != fact.terms.len) continue;
-            var binding: Binding = .{};
+            var binding: syntax.Binding = .{};
             defer binding.deinit(db.allocator);
             if (!try db.eval.unify(fact, expression, &binding)) continue;
 
             var mask: u64 = 0;
-            var bound: [64]ValueId = undefined;
+            var bound: [64]relation_store.ValueId = undefined;
             var count: usize = 0;
             for (view.projected, 0..) |variable, position| {
                 const value = binding.values.get(variable) orelse continue;
@@ -413,29 +390,29 @@ fn collectSweepCandidates(
             for (try view.tuples.lookup(view.key(), mask, bound[0..count])) |candidate| {
                 const tuple = view.tuples.factAt(candidate);
                 if (try candidates.contains(tuple)) continue;
-                try copyFactInto(db.allocator, candidates, tuple, false);
+                try relation_store.copyFactInto(db.allocator, candidates, tuple, false);
             }
         }
     }
 }
 fn recordHeadRemoval(
-    db: *Jatalog,
-    rule: Rule,
-    head: []const ValueId,
-    removals: *RelationStore,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
+    head: []const relation_store.ValueId,
+    removals: *relation_store.RelationStore,
 ) !void {
-    const fact: Fact = .{ .predicate = rule.head.predicate, .terms = @constCast(head) };
+    const fact: relation_store.Fact = .{ .predicate = rule.head.predicate, .terms = @constCast(head) };
     if (!try db.closure.?.contains(fact)) return;
     if (try removals.contains(fact)) return;
-    try copyFactInto(db.allocator, removals, fact, true);
+    try relation_store.copyFactInto(db.allocator, removals, fact, true);
 }
 fn deriveGroupHeads(
-    db: *Jatalog,
-    rule: Rule,
-    group: *const Binding,
-    derived: *RelationStore,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
+    group: *const syntax.Binding,
+    derived: *relation_store.RelationStore,
 ) !void {
-    var answers: std.ArrayList(Binding) = .empty;
+    var answers: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
@@ -448,7 +425,7 @@ fn deriveGroupHeads(
         &answers,
         null,
     ) catch |err| switch (err) {
-        Error.NumericType, Error.NumericOverflow => return,
+        root.Error.NumericType, root.Error.NumericOverflow => return,
         else => return err,
     };
     for (answers.items) |*answer| {
@@ -460,12 +437,12 @@ fn deriveGroupHeads(
     }
 }
 fn collectAggregateGroups(
-    db: *Jatalog,
-    outer: []const Clause,
-    seed: *const Binding,
-    groups: *std.ArrayList(Binding),
+    db: *root.Jatalog,
+    outer: []const syntax.Clause,
+    seed: *const syntax.Binding,
+    groups: *std.ArrayList(syntax.Binding),
 ) !void {
-    var solutions: std.ArrayList(Binding) = .empty;
+    var solutions: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (solutions.items) |*solution| solution.deinit(db.allocator);
         solutions.deinit(db.allocator);
@@ -478,13 +455,13 @@ fn collectAggregateGroups(
         &solutions,
         null,
     ) catch |err| switch (err) {
-        Error.NumericType, Error.NumericOverflow => return,
+        root.Error.NumericType, root.Error.NumericOverflow => return,
         else => return err,
     };
     for (solutions.items) |*solution| {
         var duplicate = false;
         for (groups.items) |*existing| {
-            if (bindingsEqual(existing, solution)) {
+            if (syntax.bindingsEqual(existing, solution)) {
                 duplicate = true;
                 break;
             }
@@ -501,13 +478,13 @@ fn collectAggregateGroups(
 /// deletions unless the recomputation still derives them, and newly
 /// derived tuples become insertions.
 fn maintainAggregateGroup(
-    db: *Jatalog,
-    rule: Rule,
-    group: *const Binding,
-    removals: *RelationStore,
-    additions: *std.ArrayList(Fact),
+    db: *root.Jatalog,
+    rule: syntax.Rule,
+    group: *const syntax.Binding,
+    removals: *relation_store.RelationStore,
+    additions: *std.ArrayList(relation_store.Fact),
 ) !void {
-    var derived: RelationStore = .init(db.allocator);
+    var derived: relation_store.RelationStore = .init(db.allocator);
     defer derived.deinit();
     try deriveGroupHeads(db, rule, group, &derived);
 
@@ -520,34 +497,34 @@ fn maintainAggregateGroup(
         if (!try db.eval.unify(stored, rule.head, &matched)) continue;
         if (try derived.contains(stored)) continue;
         if (try removals.contains(stored)) continue;
-        try copyFactInto(db.allocator, removals, stored, true);
+        try relation_store.copyFactInto(db.allocator, removals, stored, true);
     }
 
     for (0..derived.len()) |index| {
         const fact = derived.factAt(index);
         if (try db.closure.?.contains(fact)) continue;
-        try appendFactCopy(db.allocator, additions, fact);
+        try relation_store.appendFactCopy(db.allocator, additions, fact);
     }
 }
-pub fn dropAuxiliaryViews(db: *Jatalog) void {
+pub fn dropAuxiliaryViews(db: *root.Jatalog) void {
     for (db.auxiliary.items) |*view| view.deinit(db.allocator);
     db.auxiliary.clearRetainingCapacity();
 }
-pub fn auxiliaryFor(db: *Jatalog, rule_id: u32) ?*AuxiliaryView {
+pub fn auxiliaryFor(db: *root.Jatalog, rule_id: u32) ?*AuxiliaryView {
     for (db.auxiliary.items) |*view| if (view.rule_id == rule_id) return view;
     return null;
 }
 /// Rebuilds every projected aggregate view from the materialized
 /// closure. Views are built into a temporary list and installed only on
 /// success, so a failure leaves the previous views in place.
-pub fn rebuildAuxiliaryViews(db: *Jatalog) !void {
+pub fn rebuildAuxiliaryViews(db: *root.Jatalog) !void {
     var built: std.ArrayList(AuxiliaryView) = .empty;
     errdefer {
         for (built.items) |*view| view.deinit(db.allocator);
         built.deinit(db.allocator);
     }
     for (db.eval.rules.items) |rule| {
-        const clause_index = maintainableAggregateIndex(rule) orelse continue;
+        const clause_index = syntax.maintainableAggregateIndex(rule) orelse continue;
         var view = (try buildAuxiliaryView(db, rule, clause_index)) orelse continue;
         built.append(db.allocator, view) catch |err| {
             view.deinit(db.allocator);
@@ -562,28 +539,28 @@ pub fn rebuildAuxiliaryViews(db: *Jatalog) !void {
 /// outer-goal variables its head omits. An empty result means the head
 /// retains every outer variable, so each head tuple already belongs to
 /// exactly one group and no auxiliary view is needed.
-fn projectedVariables(db: *Jatalog, rule: Rule, clause_index: usize) ![]Id {
-    const outer = try outerClauses(db.allocator, rule, clause_index);
+fn projectedVariables(db: *root.Jatalog, rule: syntax.Rule, clause_index: usize) ![]syntax.Id {
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
     defer db.allocator.free(outer);
-    var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
+    var outer_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
     defer outer_variables.deinit(db.allocator);
     for (outer) |clause|
-        try collectClauseSurfaceVariables(db.allocator, clause, &outer_variables);
-    var head_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        try syntax.collectClauseSurfaceVariables(db.allocator, clause, &outer_variables);
+    var head_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
     defer head_variables.deinit(db.allocator);
-    for (rule.head.terms) |term| try collectTermVariables(db.allocator, term, &head_variables);
+    for (rule.head.terms) |term| try syntax.collectTermVariables(db.allocator, term, &head_variables);
 
-    var projected: std.ArrayList(Id) = .empty;
+    var projected: std.ArrayList(syntax.Id) = .empty;
     errdefer projected.deinit(db.allocator);
     var iterator = outer_variables.keyIterator();
     while (iterator.next()) |variable| {
         if (!head_variables.contains(variable.*))
             try projected.append(db.allocator, variable.*);
     }
-    std.mem.sort(Id, projected.items, {}, std.sort.asc(Id));
+    std.mem.sort(syntax.Id, projected.items, {}, std.sort.asc(syntax.Id));
     return projected.toOwnedSlice(db.allocator);
 }
-fn buildAuxiliaryView(db: *Jatalog, rule: Rule, clause_index: usize) !?AuxiliaryView {
+fn buildAuxiliaryView(db: *root.Jatalog, rule: syntax.Rule, clause_index: usize) !?AuxiliaryView {
     const projected = try projectedVariables(db, rule, clause_index);
     var projected_owned = true;
     defer if (projected_owned) db.allocator.free(projected);
@@ -600,14 +577,14 @@ fn buildAuxiliaryView(db: *Jatalog, rule: Rule, clause_index: usize) !?Auxiliary
     projected_owned = false;
     errdefer view.deinit(db.allocator);
 
-    const outer = try outerClauses(db.allocator, rule, clause_index);
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
     defer db.allocator.free(outer);
-    var groups: std.ArrayList(Binding) = .empty;
+    var groups: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (groups.items) |*group| group.deinit(db.allocator);
         groups.deinit(db.allocator);
     }
-    var initial: Binding = .{};
+    var initial: syntax.Binding = .{};
     defer initial.deinit(db.allocator);
     db.eval.matchClauses(
         outer,
@@ -617,7 +594,7 @@ fn buildAuxiliaryView(db: *Jatalog, rule: Rule, clause_index: usize) !?Auxiliary
         &groups,
         null,
     ) catch |err| switch (err) {
-        Error.NumericType, Error.NumericOverflow => return view,
+        root.Error.NumericType, root.Error.NumericOverflow => return view,
         else => return err,
     };
     for (groups.items) |*group| try recordGroupTuples(db, rule, &view, group);
@@ -626,12 +603,12 @@ fn buildAuxiliaryView(db: *Jatalog, rule: Rule, clause_index: usize) !?Auxiliary
 /// Records the auxiliary tuples one group contributes: its projected
 /// values followed by each head tuple the rule derives for it.
 fn recordGroupTuples(
-    db: *Jatalog,
-    rule: Rule,
+    db: *root.Jatalog,
+    rule: syntax.Rule,
     view: *AuxiliaryView,
-    group: *const Binding,
+    group: *const syntax.Binding,
 ) !void {
-    var answers: std.ArrayList(Binding) = .empty;
+    var answers: std.ArrayList(syntax.Binding) = .empty;
     defer {
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
@@ -644,7 +621,7 @@ fn recordGroupTuples(
         &answers,
         null,
     ) catch |err| switch (err) {
-        Error.NumericType, Error.NumericOverflow => return,
+        root.Error.NumericType, root.Error.NumericOverflow => return,
         else => return err,
     };
     for (answers.items) |*answer| {
@@ -658,12 +635,12 @@ fn recordGroupTuples(
     }
 }
 fn auxiliaryTerms(
-    db: *Jatalog,
+    db: *root.Jatalog,
     view: *const AuxiliaryView,
-    group: *const Binding,
-    head: Fact,
-) !?[]ValueId {
-    const terms = try db.allocator.alloc(ValueId, view.arity());
+    group: *const syntax.Binding,
+    head: relation_store.Fact,
+) !?[]relation_store.ValueId {
+    const terms = try db.allocator.alloc(relation_store.ValueId, view.arity());
     var owned = true;
     defer if (owned) db.allocator.free(terms);
     for (view.projected, 0..) |variable, index| {
@@ -675,7 +652,7 @@ fn auxiliaryTerms(
 }
 
 test "aggregate groups are maintained incrementally across member changes" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\group(g1). group(g2).
@@ -684,67 +661,67 @@ test "aggregate groups are maintained incrementally across member changes" {
     );
     setup.deinit();
     var initial = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
     initial.deinit();
     const expansions_after_build = db.eval.expansions;
 
     // Member insertion updates only the affected group, with no rebuild.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("c") }),
+        root.input.fact("member", &.{ root.input.atom("g1"), root.input.atom("c") }),
     }, &.{}));
     try std.testing.expect(db.materialization == .clean);
     try std.testing.expectEqual(expansions_after_build, db.eval.expansions);
     var inserted = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&inserted.query.answers.items[0], "S", "[a, b, c]");
+    try test_support.expectBindingValue(&inserted.query.answers.items[0], "S", "[a, b, c]");
     inserted.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // The untouched group keeps its list and there is exactly one tuple
     // per group after the change.
     var untouched = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&untouched.query.answers.items[0], "S", "[z]");
+    try test_support.expectBindingValue(&untouched.query.answers.items[0], "S", "[z]");
     untouched.deinit();
-    try expectAnswerCount(&db, "collected(G, S)?", 2);
+    try test_support.expectAnswerCount(&db, "collected(G, S)?", 2);
 
     // Member deletion shrinks the list.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+        root.input.fact("member", &.{ root.input.atom("g1"), root.input.atom("a") }),
     }));
     var deleted = try db.execute("collected(g1, S)?");
-    try expectBindingValue(&deleted.query.answers.items[0], "S", "[b, c]");
+    try test_support.expectBindingValue(&deleted.query.answers.items[0], "S", "[b, c]");
     deleted.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Deleting the last member leaves the enumerated group with an empty
     // list, because its outer goal still derives the group.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g2"), input.atom("z") }),
+        root.input.fact("member", &.{ root.input.atom("g2"), root.input.atom("z") }),
     }));
     var emptied = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&emptied.query.answers.items[0], "S", "[]");
+    try test_support.expectBindingValue(&emptied.query.answers.items[0], "S", "[]");
     emptied.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Deleting the group key removes the tuple entirely.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("group", &.{input.atom("g2")}),
+        root.input.fact("group", &.{root.input.atom("g2")}),
     }));
-    try expectAnswerCount(&db, "collected(g2, S)?", 0);
-    try expectAnswerCount(&db, "collected(G, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "collected(g2, S)?", 0);
+    try test_support.expectAnswerCount(&db, "collected(G, S)?", 1);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Restoring the group key brings back an empty group.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("group", &.{input.atom("g2")}),
+        root.input.fact("group", &.{root.input.atom("g2")}),
     }, &.{}));
     var restored = try db.execute("collected(g2, S)?");
-    try expectBindingValue(&restored.query.answers.items[0], "S", "[]");
+    try test_support.expectBindingValue(&restored.query.answers.items[0], "S", "[]");
     restored.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "duplicate member derivations do not disturb a maintained group" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\group(g). direct(g, a). mirrored(g, a). direct(g, b).
@@ -754,26 +731,26 @@ test "duplicate member derivations do not disturb a maintained group" {
     );
     setup.deinit();
     var initial = try db.execute("collected(g, S)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
     initial.deinit();
 
     // Removing one of two derivations of member(g, a) keeps the member.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("mirrored", &.{ input.atom("g"), input.atom("a") }),
+        root.input.fact("mirrored", &.{ root.input.atom("g"), root.input.atom("a") }),
     }));
     var kept = try db.execute("collected(g, S)?");
-    try expectBindingValue(&kept.query.answers.items[0], "S", "[a, b]");
+    try test_support.expectBindingValue(&kept.query.answers.items[0], "S", "[a, b]");
     kept.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Removing the last derivation drops it from the list.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("direct", &.{ input.atom("g"), input.atom("a") }),
+        root.input.fact("direct", &.{ root.input.atom("g"), root.input.atom("a") }),
     }));
     var dropped = try db.execute("collected(g, S)?");
-    try expectBindingValue(&dropped.query.answers.items[0], "S", "[b]");
+    try test_support.expectBindingValue(&dropped.query.answers.items[0], "S", "[b]");
     dropped.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "canonical aggregate lists are independent of update order" {
@@ -783,7 +760,7 @@ test "canonical aggregate lists are independent of update order" {
         .{ "a", "b", "c" },
     };
     for (orders) |order| {
-        var db: Jatalog = .init(std.testing.allocator);
+        var db: root.Jatalog = .init(std.testing.allocator);
         defer db.deinit();
         var setup = try db.execute(
             \\group(g).
@@ -791,23 +768,23 @@ test "canonical aggregate lists are independent of update order" {
         );
         setup.deinit();
         var empty = try db.execute("collected(g, S)?");
-        try expectBindingValue(&empty.query.answers.items[0], "S", "[]");
+        try test_support.expectBindingValue(&empty.query.answers.items[0], "S", "[]");
         empty.deinit();
 
         for (order) |name| {
             _ = try db.applyChanges(&.{
-                input.fact("member", &.{ input.atom("g"), input.atom(name) }),
+                root.input.fact("member", &.{ root.input.atom("g"), root.input.atom(name) }),
             }, &.{});
         }
         var result = try db.execute("collected(g, S)?");
-        try expectBindingValue(&result.query.answers.items[0], "S", "[a, b, c]");
+        try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a, b, c]");
         result.deinit();
-        try expectClosureMatchesRebuild(&db);
+        try test_support.expectClosureMatchesRebuild(&db);
     }
 }
 
 test "bag emulation retains equal values with distinct discriminators" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\group(g). reading(g, r1, 5). reading(g, r2, 5). reading(g, r3, 7).
@@ -815,7 +792,7 @@ test "bag emulation retains equal values with distinct discriminators" {
     );
     setup.deinit();
     var initial = try db.execute("bag(g, S)?");
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &initial.query.answers.items[0],
         "S",
         "[[5, r1], [5, r2], [7, r3]]",
@@ -823,33 +800,33 @@ test "bag emulation retains equal values with distinct discriminators" {
     initial.deinit();
 
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("reading", &.{ input.atom("g"), input.atom("r4"), input.integer(5) }),
+        root.input.fact("reading", &.{ root.input.atom("g"), root.input.atom("r4"), root.input.integer(5) }),
     }, &.{}));
     var added = try db.execute("bag(g, S)?");
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &added.query.answers.items[0],
         "S",
         "[[5, r1], [5, r2], [5, r4], [7, r3]]",
     );
     added.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Removing one duplicate value keeps the others.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("reading", &.{ input.atom("g"), input.atom("r2"), input.integer(5) }),
+        root.input.fact("reading", &.{ root.input.atom("g"), root.input.atom("r2"), root.input.integer(5) }),
     }));
     var removed = try db.execute("bag(g, S)?");
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &removed.query.answers.items[0],
         "S",
         "[[5, r1], [5, r4], [7, r3]]",
     );
     removed.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "maintained aggregates feed downstream strata and recursive consumers" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\person(alice). person(bob).
@@ -867,26 +844,26 @@ test "maintained aggregates feed downstream strata and recursive consumers" {
     // A new child changes the aggregate list, which must flow through the
     // downstream structural list function.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("person", &.{input.atom("carol")}),
-        input.fact("parent", &.{ input.atom("alice"), input.atom("carol") }),
+        root.input.fact("person", &.{root.input.atom("carol")}),
+        root.input.fact("parent", &.{ root.input.atom("alice"), root.input.atom("carol") }),
     }, &.{}));
     var grown = try db.execute("numchildren(alice, N)?");
     try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
     grown.deinit();
-    try expectAnswerCount(&db, "numchildren(X, N)?", 3);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "numchildren(X, N)?", 3);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }),
+        root.input.fact("parent", &.{ root.input.atom("alice"), root.input.atom("bob") }),
     }));
     var shrunk = try db.execute("numchildren(alice, N)?");
     try std.testing.expectEqual(@as(i64, 1), try shrunk.query.answers.items[0].getInteger("N"));
     shrunk.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "multiple and nested aggregates stay correct through the rebuild path" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\group(g1). group(g2). item(g1, a). item(g2, b). tag(g1, t1). tag(g2, t2).
@@ -895,40 +872,40 @@ test "multiple and nested aggregates stay correct through the rebuild path" {
     );
     setup.deinit();
     var initial = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[a]");
-    try expectBindingValue(&initial.query.answers.items[0], "T", "[t1]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "T", "[t1]");
     initial.deinit();
 
     // Rules outside the maintainable class fall back to the stratum
     // rebuild, which must still produce rebuild-equivalent results.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("item", &.{ input.atom("g1"), input.atom("c") }),
-        input.fact("tag", &.{ input.atom("g1"), input.atom("t3") }),
+        root.input.fact("item", &.{ root.input.atom("g1"), root.input.atom("c") }),
+        root.input.fact("tag", &.{ root.input.atom("g1"), root.input.atom("t3") }),
     }, &.{}));
     var updated = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&updated.query.answers.items[0], "S", "[a, c]");
-    try expectBindingValue(&updated.query.answers.items[0], "T", "[t1, t3]");
+    try test_support.expectBindingValue(&updated.query.answers.items[0], "S", "[a, c]");
+    try test_support.expectBindingValue(&updated.query.answers.items[0], "T", "[t1, t3]");
     updated.deinit();
     var nested = try db.execute("nested(S)?");
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &nested.query.answers.items[0],
         "S",
         "[[g1, [a, c]], [g2, [b]]]",
     );
     nested.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("item", &.{ input.atom("g1"), input.atom("a") }),
+        root.input.fact("item", &.{ root.input.atom("g1"), root.input.atom("a") }),
     }));
     var reduced = try db.execute("both(g1, S, T)?");
-    try expectBindingValue(&reduced.query.answers.items[0], "S", "[c]");
+    try test_support.expectBindingValue(&reduced.query.answers.items[0], "S", "[c]");
     reduced.deinit();
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "random aggregate update traces match a clean rebuild after every batch" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     // Pinned: this test asserts the incremental mechanism itself.
     db.setMaintenancePolicy(.incremental);
@@ -941,43 +918,43 @@ test "random aggregate update traces match a clean rebuild after every batch" {
         \\empty(G) :- group(G), not member(G, m1), not member(G, m2), not member(G, m3).
     );
     setup.deinit();
-    try expectAnswerCount(&db, "size(G, N)?", 3);
+    try test_support.expectAnswerCount(&db, "size(G, N)?", 3);
 
     const groups = [_][]const u8{ "g1", "g2", "g3" };
     const members = [_][]const u8{ "m1", "m2", "m3" };
     var prng = std.Random.DefaultPrng.init(0xa99a6a7e5eed);
     const random = prng.random();
     for (0..40) |_| {
-        var insert_buffer: [2][2]input.Term = undefined;
-        var inserts: [2]input.Relation = undefined;
+        var insert_buffer: [2][2]root.input.Term = undefined;
+        var inserts: [2]root.input.Relation = undefined;
         const insert_count = random.uintLessThan(usize, 3);
         for (0..insert_count) |slot| {
             insert_buffer[slot] = .{
-                input.atom(groups[random.uintLessThan(usize, groups.len)]),
-                input.atom(members[random.uintLessThan(usize, members.len)]),
+                root.input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                root.input.atom(members[random.uintLessThan(usize, members.len)]),
             };
-            inserts[slot] = input.fact("member", &insert_buffer[slot]);
+            inserts[slot] = root.input.fact("member", &insert_buffer[slot]);
         }
-        var delete_buffer: [2][2]input.Term = undefined;
-        var deletes: [2]input.Relation = undefined;
+        var delete_buffer: [2][2]root.input.Term = undefined;
+        var deletes: [2]root.input.Relation = undefined;
         const delete_count = random.uintLessThan(usize, 3);
         for (0..delete_count) |slot| {
             delete_buffer[slot] = .{
-                input.atom(groups[random.uintLessThan(usize, groups.len)]),
-                input.atom(members[random.uintLessThan(usize, members.len)]),
+                root.input.atom(groups[random.uintLessThan(usize, groups.len)]),
+                root.input.atom(members[random.uintLessThan(usize, members.len)]),
             };
-            deletes[slot] = input.fact("member", &delete_buffer[slot]);
+            deletes[slot] = root.input.fact("member", &delete_buffer[slot]);
         }
         _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
         try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
+        try test_support.expectClosureMatchesRebuild(&db);
     }
 }
 
 /// Derivation count the auxiliary view records for the single tuple of
 /// `predicate` whose first argument is the atom `first_atom`.
 fn derivationCountOf(
-    db: *Jatalog,
+    db: *root.Jatalog,
     predicate: []const u8,
     first_atom: []const u8,
 ) !u32 {
@@ -999,7 +976,7 @@ fn derivationCountOf(
 }
 
 test "Chapter 5 Example 5.2.1 maintains a view without projections" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\p(a). p(b). r(a, 1). r(c, 3).
@@ -1009,27 +986,27 @@ test "Chapter 5 Example 5.2.1 maintains a view without projections" {
 
     // The materialization contains v(a, [1]) and v(b, []).
     var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
     initial.deinit();
     var empty = try db.execute("v(b, S)?");
-    try expectBindingValue(&empty.query.answers.items[0], "S", "[]");
+    try test_support.expectBindingValue(&empty.query.answers.items[0], "S", "[]");
     empty.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 2);
+    try test_support.expectAnswerCount(&db, "v(X, S)?", 2);
 
     // Deleting p(a) and inserting r(b, 2) deletes v(a, [1]) and updates
     // v(b, []) to v(b, [2]).
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("r", &.{ input.atom("b"), input.integer(2) }),
+        root.input.fact("r", &.{ root.input.atom("b"), root.input.integer(2) }),
     }, &.{
-        input.fact("p", &.{input.atom("a")}),
+        root.input.fact("p", &.{root.input.atom("a")}),
     }));
     try std.testing.expect(db.materialization == .clean);
-    try expectAnswerCount(&db, "v(a, S)?", 0);
+    try test_support.expectAnswerCount(&db, "v(a, S)?", 0);
     var updated = try db.execute("v(b, S)?");
-    try expectBindingValue(&updated.query.answers.items[0], "S", "[2]");
+    try test_support.expectBindingValue(&updated.query.answers.items[0], "S", "[2]");
     updated.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "v(X, S)?", 1);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // This view retains every outer variable, so it is self-maintainable and
     // needs no auxiliary derivation counts.
@@ -1040,7 +1017,7 @@ test "Chapter 5 Example 5.2.1 maintains a view without projections" {
 }
 
 test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\p(a, 1). p(a, 2). p(b, 1). r(a, 1). r(a, 2). r(b, 2).
@@ -1049,10 +1026,10 @@ test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
     setup.deinit();
 
     var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[1, 2]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1, 2]");
     initial.deinit();
     var other = try db.execute("v(b, S)?");
-    try expectBindingValue(&other.query.answers.items[0], "S", "[2]");
+    try test_support.expectBindingValue(&other.query.answers.items[0], "S", "[2]");
     other.deinit();
 
     // The auxiliary counting view holds v(a, [1, 2]) with two derivations
@@ -1066,27 +1043,27 @@ test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
 
     // Deleting p(a, 2) removes one of two derivations, so the tuple stays.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("p", &.{ input.atom("a"), input.integer(2) }),
+        root.input.fact("p", &.{ root.input.atom("a"), root.input.integer(2) }),
     }));
     try std.testing.expect(db.materialization == .clean);
     var retained = try db.execute("v(a, S)?");
-    try expectBindingValue(&retained.query.answers.items[0], "S", "[1, 2]");
+    try test_support.expectBindingValue(&retained.query.answers.items[0], "S", "[1, 2]");
     retained.deinit();
     try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "a"));
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Deleting p(a, 1) removes the last derivation, so the tuple goes.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("p", &.{ input.atom("a"), input.integer(1) }),
+        root.input.fact("p", &.{ root.input.atom("a"), root.input.integer(1) }),
     }));
-    try expectAnswerCount(&db, "v(a, S)?", 0);
+    try test_support.expectAnswerCount(&db, "v(a, S)?", 0);
     try std.testing.expectEqual(@as(u32, 0), try derivationCountOf(&db, "v", "a"));
-    try expectAnswerCount(&db, "v(X, S)?", 1);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "v(X, S)?", 1);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "a changed aggregate list transfers support to the new tuple" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\p(a, 1). p(a, 2). p(a, 3). r(a, 1).
@@ -1094,38 +1071,38 @@ test "a changed aggregate list transfers support to the new tuple" {
     );
     setup.deinit();
     var initial = try db.execute("v(a, S)?");
-    try expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
+    try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
     initial.deinit();
     try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
 
     // Growing the member set replaces the old tuple with the new one and
     // carries all three derivations across in the same batch.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("r", &.{ input.atom("a"), input.integer(2) }),
+        root.input.fact("r", &.{ root.input.atom("a"), root.input.integer(2) }),
     }, &.{}));
     try std.testing.expect(db.materialization == .clean);
     var moved = try db.execute("v(a, S)?");
-    try expectBindingValue(&moved.query.answers.items[0], "S", "[1, 2]");
+    try test_support.expectBindingValue(&moved.query.answers.items[0], "S", "[1, 2]");
     moved.deinit();
-    try expectAnswerCount(&db, "v(a, S)?", 1);
+    try test_support.expectAnswerCount(&db, "v(a, S)?", 1);
     try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
     try std.testing.expectEqual(@as(usize, 3), db.maintenanceStats().auxiliary_tuples);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Shrinking it back transfers the support again.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("r", &.{ input.atom("a"), input.integer(1) }),
+        root.input.fact("r", &.{ root.input.atom("a"), root.input.integer(1) }),
     }));
     var shrunk = try db.execute("v(a, S)?");
-    try expectBindingValue(&shrunk.query.answers.items[0], "S", "[2]");
+    try test_support.expectBindingValue(&shrunk.query.answers.items[0], "S", "[2]");
     shrunk.deinit();
-    try expectAnswerCount(&db, "v(a, S)?", 1);
+    try test_support.expectAnswerCount(&db, "v(a, S)?", 1);
     try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectClosureMatchesRebuild(&db);
 }
 
 test "projected view counts agree with explicit proof enumeration" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     // Pinned: this test asserts the incremental mechanism itself.
     db.setMaintenancePolicy(.incremental);
@@ -1134,39 +1111,39 @@ test "projected view counts agree with explicit proof enumeration" {
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
     );
     setup.deinit();
-    try expectAnswerCount(&db, "v(X, S)?", 1);
+    try test_support.expectAnswerCount(&db, "v(X, S)?", 1);
 
     const keys = [_][]const u8{ "a", "b", "c" };
     var prng = std.Random.DefaultPrng.init(0xc0107501c0107);
     const random = prng.random();
     for (0..40) |_| {
-        var insert_buffer: [2][2]input.Term = undefined;
-        var inserts: [2]input.Relation = undefined;
+        var insert_buffer: [2][2]root.input.Term = undefined;
+        var inserts: [2]root.input.Relation = undefined;
         const insert_count = random.uintLessThan(usize, 3);
         for (0..insert_count) |slot| {
             const key = keys[random.uintLessThan(usize, keys.len)];
             const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
-            insert_buffer[slot] = .{ input.atom(key), input.integer(number) };
-            inserts[slot] = input.fact(
+            insert_buffer[slot] = .{ root.input.atom(key), root.input.integer(number) };
+            inserts[slot] = root.input.fact(
                 if (random.boolean()) "p" else "r",
                 &insert_buffer[slot],
             );
         }
-        var delete_buffer: [2][2]input.Term = undefined;
-        var deletes: [2]input.Relation = undefined;
+        var delete_buffer: [2][2]root.input.Term = undefined;
+        var deletes: [2]root.input.Relation = undefined;
         const delete_count = random.uintLessThan(usize, 3);
         for (0..delete_count) |slot| {
             const key = keys[random.uintLessThan(usize, keys.len)];
             const number: i64 = @intCast(random.uintLessThan(usize, 3) + 1);
-            delete_buffer[slot] = .{ input.atom(key), input.integer(number) };
-            deletes[slot] = input.fact(
+            delete_buffer[slot] = .{ root.input.atom(key), root.input.integer(number) };
+            deletes[slot] = root.input.fact(
                 if (random.boolean()) "p" else "r",
                 &delete_buffer[slot],
             );
         }
         _ = try db.applyChanges(inserts[0..insert_count], deletes[0..delete_count]);
         try std.testing.expect(db.materialization == .clean);
-        try expectClosureMatchesRebuild(&db);
+        try test_support.expectClosureMatchesRebuild(&db);
 
         // Every proof of v(k, S) comes from one p(k, Z) fact, so the stored
         // derivation count must equal the number of such base facts.
@@ -1184,7 +1161,7 @@ test "projected view counts agree with explicit proof enumeration" {
 }
 
 test "aggregate changes propagate through downstream list functions and arithmetic" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     // Pinned: this test asserts the incremental mechanism itself.
     db.setMaintenancePolicy(.incremental);
@@ -1205,12 +1182,12 @@ test "aggregate changes propagate through downstream list functions and arithmet
     var initial = try db.execute("headcount(red, N)?");
     try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
     initial.deinit();
-    try expectAnswerCount(&db, "staffed(T)?", 0);
+    try test_support.expectAnswerCount(&db, "staffed(T)?", 0);
 
     // Growing one group must reach every downstream stratum.
     try std.testing.expect(try db.applyChanges(&.{
-        input.fact("plays", &.{ input.atom("red"), input.atom("ann") }),
-        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+        root.input.fact("plays", &.{ root.input.atom("red"), root.input.atom("ann") }),
+        root.input.fact("plays", &.{ root.input.atom("red"), root.input.atom("bo") }),
     }, &.{}));
     var grown = try db.execute("size(red, N)?");
     try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
@@ -1218,19 +1195,19 @@ test "aggregate changes propagate through downstream list functions and arithmet
     var counted = try db.execute("headcount(red, N)?");
     try std.testing.expectEqual(@as(i64, 3), try counted.query.answers.items[0].getInteger("N"));
     counted.deinit();
-    try expectAnswerCount(&db, "staffed(red)?", 1);
-    try expectAnswerCount(&db, "staffed(blue)?", 0);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "staffed(red)?", 1);
+    try test_support.expectAnswerCount(&db, "staffed(blue)?", 0);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // Shrinking it retracts the downstream conclusions again.
     try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
+        root.input.fact("plays", &.{ root.input.atom("red"), root.input.atom("bo") }),
     }));
     var shrunk = try db.execute("headcount(red, N)?");
     try std.testing.expectEqual(@as(i64, 2), try shrunk.query.answers.items[0].getInteger("N"));
     shrunk.deinit();
-    try expectAnswerCount(&db, "staffed(T)?", 0);
-    try expectClosureMatchesRebuild(&db);
+    try test_support.expectAnswerCount(&db, "staffed(T)?", 0);
+    try test_support.expectClosureMatchesRebuild(&db);
 
     // A downstream structural-recursive component recomputes within its own
     // stratum rather than forcing a whole-closure rebuild.
@@ -1239,7 +1216,7 @@ test "aggregate changes propagate through downstream list functions and arithmet
 }
 
 fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
+    var db: root.Jatalog = .init(allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\group(g1). group(g2). member(g1, a).
@@ -1249,11 +1226,11 @@ fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
     var first = try db.execute("collected(G, S)?");
     first.deinit();
     _ = try db.applyChanges(&.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
-        input.fact("member", &.{ input.atom("g2"), input.atom("c") }),
+        root.input.fact("member", &.{ root.input.atom("g1"), root.input.atom("b") }),
+        root.input.fact("member", &.{ root.input.atom("g2"), root.input.atom("c") }),
     }, &.{});
     _ = try db.applyChanges(&.{}, &.{
-        input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
+        root.input.fact("member", &.{ root.input.atom("g1"), root.input.atom("a") }),
     });
     var second = try db.execute("collected(g1, S)?");
     defer second.deinit();

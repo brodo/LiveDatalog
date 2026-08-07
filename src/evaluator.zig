@@ -15,38 +15,18 @@
 //! instead of the error set and does not compile.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 const scalar = @import("scalar.zig");
 const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 const cost_model = @import("cost_model.zig");
 
-const Error = @import("root.zig").Error;
-const root_mod = @import("root.zig");
-const Jatalog = root_mod.Jatalog;
-const expectSemiNaiveMatchesNaive = @import("test_support.zig").expectSemiNaiveMatchesNaive;
-const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
-const expectBindingValue = @import("test_support.zig").expectBindingValue;
-const CostModel = cost_model.CostModel;
-const Fact = relation_store.Fact;
-const PredicateKey = relation_store.PredicateKey;
-const RelationStore = relation_store.RelationStore;
-const ValueId = syntax.ValueId;
-const Term = syntax.Term;
-const Expr = syntax.Expr;
-const Clause = syntax.Clause;
-const Rule = syntax.Rule;
-const Binding = syntax.Binding;
-const DeltaConstraint = syntax.DeltaConstraint;
-const predicateKey = syntax.predicateKey;
-const isBuiltin = syntax.isBuiltin;
-const cloneRule = syntax.cloneRule;
-const freeRule = syntax.freeRule;
-const noteBodyDependencies = syntax.noteBodyDependencies;
+const root = @import("root.zig");
 
 pub const Value = union(enum) {
     scalar: scalar.Id,
     nil,
-    cons: struct { head: ValueId, tail: ValueId },
+    cons: struct { head: syntax.ValueId, tail: syntax.ValueId },
 };
 
 pub const ValueTable = struct {
@@ -69,7 +49,7 @@ pub const ValueTable = struct {
         };
     }
 
-    pub fn intern(self: *ValueTable, value: Value) !ValueId {
+    pub fn intern(self: *ValueTable, value: Value) !syntax.ValueId {
         for (self.values.items, 0..) |existing, index| {
             if (std.meta.eql(existing, value)) return @intCast(index);
         }
@@ -77,11 +57,11 @@ pub const ValueTable = struct {
         return @intCast(self.values.items.len - 1);
     }
 
-    pub fn get(self: *const ValueTable, id: ValueId) Value {
+    pub fn get(self: *const ValueTable, id: syntax.ValueId) Value {
         return self.values.items[@intCast(id)];
     }
 
-    pub fn internFrom(self: *ValueTable, source: *const ValueTable, id: ValueId) !ValueId {
+    pub fn internFrom(self: *ValueTable, source: *const ValueTable, id: syntax.ValueId) !syntax.ValueId {
         return switch (source.get(id)) {
             .scalar => |value| try self.intern(.{ .scalar = value }),
             .nil => try self.intern(.nil),
@@ -97,8 +77,8 @@ pub const ValueTable = struct {
 /// predicate read anywhere in a rule body, the lowest head stratum that
 /// depends on it. Invalidated whenever the rule set changes.
 pub const Analysis = struct {
-    strata: std.array_hash_map.Auto(PredicateKey, usize),
-    first_dependent: std.array_hash_map.Auto(PredicateKey, usize),
+    strata: std.array_hash_map.Auto(relation_store.PredicateKey, usize),
+    first_dependent: std.array_hash_map.Auto(relation_store.PredicateKey, usize),
     max_level: usize,
     has_seed_rules: bool,
 
@@ -115,11 +95,11 @@ pub const Analysis = struct {
 /// stays active in every stratum at or above its own, because its seed set is
 /// the growing value table rather than a completed relation.
 pub fn ruleActiveAt(
-    levels: *const std.array_hash_map.Auto(PredicateKey, usize),
-    rule: Rule,
+    levels: *const std.array_hash_map.Auto(relation_store.PredicateKey, usize),
+    rule: syntax.Rule,
     level: usize,
 ) bool {
-    const rule_level = levels.get(predicateKey(rule.head)) orelse 0;
+    const rule_level = levels.get(syntax.predicateKey(rule.head)) orelse 0;
     if (rule_level == level) return true;
     return rule.seed_argument != null and rule_level < level;
 }
@@ -127,10 +107,10 @@ pub fn ruleActiveAt(
 /// The stratum a rule's head belongs to, ignoring the cross-stratum reach of
 /// seeded rules that `ruleActiveAt` grants.
 pub fn ruleStratum(
-    levels: *const std.array_hash_map.Auto(PredicateKey, usize),
-    rule: Rule,
+    levels: *const std.array_hash_map.Auto(relation_store.PredicateKey, usize),
+    rule: syntax.Rule,
 ) usize {
-    return levels.get(predicateKey(rule.head)) orelse 0;
+    return levels.get(syntax.predicateKey(rule.head)) orelse 0;
 }
 
 /// The program a database evaluates: interned ground values, the rule set,
@@ -148,14 +128,14 @@ pub const Evaluator = struct {
     allocator: std.mem.Allocator,
     scalars: scalar.Store,
     values: ValueTable,
-    rules: std.ArrayList(Rule) = .empty,
+    rules: std.ArrayList(syntax.Rule) = .empty,
     next_rule_id: u32 = 0,
     analysis: ?Analysis = null,
     /// Counts stratum expansions; tests use it to prove that repeated
     /// queries perform no rule expansion after the first materialization.
     expansions: usize = 0,
     /// Chooses between maintaining and recomputing, and learns both costs.
-    cost: CostModel = .{},
+    cost: cost_model.CostModel = .{},
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         return .{
@@ -167,7 +147,7 @@ pub const Evaluator = struct {
 
     pub fn deinit(self: *Evaluator) void {
         if (self.analysis) |*analysis| analysis.deinit(self.allocator);
-        for (self.rules.items) |rule| freeRule(self.allocator, rule);
+        for (self.rules.items) |rule| syntax.freeRule(self.allocator, rule);
         self.rules.deinit(self.allocator);
         self.values.deinit();
         self.scalars.deinit();
@@ -187,13 +167,13 @@ pub const Evaluator = struct {
         result.values = try self.values.clone();
         errdefer result.values.deinit();
         errdefer {
-            for (result.rules.items) |rule| freeRule(self.allocator, rule);
+            for (result.rules.items) |rule| syntax.freeRule(self.allocator, rule);
             result.rules.deinit(self.allocator);
         }
         for (self.rules.items) |rule| {
-            const copy = try cloneRule(self.allocator, rule);
+            const copy = try syntax.cloneRule(self.allocator, rule);
             result.rules.append(self.allocator, copy) catch |err| {
-                freeRule(self.allocator, copy);
+                syntax.freeRule(self.allocator, copy);
                 return err;
             };
         }
@@ -212,13 +192,13 @@ pub const Evaluator = struct {
             errdefer strata.deinit(self.allocator);
             var max_level: usize = 0;
             for (strata.values()) |level| max_level = @max(max_level, level);
-            var first_dependent: std.array_hash_map.Auto(PredicateKey, usize) = .empty;
+            var first_dependent: std.array_hash_map.Auto(relation_store.PredicateKey, usize) = .empty;
             errdefer first_dependent.deinit(self.allocator);
             var has_seed_rules = false;
             for (self.rules.items) |rule| {
                 if (rule.seed_argument != null) has_seed_rules = true;
-                const head_level = strata.get(predicateKey(rule.head)) orelse 0;
-                try noteBodyDependencies(self.allocator, rule.body, head_level, &first_dependent);
+                const head_level = strata.get(syntax.predicateKey(rule.head)) orelse 0;
+                try syntax.noteBodyDependencies(self.allocator, rule.body, head_level, &first_dependent);
             }
             self.analysis = .{
                 .strata = strata,
@@ -230,7 +210,7 @@ pub const Evaluator = struct {
         return &self.analysis.?;
     }
 
-    pub fn expandFrom(self: *Evaluator, facts: *RelationStore, first_level: usize) !void {
+    pub fn expandFrom(self: *Evaluator, facts: *relation_store.RelationStore, first_level: usize) !void {
         const analysis = try self.ensureAnalysis();
         if (first_level > analysis.max_level) return;
         for (first_level..analysis.max_level + 1) |level|
@@ -239,7 +219,7 @@ pub const Evaluator = struct {
 
     /// Reference naive fixpoint kept as the semantic oracle for the
     /// semi-naive engine; differential tests compare both closures.
-    pub fn expandNaive(self: *Evaluator, facts: *RelationStore) !void {
+    pub fn expandNaive(self: *Evaluator, facts: *relation_store.RelationStore) !void {
         var levels = try self.computeStrata();
         defer levels.deinit(self.allocator);
         var max_level: usize = 0;
@@ -269,13 +249,13 @@ pub const Evaluator = struct {
     /// active seed rule, since only those relations gain facts mid-stratum.
     fn expandLevel(
         self: *Evaluator,
-        facts: *RelationStore,
-        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+        facts: *relation_store.RelationStore,
+        levels: *const std.array_hash_map.Auto(relation_store.PredicateKey, usize),
         level: usize,
     ) !void {
         self.expansions += 1;
         const ActiveRule = struct {
-            rule: Rule,
+            rule: syntax.Rule,
             growing_occurrences: []usize,
         };
         var active: std.ArrayList(ActiveRule) = .empty;
@@ -283,12 +263,12 @@ pub const Evaluator = struct {
             for (active.items) |entry| self.allocator.free(entry.growing_occurrences);
             active.deinit(self.allocator);
         }
-        var growing: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
+        var growing: std.AutoHashMapUnmanaged(relation_store.PredicateKey, void) = .empty;
         defer growing.deinit(self.allocator);
         for (self.rules.items) |rule| {
             if (!ruleActiveAt(levels, rule, level)) continue;
             if (rule.seed_argument != null)
-                try growing.put(self.allocator, predicateKey(rule.head), {});
+                try growing.put(self.allocator, syntax.predicateKey(rule.head), {});
         }
         for (self.rules.items) |rule| {
             if (!ruleActiveAt(levels, rule, level)) continue;
@@ -300,8 +280,8 @@ pub const Evaluator = struct {
                         .relational => |value| value,
                         else => continue,
                     };
-                    const body_level = levels.get(predicateKey(expression)) orelse 0;
-                    if (body_level == level or growing.contains(predicateKey(expression)))
+                    const body_level = levels.get(syntax.predicateKey(expression)) orelse 0;
+                    if (body_level == level or growing.contains(syntax.predicateKey(expression)))
                         try occurrences.append(self.allocator, clause_index);
                 }
             }
@@ -341,11 +321,11 @@ pub const Evaluator = struct {
 
     pub fn applyRule(
         self: *Evaluator,
-        facts: *RelationStore,
-        rule: Rule,
-        constraint: ?DeltaConstraint,
+        facts: *relation_store.RelationStore,
+        rule: syntax.Rule,
+        constraint: ?syntax.DeltaConstraint,
     ) !void {
-        var answers: std.ArrayList(Binding) = .empty;
+        var answers: std.ArrayList(syntax.Binding) = .empty;
         defer {
             for (answers.items) |*answer| answer.deinit(self.allocator);
             answers.deinit(self.allocator);
@@ -353,7 +333,7 @@ pub const Evaluator = struct {
         if (rule.seed_argument) |argument| {
             const value_count = self.values.values.items.len;
             for (0..value_count) |value| {
-                var initial: Binding = .{};
+                var initial: syntax.Binding = .{};
                 defer initial.deinit(self.allocator);
                 const seeded = try self.unifyValueTerm(
                     @intCast(value),
@@ -369,13 +349,13 @@ pub const Evaluator = struct {
                         &answers,
                         null,
                     ) catch |err| switch (err) {
-                        Error.NumericType, Error.NumericOverflow => continue,
+                        root.Error.NumericType, root.Error.NumericOverflow => continue,
                         else => return err,
                     };
                 }
             }
         } else {
-            var initial: Binding = .{};
+            var initial: syntax.Binding = .{};
             defer initial.deinit(self.allocator);
             try self.matchClauses(rule.body, facts, 0, &initial, &answers, constraint);
         }
@@ -388,21 +368,21 @@ pub const Evaluator = struct {
         }
     }
 
-    pub fn deriveFact(self: *Evaluator, head: Expr, bindings: *const Binding) !Fact {
-        const terms = try self.allocator.alloc(ValueId, head.terms.len);
+    pub fn deriveFact(self: *Evaluator, head: syntax.Expr, bindings: *const syntax.Binding) !relation_store.Fact {
+        const terms = try self.allocator.alloc(syntax.ValueId, head.terms.len);
         errdefer self.allocator.free(terms);
         for (head.terms, terms) |term, *id| id.* = try self.termToValue(term, bindings);
         return .{ .predicate = head.predicate, .terms = terms };
     }
 
-    pub fn termToValue(self: *Evaluator, term: Term, bindings: ?*const Binding) !ValueId {
+    pub fn termToValue(self: *Evaluator, term: syntax.Term, bindings: ?*const syntax.Binding) !syntax.ValueId {
         return switch (term) {
             .scalar => |value| try self.values.intern(.{ .scalar = value }),
             .nil => try self.values.intern(.nil),
             .variable => |variable| if (bindings) |bound|
-                bound.values.get(variable) orelse Error.UnboundVariable
+                bound.values.get(variable) orelse root.Error.UnboundVariable
             else
-                Error.UnboundVariable,
+                root.Error.UnboundVariable,
             .cons => |pair| try self.values.intern(.{ .cons = .{
                 .head = try self.termToValue(pair.head, bindings),
                 .tail = try self.termToValue(pair.tail, bindings),
@@ -412,12 +392,12 @@ pub const Evaluator = struct {
 
     pub fn matchClauses(
         self: *Evaluator,
-        clauses: []const Clause,
-        facts: *RelationStore,
+        clauses: []const syntax.Clause,
+        facts: *relation_store.RelationStore,
         index: usize,
-        bindings: *const Binding,
-        answers: *std.ArrayList(Binding),
-        constraint: ?DeltaConstraint,
+        bindings: *const syntax.Binding,
+        answers: *std.ArrayList(syntax.Binding),
+        constraint: ?syntax.DeltaConstraint,
     ) !void {
         if (index == clauses.len) {
             var answer = try bindings.clone(self.allocator);
@@ -429,14 +409,14 @@ pub const Evaluator = struct {
         }
         if (clauses[index] == .aggregate) {
             const aggregate = clauses[index].aggregate;
-            var inner_answers: std.ArrayList(Binding) = .empty;
+            var inner_answers: std.ArrayList(syntax.Binding) = .empty;
             defer {
                 for (inner_answers.items) |*answer| answer.deinit(self.allocator);
                 inner_answers.deinit(self.allocator);
             }
             try self.matchClauses(aggregate.body, facts, 0, bindings, &inner_answers, null);
 
-            var values: std.ArrayList(ValueId) = .empty;
+            var values: std.ArrayList(syntax.ValueId) = .empty;
             defer values.deinit(self.allocator);
             for (inner_answers.items) |*answer| {
                 const value = try self.termToValue(aggregate.template, answer);
@@ -473,7 +453,7 @@ pub const Evaluator = struct {
             .builtin => |value| value,
             .negated => |value| value,
         };
-        if (isBuiltin(expression)) {
+        if (syntax.isBuiltin(expression)) {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
             const matched = try self.evalBuiltin(expression, &next);
@@ -508,18 +488,18 @@ pub const Evaluator = struct {
     /// callers unify each candidate exactly.
     pub fn lookupCandidates(
         self: *Evaluator,
-        facts: *RelationStore,
-        goal: Expr,
-        bindings: *const Binding,
+        facts: *relation_store.RelationStore,
+        goal: syntax.Expr,
+        bindings: *const syntax.Binding,
     ) ![]const u32 {
-        const key: PredicateKey = .{ .name = goal.predicate, .arity = goal.terms.len };
+        const key: relation_store.PredicateKey = .{ .name = goal.predicate, .arity = goal.terms.len };
         var mask: u64 = 0;
-        var bound: [64]ValueId = undefined;
+        var bound: [64]syntax.ValueId = undefined;
         var count: usize = 0;
         for (goal.terms, 0..) |term, position| {
             if (position >= 64) break;
             const resolved = self.termToValue(term, bindings) catch |err| switch (err) {
-                Error.UnboundVariable => continue,
+                root.Error.UnboundVariable => continue,
                 else => return err,
             };
             mask |= @as(u64, 1) << @intCast(position);
@@ -534,14 +514,14 @@ pub const Evaluator = struct {
         return candidates;
     }
 
-    pub fn unify(self: *Evaluator, fact: Fact, goal: Expr, bindings: *Binding) !bool {
+    pub fn unify(self: *Evaluator, fact: relation_store.Fact, goal: syntax.Expr, bindings: *syntax.Binding) !bool {
         for (fact.terms, goal.terms) |value, term| {
             if (!try self.unifyValueTerm(value, term, bindings)) return false;
         }
         return true;
     }
 
-    fn unifyValueTerm(self: *Evaluator, value: ValueId, term: Term, bindings: *Binding) !bool {
+    fn unifyValueTerm(self: *Evaluator, value: syntax.ValueId, term: syntax.Term, bindings: *syntax.Binding) !bool {
         return switch (term) {
             .variable => |variable| if (bindings.values.get(variable)) |bound|
                 bound == value
@@ -562,9 +542,9 @@ pub const Evaluator = struct {
         };
     }
 
-    fn evalBuiltin(self: *Evaluator, expr_value: Expr, bindings: *Binding) !bool {
+    fn evalBuiltin(self: *Evaluator, expr_value: syntax.Expr, bindings: *syntax.Binding) !bool {
         if (expr_value.kind == .add or expr_value.kind == .subtract) {
-            if (expr_value.terms.len != 3) return Error.InvalidQuery; // ziglint-ignore: Z010
+            if (expr_value.terms.len != 3) return root.Error.InvalidQuery; // ziglint-ignore: Z010
             const left_id = try self.termToValue(expr_value.terms[1], bindings);
             const right_id = try self.termToValue(expr_value.terms[2], bindings);
             const result_scalar = if (expr_value.kind == .add)
@@ -574,25 +554,25 @@ pub const Evaluator = struct {
             const value = try self.values.intern(.{ .scalar = result_scalar });
             return self.unifyValueTerm(value, expr_value.terms[0], bindings);
         }
-        if (expr_value.terms.len != 2) return Error.InvalidQuery; // ziglint-ignore: Z010
+        if (expr_value.terms.len != 2) return root.Error.InvalidQuery; // ziglint-ignore: Z010
         const left = expr_value.terms[0];
         const right = expr_value.terms[1];
         const left_id = self.termToValue(left, bindings) catch |err| switch (err) {
-            Error.UnboundVariable => null,
+            root.Error.UnboundVariable => null,
             else => return err,
         };
         const right_id = self.termToValue(right, bindings) catch |err| switch (err) {
-            Error.UnboundVariable => null,
+            root.Error.UnboundVariable => null,
             else => return err,
         };
 
         if (expr_value.kind == .equality) {
-            if (left_id == null and right_id == null) return Error.UnboundVariable; // ziglint-ignore: Z010
+            if (left_id == null and right_id == null) return root.Error.UnboundVariable; // ziglint-ignore: Z010
             if (left_id == null) return self.unifyValueTerm(right_id.?, left, bindings);
             if (right_id == null) return self.unifyValueTerm(left_id.?, right, bindings);
             return self.valuesEqual(left_id.?, right_id.?);
         }
-        if (left_id == null or right_id == null) return Error.UnboundVariable; // ziglint-ignore: Z010
+        if (left_id == null or right_id == null) return root.Error.UnboundVariable; // ziglint-ignore: Z010
         if (expr_value.kind == .inequality) return !self.valuesEqual(left_id.?, right_id.?);
 
         const order = try self.scalars.compareNumeric(
@@ -604,18 +584,18 @@ pub const Evaluator = struct {
             .less_or_equal => order != .gt,
             .greater_than => order == .gt,
             .greater_or_equal => order != .lt,
-            else => Error.UnknownOperator,
+            else => root.Error.UnknownOperator,
         };
     }
 
-    fn valueScalar(self: *const Evaluator, value: ValueId) !scalar.Id {
+    fn valueScalar(self: *const Evaluator, value: syntax.ValueId) !scalar.Id {
         return switch (self.values.get(value)) {
             .scalar => |scalar_id| scalar_id,
-            else => Error.NumericType,
+            else => root.Error.NumericType,
         };
     }
 
-    fn valuesEqual(self: *const Evaluator, left: ValueId, right: ValueId) bool {
+    fn valuesEqual(self: *const Evaluator, left: syntax.ValueId, right: syntax.ValueId) bool {
         const left_value = self.values.get(left);
         const right_value = self.values.get(right);
         return switch (left_value) {
@@ -632,11 +612,11 @@ pub const Evaluator = struct {
         };
     }
 
-    pub fn computeStrata(self: *Evaluator) !std.array_hash_map.Auto(PredicateKey, usize) {
-        var levels: std.array_hash_map.Auto(PredicateKey, usize) = .empty;
+    pub fn computeStrata(self: *Evaluator) !std.array_hash_map.Auto(relation_store.PredicateKey, usize) {
+        var levels: std.array_hash_map.Auto(relation_store.PredicateKey, usize) = .empty;
         errdefer levels.deinit(self.allocator);
         for (self.rules.items) |rule| {
-            try levels.put(self.allocator, predicateKey(rule.head), 0);
+            try levels.put(self.allocator, syntax.predicateKey(rule.head), 0);
             for (rule.body) |clause| try self.collectDependencyPredicates(clause, &levels);
         }
         const predicate_count = levels.count();
@@ -646,7 +626,7 @@ pub const Evaluator = struct {
                 var required: usize = 0;
                 for (rule.body) |clause|
                     required = @max(required, self.clauseRequiredStratum(clause, &levels, false));
-                const head = predicateKey(rule.head);
+                const head = syntax.predicateKey(rule.head);
                 const current = levels.get(head) orelse 0;
                 if (required > current) {
                     try levels.put(self.allocator, head, required);
@@ -654,20 +634,20 @@ pub const Evaluator = struct {
                 }
             }
             if (!changed) return levels;
-            if (iteration == predicate_count) return Error.NotStratified; // ziglint-ignore: Z010
+            if (iteration == predicate_count) return root.Error.NotStratified; // ziglint-ignore: Z010
         }
         return levels;
     }
 
     fn collectDependencyPredicates(
         self: *Evaluator,
-        clause: Clause,
-        levels: *std.array_hash_map.Auto(PredicateKey, usize),
+        clause: syntax.Clause,
+        levels: *std.array_hash_map.Auto(relation_store.PredicateKey, usize),
     ) !void {
         switch (clause) {
-            .relational => |expression| try levels.put(self.allocator, predicateKey(expression), 0),
-            .negated => |expression| if (!isBuiltin(expression))
-                try levels.put(self.allocator, predicateKey(expression), 0),
+            .relational => |expression| try levels.put(self.allocator, syntax.predicateKey(expression), 0),
+            .negated => |expression| if (!syntax.isBuiltin(expression))
+                try levels.put(self.allocator, syntax.predicateKey(expression), 0),
             .builtin => {},
             .aggregate => |aggregate| for (aggregate.body) |body_clause|
                 try self.collectDependencyPredicates(body_clause, levels),
@@ -676,17 +656,17 @@ pub const Evaluator = struct {
 
     fn clauseRequiredStratum(
         self: *const Evaluator,
-        clause: Clause,
-        levels: *const std.array_hash_map.Auto(PredicateKey, usize),
+        clause: syntax.Clause,
+        levels: *const std.array_hash_map.Auto(relation_store.PredicateKey, usize),
         aggregate_context: bool,
     ) usize {
         return switch (clause) {
-            .relational => |expression| (levels.get(predicateKey(expression)) orelse 0) +
+            .relational => |expression| (levels.get(syntax.predicateKey(expression)) orelse 0) +
                 @intFromBool(aggregate_context),
-            .negated => |expression| if (isBuiltin(expression))
+            .negated => |expression| if (syntax.isBuiltin(expression))
                 0
             else
-                (levels.get(predicateKey(expression)) orelse 0) + 1,
+                (levels.get(syntax.predicateKey(expression)) orelse 0) + 1,
             .builtin => 0,
             .aggregate => |aggregate| blk: {
                 var required: usize = 0;
@@ -698,7 +678,7 @@ pub const Evaluator = struct {
     }
 
     /// Numbers by value, atoms by spelling, nil, then cons cells recursively.
-    fn compareValues(self: *const Evaluator, left: ValueId, right: ValueId) std.math.Order {
+    fn compareValues(self: *const Evaluator, left: syntax.ValueId, right: syntax.ValueId) std.math.Order {
         const a = self.values.get(left);
         const b = self.values.get(right);
         const a_rank: u2 = switch (a) {
@@ -728,7 +708,7 @@ pub const Evaluator = struct {
         };
     }
 
-    fn sortValues(self: *const Evaluator, values: []ValueId) void {
+    fn sortValues(self: *const Evaluator, values: []syntax.ValueId) void {
         if (values.len < 2) return;
         for (values[1..], 1..) |value, index| {
             var insertion = index;
@@ -743,17 +723,17 @@ pub const Evaluator = struct {
 
 test "semi-naive and naive closures agree across rule classes" {
     // Non-recursive joins.
-    var joins: Jatalog = .init(std.testing.allocator);
+    var joins: root.Jatalog = .init(std.testing.allocator);
     defer joins.deinit();
     var joins_setup = try joins.execute(
         \\parent(a, b). parent(b, c). parent(c, d).
         \\grand(X, Z) :- parent(X, Y), parent(Y, Z).
     );
     joins_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&joins);
+    try test_support.expectSemiNaiveMatchesNaive(&joins);
 
     // Direct recursion.
-    var direct: Jatalog = .init(std.testing.allocator);
+    var direct: root.Jatalog = .init(std.testing.allocator);
     defer direct.deinit();
     var direct_setup = try direct.execute(
         \\edge(a, b). edge(b, c). edge(c, d). edge(d, a).
@@ -761,10 +741,10 @@ test "semi-naive and naive closures agree across rule classes" {
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
     );
     direct_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&direct);
+    try test_support.expectSemiNaiveMatchesNaive(&direct);
 
     // Mutual recursion across two predicates in one stratum.
-    var mutual: Jatalog = .init(std.testing.allocator);
+    var mutual: root.Jatalog = .init(std.testing.allocator);
     defer mutual.deinit();
     var mutual_setup = try mutual.execute(
         \\start(n0). step(n0, n1). step(n1, n2). step(n2, n3). step(n3, n4).
@@ -773,10 +753,10 @@ test "semi-naive and naive closures agree across rule classes" {
         \\odd(X) :- even(Y), step(Y, X).
     );
     mutual_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&mutual);
+    try test_support.expectSemiNaiveMatchesNaive(&mutual);
 
     // Seeded structural recursion feeding a same-stratum consumer.
-    var structural: Jatalog = .init(std.testing.allocator);
+    var structural: root.Jatalog = .init(std.testing.allocator);
     defer structural.deinit();
     var structural_setup = try structural.execute(
         \\person(alice). person(bob). parent(alice, bob).
@@ -786,10 +766,10 @@ test "semi-naive and naive closures agree across rule classes" {
         \\numchildren(X, N) :- children(X, S), length(S, N).
     );
     structural_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&structural);
+    try test_support.expectSemiNaiveMatchesNaive(&structural);
 
     // Stratified negation above a recursive stratum.
-    var negated: Jatalog = .init(std.testing.allocator);
+    var negated: root.Jatalog = .init(std.testing.allocator);
     defer negated.deinit();
     var negated_setup = try negated.execute(
         \\node(a). node(b). node(c). edge(a, b).
@@ -798,10 +778,10 @@ test "semi-naive and naive closures agree across rule classes" {
         \\isolated(X) :- node(X), not reachable(X).
     );
     negated_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&negated);
+    try test_support.expectSemiNaiveMatchesNaive(&negated);
 
     // Aggregation over a recursive relation.
-    var aggregated: Jatalog = .init(std.testing.allocator);
+    var aggregated: root.Jatalog = .init(std.testing.allocator);
     defer aggregated.deinit();
     var aggregated_setup = try aggregated.execute(
         \\edge(a, b). edge(b, c).
@@ -810,11 +790,11 @@ test "semi-naive and naive closures agree across rule classes" {
         \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
     );
     aggregated_setup.deinit();
-    try expectSemiNaiveMatchesNaive(&aggregated);
+    try test_support.expectSemiNaiveMatchesNaive(&aggregated);
 }
 
 test "multiple recursive body occurrences miss no derivations" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\edge(n1, n2). edge(n2, n3). edge(n3, n4). edge(n4, n5).
@@ -822,16 +802,16 @@ test "multiple recursive body occurrences miss no derivations" {
         \\path(X, Z) :- path(X, Y), path(Y, Z).
     );
     setup.deinit();
-    try expectSemiNaiveMatchesNaive(&db);
+    try test_support.expectSemiNaiveMatchesNaive(&db);
 
     // The doubling rule needs delta joins on both occurrences: n1 to n5
     // only exists by combining two derived paths.
-    try expectAnswerCount(&db, "path(n1, n5)?", 1);
-    try expectAnswerCount(&db, "path(X, Y)?", 10);
+    try test_support.expectAnswerCount(&db, "path(n1, n5)?", 1);
+    try test_support.expectAnswerCount(&db, "path(X, Y)?", 10);
 }
 
 test "duplicate derivations create no duplicate facts or endless rounds" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     // A diamond plus a cycle derives many facts through multiple proofs.
     var setup = try db.execute(
@@ -840,14 +820,14 @@ test "duplicate derivations create no duplicate facts or endless rounds" {
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
     );
     setup.deinit();
-    try expectSemiNaiveMatchesNaive(&db);
+    try test_support.expectSemiNaiveMatchesNaive(&db);
     // Every node reaches every node exactly once in the answer set.
-    try expectAnswerCount(&db, "path(X, Y)?", 16);
-    try expectAnswerCount(&db, "path(a, d)?", 1);
+    try test_support.expectAnswerCount(&db, "path(X, Y)?", 16);
+    try test_support.expectAnswerCount(&db, "path(a, d)?", 1);
 }
 
 test "indexed lookups match every structural binding pattern deterministically" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var setup = try db.execute(
         \\edge(a, b). edge(b, c). edge(a, c).
@@ -857,10 +837,10 @@ test "indexed lookups match every structural binding pattern deterministically" 
     setup.deinit();
 
     // Bound-position patterns over atoms.
-    try expectAnswerCount(&db, "edge(a, X)?", 2);
-    try expectAnswerCount(&db, "edge(X, Y)?", 3);
-    try expectAnswerCount(&db, "edge(a, b)?", 1);
-    try expectAnswerCount(&db, "edge(c, X)?", 0);
+    try test_support.expectAnswerCount(&db, "edge(a, X)?", 2);
+    try test_support.expectAnswerCount(&db, "edge(X, Y)?", 3);
+    try test_support.expectAnswerCount(&db, "edge(a, b)?", 1);
+    try test_support.expectAnswerCount(&db, "edge(c, X)?", 0);
 
     // Answers arrive in fact insertion order.
     var ordered = try db.execute("edge(X, c)?");
@@ -886,24 +866,24 @@ test "indexed lookups match every structural binding pattern deterministically" 
     // A structural value bound through the second position.
     var reverse = try db.execute("holds(X, c)?");
     defer reverse.deinit();
-    try expectBindingValue(&reverse.query.answers.items[0], "X", "cons(1, 2)");
+    try test_support.expectBindingValue(&reverse.query.answers.items[0], "X", "cons(1, 2)");
 
     // A partially ground structure is unbound for indexing and still unifies.
-    try expectAnswerCount(&db, "holds([1, T], X)?", 2);
+    try test_support.expectAnswerCount(&db, "holds([1, T], X)?", 2);
 
     // One predicate name at two arities never shares matches.
-    try expectAnswerCount(&db, "p(X)?", 1);
-    try expectAnswerCount(&db, "p(X, Y)?", 1);
+    try test_support.expectAnswerCount(&db, "p(X)?", 1);
+    try test_support.expectAnswerCount(&db, "p(X, Y)?", 1);
 
     // Retraction through the same lookup interface removes exactly one fact.
     var retract = try db.execute("edge(a, X)~");
     defer retract.deinit();
-    try expectAnswerCount(&db, "edge(X, Y)?", 1);
-    try expectAnswerCount(&db, "edge(b, c)?", 1);
+    try test_support.expectAnswerCount(&db, "edge(X, Y)?", 1);
+    try test_support.expectAnswerCount(&db, "edge(b, c)?", 1);
 }
 
 test "stratification distinguishes predicate arities" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute(
         \\p(a, b). seed(k).
@@ -912,5 +892,5 @@ test "stratification distinguishes predicate arities" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "S", "[[a, b]]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[[a, b]]");
 }

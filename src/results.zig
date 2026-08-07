@@ -6,10 +6,8 @@
 //! refers to a database, a rule or a term.
 
 const std = @import("std");
+const errors = @import("errors.zig");
 const scalar = @import("scalar.zig");
-// The database's error set. results.zig is a leaf otherwise; this is the
-// one name it borrows back so public accessors share one error type.
-const Error = @import("root.zig").Error;
 
 pub const ResultNode = union(enum) {
     atom: []u8,
@@ -39,38 +37,38 @@ pub const ResultValue = struct {
         };
     }
 
-    pub fn getAtom(self: ResultValue) Error![]const u8 {
+    pub fn getAtom(self: ResultValue) errors.Error![]const u8 {
         return switch (self.node.*) {
             .atom => |value| value,
-            else => Error.TypeMismatch,
+            else => errors.Error.TypeMismatch,
         };
     }
 
-    pub fn getInteger(self: ResultValue) Error!i64 {
+    pub fn getInteger(self: ResultValue) errors.Error!i64 {
         return switch (self.node.*) {
             .integer => |value| value,
-            else => Error.TypeMismatch,
+            else => errors.Error.TypeMismatch,
         };
     }
 
-    pub fn getFloat(self: ResultValue) Error!f64 {
+    pub fn getFloat(self: ResultValue) errors.Error!f64 {
         return switch (self.node.*) {
             .float => |value| value,
-            else => Error.TypeMismatch,
+            else => errors.Error.TypeMismatch,
         };
     }
 
-    pub fn head(self: ResultValue) Error!ResultValue {
+    pub fn head(self: ResultValue) errors.Error!ResultValue {
         return switch (self.node.*) {
             .cons => |pair| .{ .node = pair.head },
-            else => Error.TypeMismatch,
+            else => errors.Error.TypeMismatch,
         };
     }
 
-    pub fn tail(self: ResultValue) Error!ResultValue {
+    pub fn tail(self: ResultValue) errors.Error!ResultValue {
         return switch (self.node.*) {
             .cons => |pair| .{ .node = pair.tail },
-            else => Error.TypeMismatch,
+            else => errors.Error.TypeMismatch,
         };
     }
 
@@ -151,23 +149,23 @@ pub const Answer = struct {
         self.* = undefined;
     }
 
-    pub fn getValue(self: *const Answer, variable: []const u8) Error!ResultValue {
+    pub fn getValue(self: *const Answer, variable: []const u8) errors.Error!ResultValue {
         for (self.bindings.items) |binding|
             if (std.mem.eql(u8, binding.name, variable)) return binding.value;
         // Not inferrable: in an `Error!ResultValue` return the enum literal
         // resolves against the payload type, not the error set.
-        return Error.UnknownVariable; // ziglint-ignore: Z010
+        return errors.Error.UnknownVariable; // ziglint-ignore: Z010
     }
 
-    pub fn getAtom(self: *const Answer, variable: []const u8) Error![]const u8 {
+    pub fn getAtom(self: *const Answer, variable: []const u8) errors.Error![]const u8 {
         return (try self.getValue(variable)).getAtom();
     }
 
-    pub fn getInteger(self: *const Answer, variable: []const u8) Error!i64 {
+    pub fn getInteger(self: *const Answer, variable: []const u8) errors.Error!i64 {
         return (try self.getValue(variable)).getInteger();
     }
 
-    pub fn getFloat(self: *const Answer, variable: []const u8) Error!f64 {
+    pub fn getFloat(self: *const Answer, variable: []const u8) errors.Error!f64 {
         return (try self.getValue(variable)).getFloat();
     }
 };

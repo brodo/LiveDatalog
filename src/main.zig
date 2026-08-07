@@ -1,6 +1,6 @@
 const std = @import("std");
 const LiveDatalog = @import("LiveDatalog");
-const Linenoise = @import("linenoise").Linenoise;
+const linenoise = @import("linenoise");
 
 const help_text =
     \\LiveDatalog syntax reference
@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn repl(allocator: std.mem.Allocator, init: std.process.Init, database: *LiveDatalog.Jatalog) !void {
-    var line_editor = Linenoise.init(allocator, init.io, init.environ_map);
+    var line_editor = linenoise.Linenoise.init(allocator, init.io, init.environ_map);
     defer line_editor.deinit();
 
     while (try line_editor.linenoise("datalog> ")) |line| {

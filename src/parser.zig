@@ -11,42 +11,24 @@
 //! the transaction primitives those are built from.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 const root = @import("root.zig");
 const syntax = @import("syntax.zig");
 
-const Jatalog = root.Jatalog;
-const Statement = root.Statement;
-const ExecutionResult = root.ExecutionResult;
-const Term = syntax.Term;
-const Expr = syntax.Expr;
-const Clause = syntax.Clause;
-const Aggregate = syntax.Aggregate;
-const GoalKind = syntax.GoalKind;
-const freeClauseTree = syntax.freeClauseTree;
-const freeTerm = syntax.freeTerm;
-const goalKind = syntax.goalKind;
-const goalOperator = syntax.goalOperator;
-const isVariable = syntax.isVariable;
-const classifyExpr = syntax.classifyExpr;
-const Error = root.Error;
-const ResultValue = root.ResultValue;
-const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
-const expectBindingValue = @import("test_support.zig").expectBindingValue;
-
 pub const Parser = struct {
-    jatalog: *Jatalog,
+    jatalog: *root.Jatalog,
     source: []const u8,
     index: usize = 0,
 
-    pub fn executeAll(self: *Parser) !ExecutionResult {
-        var last: ?ExecutionResult = null;
+    pub fn executeAll(self: *Parser) !root.ExecutionResult {
+        var last: ?root.ExecutionResult = null;
         errdefer if (last) |*result| result.deinit();
         while (true) {
             self.skipSpace();
             if (self.index == self.source.len) return last orelse .none;
             if (last) |*result| result.deinit();
             last = null;
-            var statement = try Statement.begin(self.jatalog, self.peekStatementKind());
+            var statement = try root.Statement.begin(self.jatalog, self.peekStatementKind());
             defer statement.deinit();
             var statement_parser = self.*;
             statement_parser.jatalog = statement.target();
@@ -60,7 +42,7 @@ pub const Parser = struct {
     /// Classifies the next statement by scanning for its terminator without
     /// interning anything, mirroring the tokenizer's comment, quote, and
     /// digit-dot-digit rules.
-    fn peekStatementKind(self: *const Parser) Statement.Kind {
+    fn peekStatementKind(self: *const Parser) root.Statement.Kind {
         var index = self.index;
         while (index < self.source.len) : (index += 1) {
             const byte = self.source[index];
@@ -98,23 +80,23 @@ pub const Parser = struct {
         return .end;
     }
 
-    fn executeStatement(self: *Parser) !ExecutionResult {
+    fn executeStatement(self: *Parser) !root.ExecutionResult {
         const first = try self.parseClause();
         var first_owned = true;
-        errdefer if (first_owned) freeClauseTree(self.jatalog.allocator, first);
+        errdefer if (first_owned) syntax.freeClauseTree(self.jatalog.allocator, first);
         self.skipSpace();
         if (self.consume(":-")) {
             const head = switch (first) {
                 .relational => |expression| expression,
                 else => return error.InvalidRule,
             };
-            var body: std.ArrayList(Clause) = .empty;
+            var body: std.ArrayList(syntax.Clause) = .empty;
             defer body.deinit(self.jatalog.allocator);
-            errdefer for (body.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
+            errdefer for (body.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
             while (true) {
                 const clause = try self.parseClause();
                 body.append(self.jatalog.allocator, clause) catch |err| {
-                    freeClauseTree(self.jatalog.allocator, clause);
+                    syntax.freeClauseTree(self.jatalog.allocator, clause);
                     return err;
                 };
                 self.skipSpace();
@@ -132,14 +114,14 @@ pub const Parser = struct {
                 else => return error.InvalidFact,
             };
             try self.jatalog.addFactExpr(fact);
-            freeClauseTree(self.jatalog.allocator, first);
+            syntax.freeClauseTree(self.jatalog.allocator, first);
             first_owned = false;
             return .none;
         }
 
-        var goals: std.ArrayList(Clause) = .empty;
+        var goals: std.ArrayList(syntax.Clause) = .empty;
         defer {
-            for (goals.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
+            for (goals.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
             goals.deinit(self.jatalog.allocator);
         }
         try goals.append(self.jatalog.allocator, first);
@@ -147,7 +129,7 @@ pub const Parser = struct {
         while (self.consume(",")) {
             const goal = try self.parseClause();
             goals.append(self.jatalog.allocator, goal) catch |err| {
-                freeClauseTree(self.jatalog.allocator, goal);
+                syntax.freeClauseTree(self.jatalog.allocator, goal);
                 return err;
             };
         }
@@ -156,32 +138,32 @@ pub const Parser = struct {
         return error.InvalidSyntax;
     }
 
-    fn parseClause(self: *Parser) anyerror!Clause {
+    fn parseClause(self: *Parser) anyerror!syntax.Clause {
         self.skipSpace();
         if (self.peekKeyword("setof")) return .{ .aggregate = try self.parseAggregate() };
         const expression = try self.parseExpr();
-        return classifyExpr(expression);
+        return syntax.classifyExpr(expression);
     }
 
-    fn parseAggregate(self: *Parser) anyerror!Aggregate {
+    fn parseAggregate(self: *Parser) anyerror!syntax.Aggregate {
         const keyword = try self.parseBare();
         if (!std.mem.eql(u8, keyword, "setof")) return error.InvalidSyntax;
         try self.expect("(");
         const template = try self.parseTerm();
         var template_owned = true;
-        errdefer if (template_owned) freeTerm(self.jatalog.allocator, template);
+        errdefer if (template_owned) syntax.freeTerm(self.jatalog.allocator, template);
         try self.expect(",");
 
-        var body: std.ArrayList(Clause) = .empty;
+        var body: std.ArrayList(syntax.Clause) = .empty;
         errdefer {
-            for (body.items) |clause| freeClauseTree(self.jatalog.allocator, clause);
+            for (body.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
             body.deinit(self.jatalog.allocator);
         }
         if (self.consume("(")) {
             while (true) {
                 const clause = try self.parseClause();
                 body.append(self.jatalog.allocator, clause) catch |err| {
-                    freeClauseTree(self.jatalog.allocator, clause);
+                    syntax.freeClauseTree(self.jatalog.allocator, clause);
                     return err;
                 };
                 if (self.consume(")")) break;
@@ -190,13 +172,13 @@ pub const Parser = struct {
         } else {
             const clause = try self.parseClause();
             body.append(self.jatalog.allocator, clause) catch |err| {
-                freeClauseTree(self.jatalog.allocator, clause);
+                syntax.freeClauseTree(self.jatalog.allocator, clause);
                 return err;
             };
         }
         try self.expect(",");
         const output = try self.parseTerm();
-        errdefer freeTerm(self.jatalog.allocator, output);
+        errdefer syntax.freeTerm(self.jatalog.allocator, output);
         try self.expect(")");
         const owned_body = try body.toOwnedSlice(self.jatalog.allocator);
         template_owned = false;
@@ -207,7 +189,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseExpr(self: *Parser) !Expr {
+    fn parseExpr(self: *Parser) !syntax.Expr {
         self.skipSpace();
         var negated = false;
         if (self.peekKeyword("not")) {
@@ -216,13 +198,13 @@ pub const Parser = struct {
         }
         const first = try self.parseTerm();
         var first_owned = true;
-        errdefer if (first_owned) freeTerm(self.jatalog.allocator, first);
+        errdefer if (first_owned) syntax.freeTerm(self.jatalog.allocator, first);
         self.skipSpace();
         if (self.parseOperator()) |operator| {
             const second = try self.parseTerm();
-            errdefer freeTerm(self.jatalog.allocator, second);
+            errdefer syntax.freeTerm(self.jatalog.allocator, second);
             if (std.mem.eql(u8, operator, "=")) {
-                const arithmetic: ?GoalKind = if (self.consume("+"))
+                const arithmetic: ?syntax.GoalKind = if (self.consume("+"))
                     .add
                 else if (self.consume("-"))
                     .subtract
@@ -231,9 +213,9 @@ pub const Parser = struct {
                 if (arithmetic) |arithmetic_kind| {
                     if (negated) return error.InvalidSyntax;
                     const third = try self.parseTerm();
-                    errdefer freeTerm(self.jatalog.allocator, third);
-                    const predicate = try self.jatalog.strings.intern(goalOperator(arithmetic_kind));
-                    const terms = try self.jatalog.allocator.alloc(Term, 3);
+                    errdefer syntax.freeTerm(self.jatalog.allocator, third);
+                    const predicate = try self.jatalog.strings.intern(syntax.goalOperator(arithmetic_kind));
+                    const terms = try self.jatalog.allocator.alloc(syntax.Term, 3);
                     terms[0] = first;
                     terms[1] = second;
                     terms[2] = third;
@@ -241,9 +223,9 @@ pub const Parser = struct {
                     return .{ .predicate = predicate, .terms = terms, .kind = arithmetic_kind };
                 }
             }
-            const kind = goalKind(operator) orelse return error.UnknownOperator;
-            const predicate = try self.jatalog.strings.intern(goalOperator(kind));
-            const terms = try self.jatalog.allocator.alloc(Term, 2);
+            const kind = syntax.goalKind(operator) orelse return error.UnknownOperator;
+            const predicate = try self.jatalog.strings.intern(syntax.goalOperator(kind));
+            const terms = try self.jatalog.allocator.alloc(syntax.Term, 2);
             terms[0] = first;
             terms[1] = second;
             first_owned = false;
@@ -263,9 +245,9 @@ pub const Parser = struct {
             else => return error.InvalidSyntax,
         };
         first_owned = false;
-        var terms: std.ArrayList(Term) = .empty;
+        var terms: std.ArrayList(syntax.Term) = .empty;
         errdefer {
-            for (terms.items) |term| freeTerm(self.jatalog.allocator, term);
+            for (terms.items) |term| syntax.freeTerm(self.jatalog.allocator, term);
             terms.deinit(self.jatalog.allocator);
         }
         self.skipSpace();
@@ -273,7 +255,7 @@ pub const Parser = struct {
             while (true) {
                 const term = try self.parseTerm();
                 terms.append(self.jatalog.allocator, term) catch |err| {
-                    freeTerm(self.jatalog.allocator, term);
+                    syntax.freeTerm(self.jatalog.allocator, term);
                     return err;
                 };
                 self.skipSpace();
@@ -284,18 +266,18 @@ pub const Parser = struct {
         return .{ .predicate = predicate, .terms = try terms.toOwnedSlice(self.jatalog.allocator), .negated = negated };
     }
 
-    fn parseTerm(self: *Parser) anyerror!Term {
+    fn parseTerm(self: *Parser) anyerror!syntax.Term {
         var head = try self.parseTermPrimary();
-        errdefer freeTerm(self.jatalog.allocator, head);
+        errdefer syntax.freeTerm(self.jatalog.allocator, head);
         if (self.consumeConsBang()) {
             const tail = try self.parseTerm();
-            errdefer freeTerm(self.jatalog.allocator, tail);
+            errdefer syntax.freeTerm(self.jatalog.allocator, tail);
             head = try self.makeCons(head, tail);
         }
         return head;
     }
 
-    fn parseTermPrimary(self: *Parser) anyerror!Term {
+    fn parseTermPrimary(self: *Parser) anyerror!syntax.Term {
         self.skipSpace();
         if (self.index == self.source.len) return error.InvalidSyntax;
         if (self.consume("[")) return self.parseListTail();
@@ -316,22 +298,22 @@ pub const Parser = struct {
         const value = try self.parseBare();
         if (std.mem.eql(u8, value, "cons") and self.consume("(")) {
             const head = try self.parseTerm();
-            errdefer freeTerm(self.jatalog.allocator, head);
+            errdefer syntax.freeTerm(self.jatalog.allocator, head);
             try self.expect(",");
             const tail = try self.parseTerm();
-            errdefer freeTerm(self.jatalog.allocator, tail);
+            errdefer syntax.freeTerm(self.jatalog.allocator, tail);
             try self.expect(")");
             return self.makeCons(head, tail);
         }
-        if (isVariable(value)) return .{ .variable = try self.jatalog.strings.intern(value) };
+        if (syntax.isVariable(value)) return .{ .variable = try self.jatalog.strings.intern(value) };
         return .{ .scalar = try self.jatalog.eval.scalars.parseBare(value) };
     }
 
-    fn parseListTail(self: *Parser) anyerror!Term {
+    fn parseListTail(self: *Parser) anyerror!syntax.Term {
         if (self.consume("]")) return .nil;
         const head = try self.parseTerm();
-        errdefer freeTerm(self.jatalog.allocator, head);
-        var tail: Term = undefined;
+        errdefer syntax.freeTerm(self.jatalog.allocator, head);
+        var tail: syntax.Term = undefined;
         if (self.consume("]")) {
             tail = .nil;
         } else if (self.consume(",")) {
@@ -339,19 +321,19 @@ pub const Parser = struct {
         } else if (self.consumeConsBang()) {
             tail = try self.parseImproperListTail();
         } else return error.InvalidSyntax;
-        errdefer freeTerm(self.jatalog.allocator, tail);
+        errdefer syntax.freeTerm(self.jatalog.allocator, tail);
         return self.makeCons(head, tail);
     }
 
-    fn parseImproperListTail(self: *Parser) anyerror!Term {
+    fn parseImproperListTail(self: *Parser) anyerror!syntax.Term {
         const tail = try self.parseTerm();
-        errdefer freeTerm(self.jatalog.allocator, tail);
+        errdefer syntax.freeTerm(self.jatalog.allocator, tail);
         try self.expect("]");
         return tail;
     }
 
-    fn makeCons(self: *Parser, head: Term, tail: Term) !Term {
-        const pair = try self.jatalog.allocator.create(Term.Cons);
+    fn makeCons(self: *Parser, head: syntax.Term, tail: syntax.Term) !syntax.Term {
+        const pair = try self.jatalog.allocator.create(syntax.Term.Cons);
         pair.* = .{ .head = head, .tail = tail };
         return .{ .cons = pair };
     }
@@ -427,16 +409,16 @@ pub const Parser = struct {
 };
 
 test "a parse error after a query releases the previous result" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(Error.InvalidSyntax, db.execute(
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute(
         \\p(a). p(X)?
         \\bad(X) :- q(X), X <>.
     ));
 }
 
 test "head tail patterns work in rules and cons syntax is equivalent" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute(
         \\items(cons(a, cons(b, []))).
@@ -445,22 +427,22 @@ test "head tail patterns work in rules and cons syntax is equivalent" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "X", "[b]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "X", "[b]");
 }
 
 test "structural equality binds variables recursively and parse errors clean up" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute("seed(a). seed(X), [X] = [a]?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
 
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("broken([a, [b])."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("broken([a, [b])."));
 }
 
 fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
+    var db: root.Jatalog = .init(allocator);
     defer db.deinit();
     var result = try db.execute(
         \\items([a, [b], c]).
@@ -483,7 +465,7 @@ test "structural parsing and evaluation release every allocation on failure" {
 }
 
 fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
+    var db: root.Jatalog = .init(allocator);
     defer db.deinit();
     var result = try db.execute(
         \\seed(k).
@@ -491,7 +473,7 @@ fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
     );
     result.deinit();
     var malformed = db.execute("broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.") catch |err| switch (err) {
-        Error.InvalidSyntax => return,
+        root.Error.InvalidSyntax => return,
         else => return err,
     };
     malformed.deinit();
@@ -507,11 +489,11 @@ test "aggregate parser errors release all partial clause trees" {
 }
 
 test "quoted numeric atoms remain distinct from numeric scalars" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
     defer result.deinit();
-    try expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
 
     var inequality = try db.execute("1 = '1'?");
     defer inequality.deinit();
@@ -527,27 +509,27 @@ test "quoted numeric atoms remain distinct from numeric scalars" {
 
     var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
     defer quoted_setof.deinit();
-    try expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
+    try test_support.expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
 
     var arithmetic = try db.execute("01 = +0 + 1?");
     defer arithmetic.deinit();
     try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
 
-    try std.testing.expectError(Error.NumericType, db.execute("value(X), X < 2?"));
+    try std.testing.expectError(root.Error.NumericType, db.execute("value(X), X < 2?"));
 }
 
 test "non-finite and malformed numeric source reports stable errors" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(1e400)."));
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(-1e400)."));
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(2e308)."));
+    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(1e400)."));
+    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(-1e400)."));
+    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(2e308)."));
 
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e+)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.2.3)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(12abc)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.)."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1e)."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1e+)."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1.2.3)."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(12abc)."));
+    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1.)."));
 
     var absent = try db.execute("value(X)?");
     defer absent.deinit();
@@ -555,7 +537,7 @@ test "non-finite and malformed numeric source reports stable errors" {
 }
 
 test "float literals parse and integral values canonicalize to integers" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute(
         \\value(2.5). value(0.5). value(-0.025). value(1.0).
@@ -564,7 +546,7 @@ test "float literals parse and integral values canonicalize to integers" {
         \\setof(X, value(X), S)?
     );
     defer result.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.query.answers.items[0],
         "S",
         "[-0.025, 0, 0.5, 1, 2.5, 1000]",
@@ -584,7 +566,7 @@ test "float literals parse and integral values canonicalize to integers" {
 }
 
 test "float extremes format deterministically and round-trip" {
-    var db: Jatalog = .init(std.testing.allocator);
+    var db: root.Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     var result = try db.execute(
         \\extreme(5e-324). extreme(2.2250738585072014e-308).
@@ -593,7 +575,7 @@ test "float extremes format deterministically and round-trip" {
         \\setof(X, extreme(X), S)?
     );
     defer result.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.query.answers.items[0],
         "S",
         "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
@@ -618,6 +600,6 @@ test "float extremes format deterministically and round-trip" {
     const spelled = try value.formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(spelled);
     try std.testing.expectEqualStrings("0.5", spelled);
-    try std.testing.expectEqual(ResultValue.Kind.float, value.kind());
-    try std.testing.expectError(Error.TypeMismatch, value.getInteger());
+    try std.testing.expectEqual(root.ResultValue.Kind.float, value.kind());
+    try std.testing.expectError(root.Error.TypeMismatch, value.getInteger());
 }

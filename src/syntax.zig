@@ -12,8 +12,6 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const relation_store = @import("relation_store.zig");
 
-const PredicateKey = relation_store.PredicateKey;
-
 /// Interned identifier for a name: predicate symbols and variable names.
 pub const Id = u64;
 /// Interned identifier for a ground value in the database's value table.
@@ -144,7 +142,7 @@ pub fn noteBodyDependencies(
     allocator: std.mem.Allocator,
     body: []const Clause,
     head_level: usize,
-    first_dependent: *std.array_hash_map.Auto(PredicateKey, usize),
+    first_dependent: *std.array_hash_map.Auto(relation_store.PredicateKey, usize),
 ) !void {
     for (body) |clause| switch (clause) {
         .relational, .negated => |expression| {
@@ -164,7 +162,7 @@ pub fn noteBodyDependencies(
 
 pub fn clausesReadGrownNonPositively(
     body: []const Clause,
-    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+    grown: *const std.AutoHashMapUnmanaged(relation_store.PredicateKey, void),
 ) bool {
     for (body) |clause| switch (clause) {
         .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
@@ -176,7 +174,7 @@ pub fn clausesReadGrownNonPositively(
 
 pub fn clausesReadGrownAnywhere(
     body: []const Clause,
-    grown: *const std.AutoHashMapUnmanaged(PredicateKey, void),
+    grown: *const std.AutoHashMapUnmanaged(relation_store.PredicateKey, void),
 ) bool {
     for (body) |clause| switch (clause) {
         .relational, .negated => |expression| if (grown.contains(predicateKey(expression))) return true,
@@ -186,7 +184,7 @@ pub fn clausesReadGrownAnywhere(
     return false;
 }
 
-pub fn predicateKey(expression: Expr) PredicateKey {
+pub fn predicateKey(expression: Expr) relation_store.PredicateKey {
     return .{ .name = expression.predicate, .arity = expression.terms.len };
 }
 
