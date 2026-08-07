@@ -117,9 +117,11 @@ pub const Jatalog = struct {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
-        const changed = try statement.deleteClauses(&staging, compiled);
-        if (changed) try statement.commitRetraction(&self.state, &staging);
-        return changed;
+        var removed = try statement.resolveRetraction(&staging, compiled);
+        defer removed.deinit();
+        if (removed.len() == 0) return false;
+        try statement.commitRetraction(&self.state, &removed);
+        return true;
     }
 
     /// Applies one batch of exact ground base-fact insertions and deletions
@@ -148,7 +150,11 @@ pub const Jatalog = struct {
         defer freeRelations(staging.allocator, compiled_deletions);
         const compiled_insertions = try compileRelations(&staging, insertions);
         defer freeRelations(staging.allocator, compiled_insertions);
-        const changed = try update.apply(&staging, compiled_deletions, compiled_insertions) > 0;
+        const changed = try update.apply(
+            &staging,
+            .{ .named = compiled_deletions },
+            compiled_insertions,
+        ) > 0;
         try materialization.verifyShadow(&staging);
         if (changed) self.state.commit(&staging);
         return changed;

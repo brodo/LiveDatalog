@@ -17,26 +17,20 @@ const syntax = @import("syntax.zig");
 const update = @import("update.zig");
 const validation = @import("validation.zig");
 
-/// Applies the base facts a retraction removed. `staging` holds the
-/// post-retraction base facts computed by goal evaluation; the removals
-/// are replayed onto a fresh clone so query-local values interned while
-/// evaluating the goals never reach the committed database. The removals
-/// then take the ordinary update path, which is what makes a retraction
-/// and a batch deletion the same operation on the closure.
-pub fn commitRetraction(db: *database.Database, staging: *database.Database) !void {
+/// Applies the base facts a retraction resolved its goals to, which
+/// `resolveRetraction` produced against a staging copy of `db`. They are
+/// applied to a fresh clone rather than to `db` itself, so that a failure
+/// part-way through leaves the database untouched — and they take the ordinary
+/// update path, which is what makes a retraction and a batch deletion the same
+/// operation on the closure.
+///
+/// Only the facts cross over. The staging copy the goals were evaluated on is
+/// discarded with everything its evaluation interned, which is how values a
+/// retraction mentions but the database does not hold stay out of it.
+pub fn commitRetraction(db: *database.Database, removed: *const relation_store.RelationStore) !void {
     var committed = try db.clone();
     defer committed.deinit();
-    var removed: relation_store.RelationStore = .init(committed.allocator);
-    defer removed.deinit();
-    var index = committed.facts.len();
-    while (index > 0) {
-        index -= 1;
-        const fact = committed.facts.factAt(index);
-        if (try staging.facts.contains(fact)) continue;
-        try relation_store.copyFactInto(committed.allocator, &removed, fact, false);
-        committed.facts.removeAt(index);
-    }
-    _ = try update.applyRemoved(&committed, &removed);
+    _ = try update.apply(&committed, .{ .resolved = removed }, &.{});
     try materialization.verifyShadow(&committed);
     db.commit(&committed);
 }
@@ -126,14 +120,31 @@ pub fn evaluateClauses(db: *database.Database, goals: []const syntax.Clause) !st
     return internal_answers;
 }
 
-pub fn deleteClauses(db: *database.Database, goals: []const syntax.Clause) !bool {
+/// Resolves a retraction's goals to the exact base facts they name, and hands
+/// them back in a store of its own. Removes nothing: the goals are evaluated
+/// against whichever database the caller points this at, and the facts are
+/// copied out of that database's fact store rather than taken out of it.
+///
+/// A retraction is the one statement whose goals have to be evaluated
+/// somewhere other than where its effect lands, because evaluating them can
+/// intern values the database does not hold. The caller therefore points this
+/// at a staging copy and hands what comes back to `commitRetraction`, which
+/// applies it to the database that copy came from — the facts are that
+/// database's own, so its value identifiers are what they carry.
+pub fn resolveRetraction(
+    db: *database.Database,
+    goals: []const syntax.Clause,
+) !relation_store.RelationStore {
     var answers = try evaluateClauses(db, goals);
     defer {
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
     }
-    var to_remove: std.ArrayList(usize) = .empty;
-    defer to_remove.deinit(db.allocator);
+    var resolved: relation_store.RelationStore = .init(db.allocator);
+    errdefer resolved.deinit();
+    // Deduplicating by entry rather than leaving it to the store's set
+    // semantics: a fact reached twice is one removal, not one removal with a
+    // second unit of support, and delete-and-rederive reads that support.
     var seen: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer seen.deinit(db.allocator);
     for (answers.items) |*answer| {
@@ -148,18 +159,17 @@ pub fn deleteClauses(db: *database.Database, goals: []const syntax.Clause) !bool
                 defer matched.deinit(db.allocator);
                 if (try db.eval.unify(db.facts.factAt(candidate), goal, &matched)) {
                     try seen.put(db.allocator, candidate, {});
-                    try to_remove.append(db.allocator, candidate);
+                    try relation_store.copyFactInto(
+                        db.allocator,
+                        &resolved,
+                        db.facts.factAt(candidate),
+                        false,
+                    );
                 }
             }
         }
     }
-    std.mem.sort(usize, to_remove.items, {}, std.sort.desc(usize));
-    for (to_remove.items) |index| {
-        const fact = db.facts.factAt(index);
-        try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
-        db.facts.removeAt(index);
-    }
-    return to_remove.items.len > 0;
+    return resolved;
 }
 
 /// One statement's transaction.
@@ -172,7 +182,7 @@ pub fn deleteClauses(db: *database.Database, goals: []const syntax.Clause) !bool
 ///
 /// This is deliberately the whole transaction interface a front end gets for
 /// that. The primitives it is built from — cloning the database, replacing it
-/// with a staged copy, replaying a retraction's removals through the deletion
+/// with a staged copy, applying a retraction's facts through the deletion
 /// engine — are not part of the public interface, because committing a foreign
 /// staging database is not an operation an embedder should be able to name.
 pub const Statement = struct {
@@ -182,6 +192,11 @@ pub const Statement = struct {
 
     database: *database.Database,
     staging: database.Database,
+    /// The base facts a retraction resolved its goals to, held from the point
+    /// the statement runs to the point it commits. A retraction is the one
+    /// statement whose commit needs something the statement itself produced,
+    /// and this transaction is what spans the two.
+    removed: relation_store.RelationStore,
 
     /// Opens a transaction for one statement. A statement that evaluates needs
     /// the committed closure materialized first, so that the staged copy
@@ -191,7 +206,11 @@ pub const Statement = struct {
             .query, .retraction => try materialization.ensureMaterialized(db),
             .assertion, .end => {},
         }
-        return .{ .database = db, .staging = try db.clone() };
+        return .{
+            .database = db,
+            .staging = try db.clone(),
+            .removed = .init(db.allocator),
+        };
     }
 
     /// The database to execute the statement against. Everything it interns —
@@ -201,21 +220,119 @@ pub const Statement = struct {
         return &self.staging;
     }
 
+    /// Runs a retraction against the staging copy, keeping the base facts its
+    /// goals resolved to for the commit. Returns whether it named any.
+    pub fn retract(self: *Statement, goals: []const syntax.Clause) !bool {
+        const resolved = try resolveRetraction(self.target(), goals);
+        self.removed.deinit();
+        self.removed = resolved;
+        return self.removed.len() > 0;
+    }
+
     /// Commits according to what the statement turned out to be. A query
     /// changes nothing and keeps its query-local interning out of the
-    /// database; an assertion installs the staged copy; a retraction that
-    /// removed facts replays those removals so they take the incremental
-    /// deletion path rather than committing the staged copy wholesale.
+    /// database; an assertion installs the staged copy; a retraction applies
+    /// the facts it resolved, so that they take the incremental deletion path,
+    /// and discards the copy it resolved them on.
     pub fn commit(self: *Statement, result: results.ExecutionResult) !void {
         switch (result) {
             .query => {},
             .none => self.database.commit(&self.staging),
-            .changed => |changed| if (changed) try commitRetraction(self.database, &self.staging),
+            .changed => |changed| if (changed) try commitRetraction(self.database, &self.removed),
         }
     }
 
     pub fn deinit(self: *Statement) void {
+        self.removed.deinit();
         self.staging.deinit();
         self.* = undefined;
     }
 };
+
+const testing = std.testing;
+const input = @import("input.zig");
+
+/// Installs `reachable(X) :- node(X)`, which is enough of a rule for a
+/// retraction to have a derived consequence to lose. Built from descriptors
+/// rather than parsed, because the parser is the layer above this one.
+fn defineReachableRule(db: *database.Database) !void {
+    const head = try compile.compileRelation(db, "reachable", &.{input.variable("X")}, false);
+    const body = try compileGoal(db, "node", input.variable("X"));
+    defer db.allocator.free(body);
+    try addRuleClauses(db, head, body);
+}
+
+fn addAtomFact(db: *database.Database, predicate: []const u8, atom: []const u8) !void {
+    const expression = try compile.compileRelation(db, predicate, &.{input.atom(atom)}, false);
+    defer syntax.freeExpr(db.allocator, expression);
+    try addFactExpr(db, expression);
+}
+
+/// Compiles one relational goal against `db`, interning whatever it names
+/// there. The caller owns the returned slice and the clauses in it.
+fn compileGoal(db: *database.Database, predicate: []const u8, term: input.Term) ![]syntax.Clause {
+    return compile.compileGoals(db, &.{input.relation(predicate, &.{term})});
+}
+
+fn freeGoals(db: *database.Database, goals: []syntax.Clause) void {
+    for (goals) |clause| syntax.freeClauseTree(db.allocator, clause);
+    db.allocator.free(goals);
+}
+
+test "the facts a retraction resolves on a copy are the original database's own" {
+    // This is the claim the retraction path rests on, and the only place it
+    // is visible: a removal set crosses from the database its goals were
+    // evaluated against to the database that copy was made from. The value
+    // identifiers it carries are indexes into tables that cloning copies
+    // verbatim and interning only appends to, so they mean the same facts on
+    // both sides. Were that not so, nothing would be found on this side and
+    // the retraction would silently remove nothing.
+    var db: database.Database = .init(testing.allocator);
+    defer db.deinit();
+    try defineReachableRule(&db);
+    try addAtomFact(&db, "node", "a");
+    try addAtomFact(&db, "node", "b");
+    try materialization.ensureMaterialized(&db);
+    try testing.expectEqual(@as(usize, 4), db.closure.?.len());
+
+    var staging = try db.clone();
+    defer staging.deinit();
+    const goals = try compileGoal(&staging, "node", input.atom("a"));
+    defer freeGoals(&staging, goals);
+    var removed = try resolveRetraction(&staging, goals);
+    defer removed.deinit();
+    try testing.expectEqual(@as(usize, 1), removed.len());
+    // Resolving is not removing: the copy still holds both facts.
+    try testing.expectEqual(@as(usize, 2), staging.facts.len());
+
+    try commitRetraction(&db, &removed);
+    try testing.expectEqual(@as(usize, 1), db.facts.len());
+    // And the fact took its derived consequence with it, which is what makes
+    // this the deletion path rather than a fact store edit.
+    try testing.expectEqual(@as(usize, 2), db.closure.?.len());
+}
+
+test "a retraction naming a value the database does not hold leaves it uninterned" {
+    // The reason the goals are evaluated somewhere else at all. Evaluating
+    // them interns what they name, and a retraction may name values the
+    // database has never held; only the facts come back, so only facts the
+    // database already had can reach it.
+    var db: database.Database = .init(testing.allocator);
+    defer db.deinit();
+    try defineReachableRule(&db);
+    try addAtomFact(&db, "node", "a");
+    try materialization.ensureMaterialized(&db);
+    const scalars_before = db.eval.scalars.values.items.len;
+
+    var staging = try db.clone();
+    defer staging.deinit();
+    const goals = try compileGoal(&staging, "node", input.atom("absent"));
+    defer freeGoals(&staging, goals);
+    var removed = try resolveRetraction(&staging, goals);
+    defer removed.deinit();
+
+    try testing.expectEqual(@as(usize, 0), removed.len());
+    try testing.expect(staging.eval.scalars.values.items.len > scalars_before);
+    try testing.expectEqual(scalars_before, db.eval.scalars.values.items.len);
+    try testing.expectEqual(@as(usize, 1), db.facts.len());
+}

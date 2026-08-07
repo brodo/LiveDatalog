@@ -73,10 +73,13 @@ base facts the caller named, because that is all that is known before applying
 them, and taught with the number the update realized. `MaintenancePolicy` pins
 the choice when a caller needs one path. Retraction — including pattern
 retraction with variables, which the batch API cannot express — resolves its
-goals to base facts and takes the deletion path. Aggregate group maintenance
-runs on top of the first two. `maintenanceStats` makes the path taken
-observable, and shadow verification checks the result against a rebuild before
-committing.
+goals to base facts and takes the deletion path. It resolves them against a
+copy of the database, because evaluating them interns whatever they name and a
+retraction may name values the database has never held; only the facts it
+resolved to cross back, and they can because a copy shares the original's value
+identifiers. Aggregate group maintenance runs on top of the first two.
+`maintenanceStats` makes the path taken observable, and shadow verification
+checks the result against a rebuild before committing.
 
 One delta reaches the closure through three calls in a fixed order: the
 removals, then staging the insertions, then propagating from the watermark

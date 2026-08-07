@@ -35,7 +35,7 @@ pub const Parser = struct {
             defer transaction.deinit();
             var statement_parser = self.*;
             statement_parser.jatalog = transaction.target();
-            const statement_result = try statement_parser.executeStatement();
+            const statement_result = try statement_parser.executeStatement(&transaction);
             self.index = statement_parser.index;
             try transaction.commit(statement_result);
             last = statement_result;
@@ -83,7 +83,11 @@ pub const Parser = struct {
         return .end;
     }
 
-    fn executeStatement(self: *Parser) !results.ExecutionResult {
+    /// Runs one statement against `self.jatalog`, which is `transaction`'s
+    /// staging copy. The transaction is named here only for the retraction,
+    /// whose commit needs the facts its goals resolved to; every other
+    /// statement is committed from the staging copy alone.
+    fn executeStatement(self: *Parser, transaction: *statement.Statement) !results.ExecutionResult {
         const first = try self.parseClause();
         var first_owned = true;
         errdefer if (first_owned) syntax.freeClauseTree(self.jatalog.allocator, first);
@@ -137,7 +141,7 @@ pub const Parser = struct {
             };
         }
         if (self.consume("?")) return .{ .query = try statement.queryClauses(self.jatalog, goals.items) };
-        if (self.consume("~")) return .{ .changed = try statement.deleteClauses(self.jatalog, goals.items) };
+        if (self.consume("~")) return .{ .changed = try transaction.retract(goals.items) };
         return error.InvalidSyntax;
     }
 

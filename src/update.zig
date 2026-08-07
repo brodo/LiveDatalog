@@ -12,10 +12,11 @@
 //!
 //! This is the layer between the state and the interface: it takes a
 //! `*Database` and never names `Jatalog`. Compilation stays above — a caller
-//! hands over expressions it has already built, from descriptors or from
-//! source. Staging and commit stay above too: everything here mutates the
-//! database it is given, and a caller that needs the update to be atomic runs
-//! it against a clone.
+//! hands over a batch it has already resolved as far as it can, whether that
+//! is expressions built from descriptors or from source, or the facts a
+//! retraction's goals turned out to name. Staging and commit stay above too:
+//! everything here mutates the database it is given, and a caller that needs
+//! the update to be atomic runs it against a clone.
 
 const std = @import("std");
 const aggregate_view = @import("aggregate_view.zig");
@@ -23,6 +24,27 @@ const database = @import("database.zig");
 const maintenance = @import("maintenance.zig");
 const relation_store = @import("relation_store.zig");
 const syntax = @import("syntax.zig");
+
+/// What a batch deletes, in whichever form its caller holds it.
+///
+/// A batch of expressions names facts the database may or may not hold, so
+/// the names have to be interned against it before they can be looked up. A
+/// retraction instead evaluates its goals against a copy of the database and
+/// arrives holding the facts themselves. That copy shares the original's value
+/// identifiers — the tables they index into are append-only, and cloning
+/// copies them verbatim — so facts resolved on the copy name the same facts
+/// here, which is what makes handing them over sound.
+pub const Deletions = union(enum) {
+    named: []const syntax.Expr,
+    resolved: *const relation_store.RelationStore,
+
+    pub fn len(self: Deletions) usize {
+        return switch (self) {
+            .named => |expressions| expressions.len,
+            .resolved => |facts| facts.len(),
+        };
+    }
+};
 
 /// Applies one batch of exact ground base-fact deletions and insertions with
 /// set semantics, and returns how many base facts really changed — fewer than
@@ -34,15 +56,17 @@ const syntax = @import("syntax.zig");
 /// over-deleted against a closure it was never absent from.
 pub fn apply(
     db: *database.Database,
-    deletions: []const syntax.Expr,
+    deletions: Deletions,
     insertions: []const syntax.Expr,
 ) !usize {
     // The batch size is only an estimate of the work ahead — it counts what
     // the caller named, and a batch naming facts the database already agrees
     // with does proportionally less. What it actually changed is measured
-    // afterwards and fed back as the realized count.
+    // afterwards and fed back as the realized count. A batch of resolved
+    // deletions is the case where the two numbers coincide: every fact in it
+    // is one this database holds.
     const maintain = db.canMaintain() and
-        db.eval.cost.decide(deletions.len + insertions.len) == .maintain;
+        db.eval.cost.decide(deletions.len() + insertions.len) == .maintain;
     const span = db.eval.cost.begin();
 
     // Facts the aggregate phase must reconsider: every fact this batch took
@@ -58,70 +82,58 @@ pub fn apply(
     return realized;
 }
 
-/// Applies base facts a caller has already removed from `db.facts`, and
-/// returns how many there were.
-///
-/// This exists for retraction, which resolves its goals by evaluating them
-/// against a staging database and recovers what it removed by comparing that
-/// database against the committed one — so unlike a batch it arrives holding
-/// facts rather than expressions, and holding them already removed. It is the
-/// same path as `apply` from the cost decision down, and it is temporary:
-/// once retraction hands over the facts its goals resolved to instead of
-/// diffing two databases for them, it can call `apply` and this goes away.
-pub fn applyRemoved(
-    db: *database.Database,
-    removed: *relation_store.RelationStore,
-) !usize {
-    // Retraction resolves its goals before deciding, so unlike a batch it
-    // knows exactly how many base facts it changes: the estimate the model
-    // decides on and the count it later measures are the same.
-    const delta = removed.len();
-    const maintain = db.canMaintain() and db.eval.cost.decide(delta) == .maintain;
-    if (maintain and delta > 0) {
-        const span = db.eval.cost.begin();
-        var touched: relation_store.RelationStore = .init(db.allocator);
-        defer touched.deinit();
-        _ = try maintenance.applyRemovals(db, removed, &touched);
-        if (touched.len() > 0) try aggregate_view.maintainAggregates(db, &touched);
-        db.eval.cost.noteMaintenance(delta, span);
-    } else {
-        for (0..removed.len()) |position| {
-            const fact = removed.factAt(position);
-            try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
-        }
-    }
-    return delta;
-}
-
 /// Removes this batch's deletions from the base facts. When maintaining, they
 /// take the delete-and-rederive path and everything that leaves the closure is
 /// added to `touched`; otherwise each removal dirties the strata that read its
 /// predicate.
 fn applyDeletions(
     db: *database.Database,
-    deletions: []const syntax.Expr,
+    deletions: Deletions,
     maintain: bool,
     touched: *relation_store.RelationStore,
 ) !usize {
     var removed: relation_store.RelationStore = .init(db.allocator);
     defer removed.deinit();
     var count: usize = 0;
-    for (deletions) |expression| {
-        if (!expression.isGround()) return error.InvalidFact;
-        const terms = try db.allocator.alloc(syntax.ValueId, expression.terms.len);
-        defer db.allocator.free(terms);
-        for (expression.terms, terms) |term, *id| id.* = try db.eval.termToValue(term, null);
-        const fact: relation_store.Fact = .{ .predicate = expression.predicate, .terms = terms };
-        if (!try db.facts.removeFact(fact)) continue;
-        count += 1;
-        if (maintain) {
-            try relation_store.copyFactInto(db.allocator, &removed, fact, false);
-        } else {
-            try db.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
-        }
+    switch (deletions) {
+        .named => |expressions| for (expressions) |expression| {
+            if (!expression.isGround()) return error.InvalidFact;
+            const terms = try db.allocator.alloc(syntax.ValueId, expression.terms.len);
+            defer db.allocator.free(terms);
+            for (expression.terms, terms) |term, *id| id.* = try db.eval.termToValue(term, null);
+            const fact: relation_store.Fact = .{ .predicate = expression.predicate, .terms = terms };
+            if (try removeOne(db, fact, maintain, &removed)) count += 1;
+        },
+        .resolved => |facts| for (0..facts.len()) |position| {
+            const present = try removeOne(db, facts.factAt(position), maintain, &removed);
+            // A resolved fact was found in a copy of this database, under the
+            // value identifiers this database uses too, so this database holds
+            // it. Were that ever not so the retraction would silently
+            // under-delete, which is worth asserting rather than discovering.
+            std.debug.assert(present);
+            if (present) count += 1;
+        },
     }
     _ = try maintenance.applyRemovals(db, &removed, touched);
     return count;
+}
+
+/// Takes one fact out of the base facts, and either queues it for
+/// delete-and-rederive or dirties the strata that read its predicate. Returns
+/// whether the database held the fact at all.
+fn removeOne(
+    db: *database.Database,
+    fact: relation_store.Fact,
+    maintain: bool,
+    removed: *relation_store.RelationStore,
+) !bool {
+    if (!try db.facts.removeFact(fact)) return false;
+    if (maintain) {
+        try relation_store.copyFactInto(db.allocator, removed, fact, false);
+    } else {
+        try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+    }
+    return true;
 }
 
 /// Adds this batch's insertions to the base facts. When maintaining, the ones
@@ -191,7 +203,7 @@ fn defineRule(
 fn applyOneInsertion(db: *database.Database, predicate: []const u8, atom: []const u8) !usize {
     const expression = try compile.compileRelation(db, predicate, &.{input.atom(atom)}, false);
     defer syntax.freeExpr(db.allocator, expression);
-    return apply(db, &.{}, &.{expression});
+    return apply(db, .{ .named = &.{} }, &.{expression});
 }
 
 test "the estimate the model decides on and the count it measures are one batch" {
