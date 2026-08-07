@@ -22,6 +22,7 @@ const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const scalar = @import("scalar.zig");
 const statement = @import("statement.zig");
+const update = @import("update.zig");
 const string_table = @import("string_table.zig");
 const syntax = @import("syntax.zig");
 const test_support = @import("test_support.zig");
@@ -143,7 +144,11 @@ pub const Jatalog = struct {
     ) !bool {
         var staging = try self.state.clone();
         defer staging.deinit();
-        const changed = try applyChangesCompiled(&staging, insertions, deletions);
+        const compiled_deletions = try compileRelations(&staging, deletions);
+        defer freeRelations(staging.allocator, compiled_deletions);
+        const compiled_insertions = try compileRelations(&staging, insertions);
+        defer freeRelations(staging.allocator, compiled_insertions);
+        const changed = try update.apply(&staging, compiled_deletions, compiled_insertions) > 0;
         try materialization.verifyShadow(&staging);
         if (changed) self.state.commit(&staging);
         return changed;
@@ -211,106 +216,27 @@ pub const Jatalog = struct {
     }
 };
 
-fn applyChangesCompiled(
-    db: *database.Database,
-    insertions: []const input.Relation,
-    deletions: []const input.Relation,
-) !bool {
-    // Both phases follow the one decision. The batch size is only an
-    // estimate of the work ahead; what it actually changed is measured
-    // afterwards.
-    const maintain = db.canMaintain() and
-        db.eval.cost.decide(insertions.len + deletions.len) == .maintain;
-    const span = db.eval.cost.begin();
-
-    // Facts the aggregate phase must reconsider: every fact this batch
-    // took out of the closure, and every fact it derived into it.
-    var touched: relation_store.RelationStore = .init(db.allocator);
-    defer touched.deinit();
-    const deleted = try applyDeletions(db, deletions, maintain, &touched);
-    const inserted = try applyInsertions(db, insertions, maintain, &touched);
-    if (touched.len() > 0) try aggregate_view.maintainAggregates(db, &touched);
-
-    const realized = deleted + inserted;
-    if (maintain) db.eval.cost.noteMaintenance(realized, span);
-    return realized > 0;
+/// Compiles a batch's relation descriptors into expressions the update path
+/// applies. Compilation belongs here rather than below because it is what
+/// turns *descriptors* — this front end's input — into the engine's syntax;
+/// the source front end arrives with expressions already.
+fn compileRelations(db: *database.Database, relations: []const input.Relation) ![]syntax.Expr {
+    const compiled = try db.allocator.alloc(syntax.Expr, relations.len);
+    var built: usize = 0;
+    errdefer {
+        for (compiled[0..built]) |expression| syntax.freeExpr(db.allocator, expression);
+        db.allocator.free(compiled);
+    }
+    for (relations, compiled) |relation, *slot| {
+        slot.* = try compile.compileRelation(db, relation.predicate, relation.terms, false);
+        built += 1;
+    }
+    return compiled;
 }
 
-/// Removes this batch's deletions from the base facts. When maintaining,
-/// they take the delete-and-rederive path and everything that leaves the
-/// closure is added to `touched`; otherwise each removal dirties the
-/// strata that read its predicate. Returns how many base facts were
-/// really removed, which is fewer than `deletions.len()` whenever the
-/// batch names a fact the database does not hold.
-fn applyDeletions(
-    db: *database.Database,
-    deletions: []const input.Relation,
-    maintain: bool,
-    touched: *relation_store.RelationStore,
-) !usize {
-    var removed: relation_store.RelationStore = .init(db.allocator);
-    defer removed.deinit();
-    var count: usize = 0;
-    for (deletions) |relation| {
-        const expression = try compile.compileRelation(db, relation.predicate, relation.terms, false);
-        defer syntax.freeExpr(db.allocator, expression);
-        if (!expression.isGround()) return error.InvalidFact;
-        const terms = try db.allocator.alloc(syntax.ValueId, expression.terms.len);
-        defer db.allocator.free(terms);
-        for (expression.terms, terms) |term, *id| id.* = try db.eval.termToValue(term, null);
-        const fact: relation_store.Fact = .{ .predicate = expression.predicate, .terms = terms };
-        if (!try db.facts.removeFact(fact)) continue;
-        count += 1;
-        if (maintain) {
-            try relation_store.copyFactInto(db.allocator, &removed, fact, false);
-        } else {
-            try db.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
-        }
-    }
-    // `removed` is only populated while maintaining. Delete-and-rederive
-    // rewrites it in place into the set of facts that actually left the
-    // closure: over-deleted consequences are added and rederived ones
-    // removed, so it must be read for `touched` only afterwards.
-    if (removed.len() > 0) {
-        try maintenance.propagateDeletions(db, &removed);
-        for (0..removed.len()) |index|
-            try relation_store.copyFactInto(db.allocator, touched, removed.factAt(index), false);
-    }
-    return count;
-}
-
-/// Adds this batch's insertions to the base facts. When maintaining, each
-/// new fact also joins the clean closure and the batch propagates through
-/// the positive strata, with everything derived added to `touched`;
-/// otherwise each insertion dirties the strata that read its predicate.
-/// Returns how many base facts were really added, which is fewer than
-/// `insertions.len()` whenever the batch re-inserts a fact the database
-/// already holds.
-fn applyInsertions(
-    db: *database.Database,
-    insertions: []const input.Relation,
-    maintain: bool,
-    touched: *relation_store.RelationStore,
-) !usize {
-    // Maintaining the deletions cannot have taken the closure out from
-    // under this phase: a delete-and-rederive fallback repairs the
-    // closure through `ensureMaterialized` rather than leaving it dirty.
-    std.debug.assert(!maintain or
-        (db.closure != null and db.materialization == .clean));
-    const batch_start = if (maintain) db.closure.?.len() else 0;
-    var count: usize = 0;
-    for (insertions) |relation| {
-        const expression = try compile.compileRelation(db, relation.predicate, relation.terms, false);
-        defer syntax.freeExpr(db.allocator, expression);
-        if (try db.applyInsertion(expression, maintain)) count += 1;
-    }
-    if (!maintain or db.closure.?.len() == batch_start) return count;
-    try maintenance.propagateInsertions(db, batch_start);
-    if (db.materialization == .clean) {
-        for (batch_start..db.closure.?.len()) |index|
-            try relation_store.copyFactInto(db.allocator, touched, db.closure.?.factAt(index), false);
-    }
-    return count;
+fn freeRelations(allocator: std.mem.Allocator, compiled: []syntax.Expr) void {
+    for (compiled) |expression| syntax.freeExpr(allocator, expression);
+    allocator.free(compiled);
 }
 
 test {
@@ -319,12 +245,14 @@ test {
     // built from. Naming them here is what puts their tests in this build; a
     // module left out still compiles and still passes, it just stops being
     // tested.
+    _ = aggregate_view;
     _ = auxiliary_view;
     _ = compile;
     _ = cost_model;
     _ = database;
     _ = evaluator;
     _ = input_compiler;
+    _ = maintenance;
     _ = relation_store;
     _ = scalar;
     _ = string_table;

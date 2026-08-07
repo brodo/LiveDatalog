@@ -148,26 +148,28 @@ pub const Database = struct {
         staging.* = previous;
     }
 
-    /// Inserts one ground base fact. When `propagate` is set the fact also
-    /// joins the clean closure for incremental propagation; otherwise the
-    /// first dependent stratum is marked dirty for the lazy rebuild path.
-    pub fn applyInsertion(self: *Database, value: syntax.Expr, propagate: bool) !bool {
+    /// Inserts one ground base fact with set semantics, returning it as the
+    /// store now holds it, or null when the store already held it.
+    ///
+    /// What the new fact means for the derived closure is not decided here.
+    /// This module holds the state; whether the fact goes on to join a clean
+    /// closure or instead dirties the strata that read it is the update path's
+    /// choice, and it makes it from what this returns.
+    ///
+    /// The returned terms are borrowed from `facts`. Further insertions can
+    /// move the entry holding them but not the terms themselves; a removal
+    /// frees them.
+    pub fn applyInsertion(self: *Database, value: syntax.Expr) !?relation_store.Fact {
         if (!value.isGround() or value.negated) return error.InvalidFact;
         const terms = try self.allocator.alloc(syntax.ValueId, value.terms.len);
         var terms_owned = true;
         errdefer if (terms_owned) self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
         const fact: relation_store.Fact = .{ .predicate = value.predicate, .terms = terms };
-        const key: relation_store.PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
         const added = try self.facts.insert(fact, false);
         terms_owned = false;
-        if (!added) return false;
-        if (propagate) {
-            try relation_store.copyFactInto(self.allocator, &self.closure.?, fact, false);
-        } else {
-            try self.markBaseChanged(key);
-        }
-        return true;
+        if (!added) return null;
+        return self.facts.factAt(self.facts.len() - 1);
     }
 
     pub fn copyQueryResult(self: *const Database, bindings: []const syntax.Binding) !results.QueryResult {

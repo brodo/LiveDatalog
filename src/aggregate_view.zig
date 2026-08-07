@@ -67,24 +67,15 @@ pub fn maintainAggregates(db: *database.Database, touched: *relation_store.Relat
         }
         if (removals.len() == 0 and additions.items.len == 0) return;
 
+        // This round's stale head tuples and recomputed ones are one delta,
+        // and take the same three-call path a base update does. A round that
+        // falls back to a rebuild ends the cascade: the rebuild recomputed
+        // every aggregate head from the closure, so there is no next round
+        // left to run.
         touched.clear();
-        if (removals.len() > 0) {
-            try maintenance.propagateDeletions(db, &removals);
-            for (0..removals.len()) |index|
-                try relation_store.copyFactInto(db.allocator, touched, removals.factAt(index), false);
-        }
-        if (db.materialization != .clean) return;
-        const batch_start = db.closure.?.len();
-        for (additions.items) |fact| {
-            if (try db.closure.?.contains(fact)) continue;
-            try relation_store.copyFactInto(db.allocator, &db.closure.?, fact, true);
-        }
-        if (db.closure.?.len() > batch_start) {
-            try maintenance.propagateInsertions(db, batch_start);
-            if (db.materialization != .clean) return;
-            for (batch_start..db.closure.?.len()) |index|
-                try relation_store.copyFactInto(db.allocator, touched, db.closure.?.factAt(index), false);
-        }
+        if (try maintenance.applyRemovals(db, &removals, touched) == .rebuilt) return;
+        const batch_start = try maintenance.stageInsertions(db, additions.items, .derived);
+        if (try maintenance.applyStaged(db, batch_start, touched) == .rebuilt) return;
     }
 }
 fn maintainAggregateRule(

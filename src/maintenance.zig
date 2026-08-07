@@ -10,6 +10,14 @@
 //! Everything else these need comes from the evaluator — matching rules
 //! against a store, deriving head facts, the stratification — or from the
 //! relation store.
+//!
+//! One delta reaches the closure through three calls in this order:
+//! `applyRemovals`, then `stageInsertions`, then `applyStaged`. The order is
+//! the interface, not an accident of it — delete-and-rederive joins against a
+//! snapshot of the pre-deletion closure, so facts staged before the removals
+//! propagate would be over-deleted against a closure they were never absent
+//! from. `update.zig` and `aggregate_view.zig` are the two callers, and both
+//! collect what moved into one `touched` store.
 
 const std = @import("std");
 const evaluator = @import("evaluator.zig");
@@ -22,11 +30,97 @@ const relation_store = @import("relation_store.zig");
 /// How a batch's changed predicates affect one stratum's maintenance.
 pub const StratumImpact = enum { none, aggregate, rebuild };
 
+/// Whether a delta reached the closure incrementally, or abandoned the
+/// incremental path for a dirty-stratum rebuild.
+///
+/// The distinction is not readable from `db.materialization`: the fallback
+/// repairs the closure through `ensureMaterialized` before returning, so the
+/// database is `.clean` either way. What differs is that a rebuild replaces
+/// the closure wholesale, which retires every index into it — including the
+/// watermark a caller would collect its `touched` facts from.
+pub const DeltaOutcome = enum { maintained, rebuilt };
+
+/// Whether a fact enters the closure as one of the database's base facts or
+/// as a fact some rule derived.
+///
+/// The two also differ in what a duplicate means. A base fact the closure
+/// already holds is a second reason to hold it, and its support count says
+/// so, which is what lets delete-and-rederive tell an exhausted fact from a
+/// still-supported one. A derived fact is re-derived on every round of the
+/// aggregate cascade, so counting those would inflate the same support with
+/// no new reason behind it.
+pub const FactKind = enum { base, derived };
+
+/// Deletes `removals` from the closure through delete-and-rederive and
+/// collects everything that actually left it into `touched`.
+///
+/// `removals` is rewritten in place into that set: over-deleted consequences
+/// are added and rederived ones removed, so it is only meaningful afterwards.
+/// A `.rebuilt` outcome leaves `touched` empty — the rebuild has already
+/// recomputed every consequence, so there is nothing left for the aggregate
+/// phase to reconsider.
+pub fn applyRemovals(
+    db: *database.Database,
+    removals: *relation_store.RelationStore,
+    touched: *relation_store.RelationStore,
+) !DeltaOutcome {
+    if (removals.len() == 0) return .maintained;
+    if (try propagateDeletions(db, removals) == .rebuilt) {
+        touched.clear();
+        return .rebuilt;
+    }
+    for (0..removals.len()) |index|
+        try relation_store.copyFactInto(db.allocator, touched, removals.factAt(index), false);
+    return .maintained;
+}
+
+/// Appends `facts` to the closure and returns the watermark `applyStaged`
+/// propagates from: the closure's length before the append.
+///
+/// Staging is separate from propagating because the two cannot be one call —
+/// a delta's removals must reach the closure first, and only a caller can sit
+/// between the two phases holding its own facts.
+pub fn stageInsertions(
+    db: *database.Database,
+    facts: []const relation_store.Fact,
+    kind: FactKind,
+) !usize {
+    const batch_start = db.closure.?.len();
+    for (facts) |fact| {
+        if (kind == .derived and try db.closure.?.contains(fact)) continue;
+        try relation_store.copyFactInto(db.allocator, &db.closure.?, fact, kind == .derived);
+    }
+    return batch_start;
+}
+
+/// Propagates the facts staged at or after `batch_start` and collects
+/// everything derived from them into `touched`. Staging that added nothing
+/// propagates nothing.
+///
+/// A `.rebuilt` outcome clears `touched`, including anything an earlier phase
+/// of the same delta put there: `batch_start` no longer indexes the closure
+/// the rebuild installed, and the rebuild already recomputed what the
+/// collection was for.
+pub fn applyStaged(
+    db: *database.Database,
+    batch_start: usize,
+    touched: *relation_store.RelationStore,
+) !DeltaOutcome {
+    if (db.closure.?.len() == batch_start) return .maintained;
+    if (try propagateInsertions(db, batch_start) == .rebuilt) {
+        touched.clear();
+        return .rebuilt;
+    }
+    for (batch_start..db.closure.?.len()) |index|
+        try relation_store.copyFactInto(db.allocator, touched, db.closure.?.factAt(index), false);
+    return .maintained;
+}
+
 /// Propagates a batch of base insertions already appended to the clean
 /// closure at `batch_start`, one stratum at a time. A stratum whose
 /// negated or aggregated dependencies gained facts falls back to the
 /// dirty-stratum rebuild; strata below it keep their incremental state.
-pub fn propagateInsertions(db: *database.Database, batch_start: usize) !void {
+fn propagateInsertions(db: *database.Database, batch_start: usize) !DeltaOutcome {
     const start_len = db.closure.?.len();
     const analysis = try db.eval.ensureAnalysis();
     const max_level = analysis.max_level;
@@ -36,11 +130,12 @@ pub fn propagateInsertions(db: *database.Database, batch_start: usize) !void {
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try materialization.ensureMaterialized(db);
-            return;
+            return .rebuilt;
         }
         try propagateLevel(db, &db.closure.?, &analysis.strata, level, batch_start);
     }
     db.propagated_facts += db.closure.?.len() - start_len;
+    return .maintained;
 }
 /// Whether stratum `level` must be rebuilt rather than maintained because the
 /// facts appended to the closure from `batch_start` reach one of its rules
@@ -120,7 +215,7 @@ pub fn stratumImpact(
 ///
 /// A stratum containing a seeded structural rule whose body lost facts is
 /// rebuilt rather than over-deleted; see `deletionBlocked`.
-pub fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationStore) !void {
+fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationStore) !DeltaOutcome {
     var old_closure = try db.closure.?.clone();
     defer old_closure.deinit();
     for (0..deleted.len()) |index| {
@@ -133,12 +228,13 @@ pub fn propagateDeletions(db: *database.Database, deleted: *relation_store.Relat
             db.rebuild_fallbacks += 1;
             db.markDirty(level);
             try materialization.ensureMaterialized(db);
-            return;
+            return .rebuilt;
         }
         try overdeleteLevel(db, &old_closure, deleted, &analysis.strata, level);
         try rederiveLevel(db, deleted, &analysis.strata, level);
     }
     db.removed_facts += deleted.len();
+    return .maintained;
 }
 /// Over-deletes stratum `level`: every fact derivable by one of the
 /// stratum's rules from at least one already-deleted fact is removed

@@ -56,25 +56,37 @@ still yields `[]`, while removing the group key removes the tuple.
 
 ### Update path
 
-Every base-fact update takes exactly one of three paths, all of which yield
-the same database a clean rebuild would: incremental insertion propagation
-through positive rules, delete-and-rederive for deletions, or a stratum
-rebuild when the update reaches negation or an aggregate outside the
-maintained class. Deletion takes the rebuild in one further case: it runs a
-rule backwards from a deleted body fact to the head it supported, which a
-seeded structural rule does not permit because its head carries a variable
-only the value table binds. Because maintaining and recomputing differ only in cost, a
-cost model chooses between them per update, estimating both from measured
-work — counted in candidate facts examined, and attributed so that each
-candidate moves exactly one of the two estimates, with a fallback rebuild
-counting as recomputation rather than as the maintenance that triggered it.
-Estimates are fed the number of base facts an update changed, not the number
-its caller named. `MaintenancePolicy` pins the choice when a caller needs one
-path. Retraction — including pattern retraction with variables,
-which the batch API cannot express — resolves its goals to base facts and
-takes the deletion path. Aggregate group maintenance runs on top of the first two.
-`maintenanceStats` makes the path taken observable, and shadow verification
-checks the result against a rebuild before committing.
+How a base-fact update reaches the derived closure (`update.zig`). Every
+update takes exactly one of three paths, all of which yield the same database
+a clean rebuild would: incremental insertion propagation through positive
+rules, delete-and-rederive for deletions, or a stratum rebuild when the update
+reaches negation or an aggregate outside the maintained class. Deletion takes
+the rebuild in one further case: it runs a rule backwards from a deleted body
+fact to the head it supported, which a seeded structural rule does not permit
+because its head carries a variable only the value table binds. Because
+maintaining and recomputing differ only in cost, a cost model chooses between
+them per update, estimating both from measured work — counted in candidate
+facts examined, and attributed so that each candidate moves exactly one of the
+two estimates, with a fallback rebuild counting as recomputation rather than
+as the maintenance that triggered it. The model is asked with the number of
+base facts the caller named, because that is all that is known before applying
+them, and taught with the number the update realized. `MaintenancePolicy` pins
+the choice when a caller needs one path. Retraction — including pattern
+retraction with variables, which the batch API cannot express — resolves its
+goals to base facts and takes the deletion path. Aggregate group maintenance
+runs on top of the first two. `maintenanceStats` makes the path taken
+observable, and shadow verification checks the result against a rebuild before
+committing.
+
+One delta reaches the closure through three calls in a fixed order: the
+removals, then staging the insertions, then propagating from the watermark
+staging returned. Delete-and-rederive joins against a snapshot of the
+pre-deletion closure, so a fact staged first would be over-deleted against a
+closure it was never absent from. Each half reports whether it maintained or
+fell back to a rebuild — a distinction the materialization tri-state cannot
+make, because the fallback repairs the closure before returning and leaves it
+`clean` either way. A rebuild retires the watermark and has already recomputed
+every consequence, so it yields nothing for the aggregate phase to reconsider.
 
 ### Projected view
 

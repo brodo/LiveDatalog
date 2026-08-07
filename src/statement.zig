@@ -7,24 +7,22 @@
 //! transaction that stages them.
 
 const std = @import("std");
-const aggregate_view = @import("aggregate_view.zig");
 const compile = @import("compile.zig");
 const database = @import("database.zig");
 const errors = @import("errors.zig");
-const maintenance = @import("maintenance.zig");
 const materialization = @import("materialization.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const syntax = @import("syntax.zig");
+const update = @import("update.zig");
 const validation = @import("validation.zig");
 
 /// Applies the base facts a retraction removed. `staging` holds the
 /// post-retraction base facts computed by goal evaluation; the removals
 /// are replayed onto a fresh clone so query-local values interned while
 /// evaluating the goals never reach the committed database. The removals
-/// then take the same incremental deletion path as a batch: exact facts
-/// through delete-and-rederive and aggregate maintenance when the
-/// closure is clean, and dirty-stratum rebuild otherwise.
+/// then take the ordinary update path, which is what makes a retraction
+/// and a batch deletion the same operation on the closure.
 pub fn commitRetraction(db: *database.Database, staging: *database.Database) !void {
     var committed = try db.clone();
     defer committed.deinit();
@@ -38,33 +36,14 @@ pub fn commitRetraction(db: *database.Database, staging: *database.Database) !vo
         try relation_store.copyFactInto(committed.allocator, &removed, fact, false);
         committed.facts.removeAt(index);
     }
-    // Retraction resolves its goals before deciding, so unlike a batch it
-    // knows exactly how many base facts it changes: the estimate the
-    // model decides on and the count it later measures are the same.
-    const delta = removed.len();
-    const maintain = committed.canMaintain() and
-        committed.eval.cost.decide(delta) == .maintain;
-    if (maintain and delta > 0) {
-        const span = committed.eval.cost.begin();
-        try maintenance.propagateDeletions(&committed, &removed);
-        var touched: relation_store.RelationStore = .init(committed.allocator);
-        defer touched.deinit();
-        for (0..removed.len()) |position|
-            try relation_store.copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
-        if (touched.len() > 0) try aggregate_view.maintainAggregates(&committed, &touched);
-        committed.eval.cost.noteMaintenance(delta, span);
-    } else {
-        for (0..removed.len()) |position| {
-            const fact = removed.factAt(position);
-            try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
-        }
-    }
+    _ = try update.applyRemoved(&committed, &removed);
     try materialization.verifyShadow(&committed);
     db.commit(&committed);
 }
 
 pub fn addFactExpr(db: *database.Database, value: syntax.Expr) !void {
-    _ = try db.applyInsertion(value, false);
+    const fact = try db.applyInsertion(value) orelse return;
+    try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
 }
 
 /// Adds a rule whose body may contain aggregate clauses. On success the
