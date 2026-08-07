@@ -58,6 +58,7 @@ S1 finite-f64 policy and syntax
                 │    └─> M1 persistent materialization
                 │         ├─> M2 insertion deltas
                 │         ├─> M3 deletion and negation maintenance
+                │         │    └─> M7 deletion through seeded structural rules
                 │         └─> M4–M6 aggregate maintenance
                 └─> F1–F5 query folding
                      └─> F6 planner/materialization integration
@@ -825,6 +826,117 @@ M6 was completed on 2026-08-06, finishing Project M:
     test runs one trace under all three policies to confirm they agree on
     base facts and closure. The choice is a cost decision only.
 
+## M7: incremental deletion through seeded structural rules
+
+### Why this is deferred work
+
+Delete-and-rederive runs a rule *backwards*: `overdeleteOccurrence` unifies a
+deleted fact against one body occurrence, solves the remaining goals, and
+reconstructs the head tuple that derivation supported. A seeded structural
+rule cannot be run backwards, because its head carries a variable no body goal
+binds:
+
+```datalog
+length([], 0).
+length(H!T, N) :- length(T, M), N = M + 1.
+```
+
+Pinning `length(T, M)` against a deleted fact binds `T`, `M`, and then `N`, but
+never `H`. Forward evaluation binds it by enumerating the value table —
+`applyRule` unifies every interned value against `head.terms[seed_argument]`
+before solving the body — and `seed_argument` records exactly which head
+argument that is. Backwards there is no value to enumerate against, so
+`deriveFact` has nothing to bind `H` to.
+
+Seeded rules are the *only* rules with this shape. `validateRuleSafety`
+pre-binds the seed argument's variables and then requires every other head
+variable to be bound by the body, so no other rule can reach over-deletion
+with an unbound head variable. That bounds this project tightly.
+
+Deleting a fact such a rule reads previously reported `UnboundVariable` to the
+caller. As of the fix that closed that defect, `deletionBlocked` sends the
+whole stratum to a dirty-stratum rebuild instead. Rederivation needs no
+equivalent work and is already correct: `hasAlternativeDerivation` unifies a
+complete candidate fact against the head, which binds the seed like any other
+head variable.
+
+This phase asks whether that rebuild can be replaced by incremental deletion.
+
+### Scope
+
+- Replace head *construction* with head *enumeration* for a pinned body match
+  of a seeded rule: produce every head tuple consistent with the body binding
+  rather than the single tuple `deriveFact` would build.
+- Choose between two candidate sources and record why, since they differ in
+  cost rather than in result:
+  - **Closure lookup.** Over-deletion only ever acts on head tuples that are
+    in the closure — `overdeleteOccurrence` already discards a constructed
+    head that is absent — so look the candidates up through the existing
+    pattern indexes on the head predicate, using the head arguments the body
+    binding fixes, and unify each against the head term. This needs no new
+    storage and narrows candidates to facts that exist.
+  - **Value-table enumeration.** Mirror forward evaluation: unify interned
+    values against `head.terms[seed_argument]` under the body binding, which
+    constrains them to structures whose tail is the bound one. This scans a
+    monotone table that never shrinks, so it needs a structural index on the
+    value table to be affordable.
+  Closure lookup is the expected answer; the value-table form is recorded
+  because it is the direct inverse of forward evaluation and is the fallback
+  if a head is found that closure lookup cannot constrain.
+- Narrow or remove the seeded-rule guard in `deletionBlocked` once candidates
+  can be enumerated, keeping the rest of that predicate intact.
+- Leave rederivation, aggregate maintenance, and the insertion path untouched.
+- Let the maintenance cost model choose as it does for every other update; do
+  not force incrementality when the estimate prefers recomputation.
+- Preserve per-batch atomicity: a failure during enumeration must leave base
+  facts, closure, indexes, and auxiliary views unchanged.
+
+### Acceptance tests
+
+- Deleting the base case of a structural recursion removes every derived fact
+  of the chain, matches a clean rebuild, and records no rebuild fallback.
+- A chain fact with an alternative proof survives the deletion of one support,
+  and one without it does not.
+- A rule with several seeded body occurrences, and mutually recursive seeded
+  rules, over-delete every affected head exactly once.
+- A seeded rule consuming lists interned by a higher stratum — the existing
+  aggregate-plus-`length` case — stays correct with the fallback assertion
+  inverted to require incremental maintenance.
+- Randomized mixed traces over a program combining structural recursion,
+  negation, and aggregation match a clean rebuild after every batch under
+  shadow verification.
+- Allocation-failure tests cover candidate enumeration and rollback.
+
+### Measurement gate
+
+This phase may reasonably conclude that the rebuild fallback should stay, and
+that outcome must be recorded rather than worked around.
+
+Deleting the base case of a structural recursion invalidates the derived facts
+of *every* interned structure, so the over-deletion set can approach the whole
+relation while a stratum rebuild costs one expansion. The benchmark must
+therefore compare incremental deletion against the fallback on both shapes:
+deleting a leaf of a deep structure, where few facts are affected, and deleting
+the base case, where nearly all are. Report over-deleted and rederived counts
+alongside time, so a win can be attributed to the algorithm rather than to the
+workload.
+
+### Session boundary
+
+Stop when deletion through seeded structural rules is either incremental and
+rebuild-equivalent, or measured to be slower than the fallback with the numbers
+and the decision recorded here. Do not extend the work into indexing the value
+table unless closure lookup has been shown insufficient.
+
+### Open questions for the phase
+
+- Can the head arguments a body binding fixes always constrain the closure
+  lookup enough, or are there seeded rules whose head shares no bound argument
+  with the body?
+- Does anything else want a structural index on the value table — forward seed
+  application currently scans it once per rule per round — or would this be its
+  only consumer?
+
 # Project F: query folding
 
 Query folding is a planner feature, not a transparent evaluator optimization.
@@ -988,13 +1100,14 @@ Use one session and one commit per phase unless a phase proves too large:
 9. M4 aggregate group maintenance
 10. M5 projected views and CReaM counts
 11. M6 downstream propagation and public API
-12. P3 join planning and aggregate lookup
-13. F1 folding IR and view catalog
-14. F2 ordinary Inverse Method
-15. F3 conjunctive aggregate inversion
-16. F4 soundness restrictions
-17. F5 list functions and dependency chase
-18. F6 execution and view selection
+12. M7 deletion through seeded structural rules
+13. P3 join planning and aggregate lookup
+14. F1 folding IR and view catalog
+15. F2 ordinary Inverse Method
+16. F3 conjunctive aggregate inversion
+17. F4 soundness restrictions
+18. F5 list functions and dependency chase
+19. F6 execution and view selection
 
 P3 may move earlier if profiling shows join scans dominate M-project test runs.
 F1–F5 may run in parallel with M2–M6 in separate branches because they share
