@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const materialization = @import("materialization.zig");
 const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 const maintenance = @import("maintenance.zig");
@@ -124,8 +125,8 @@ pub fn maintainAggregates(db: *Jatalog, touched: *RelationStore) !void {
         round += 1;
         if (round > round_cap) {
             db.rebuild_fallbacks += 1;
-            db.markDirty(0);
-            return db.ensureMaterialized();
+            materialization.markDirty(db, 0);
+            return materialization.ensureMaterialized(db);
         }
         var removals: RelationStore = .init(db.allocator);
         defer removals.deinit();

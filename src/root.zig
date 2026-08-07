@@ -1,7 +1,7 @@
 //! A small, embeddable Datalog engine modeled after Jatalog.
 const std = @import("std");
 pub const input = @import("input.zig");
-const input_compiler = @import("input_compiler.zig");
+const errors = @import("errors.zig");
 const relation_store = @import("relation_store.zig");
 const cost_model = @import("cost_model.zig");
 const syntax = @import("syntax.zig");
@@ -11,27 +11,17 @@ const test_support = @import("test_support.zig");
 const parser_mod = @import("parser.zig");
 const expectBindingValue = test_support.expectBindingValue;
 const maintenance = @import("maintenance.zig");
+const compile = @import("compile.zig");
+const materialization = @import("materialization.zig");
+const validation = @import("validation.zig");
 const aggregate_view = @import("aggregate_view.zig");
-pub const Error = error{
-    InvalidFact,
-    InvalidRule,
-    InvalidQuery,
-    InvalidTerm,
-    InvalidSyntax,
-    NotStratified,
-    UnboundVariable,
-    UnknownOperator,
-    NumericType,
-    NumericOverflow,
-    NotAdmissible,
-    UnknownVariable,
-    TypeMismatch,
-    /// Shadow verification found the maintained closure disagreeing with a
-    /// fresh rebuild. Only reachable with `setShadowVerification(true)`.
-    MaintenanceMismatch,
-};
 
+/// Re-exported so embedders name one error set, whichever layer produced it.
+pub const Error = errors.Error;
 const Fact = relation_store.Fact;
+const StringTable = compile.StringTable;
+const InputBuilder = compile.InputBuilder;
+const Materialization = materialization.Materialization;
 const AuxiliaryView = aggregate_view.AuxiliaryView;
 const StratumImpact = maintenance.StratumImpact;
 const copyFactInto = relation_store.copyFactInto;
@@ -97,92 +87,6 @@ const CostModel = cost_model.CostModel;
 pub const MaintenancePolicy = cost_model.MaintenancePolicy;
 const PredicateKey = relation_store.PredicateKey;
 const RelationStore = relation_store.RelationStore;
-
-/// Interns predicate and variable symbols used by a database. IDs are
-/// insertion indexes, which makes `resolve` a reverse lookup into the ordered
-/// keys of the same StringArrayHashMapUnmanaged.
-const StringTable = struct {
-    allocator: std.mem.Allocator,
-    strings: std.StringArrayHashMapUnmanaged(Id) = .empty,
-
-    fn init(allocator: std.mem.Allocator) StringTable {
-        return .{ .allocator = allocator };
-    }
-
-    fn deinit(self: *StringTable) void {
-        for (self.strings.keys()) |string| self.allocator.free(string);
-        self.strings.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    fn clone(self: *const StringTable) !StringTable {
-        var result: StringTable = .init(self.allocator);
-        errdefer result.deinit();
-        for (self.strings.keys()) |string| _ = try result.intern(string);
-        return result;
-    }
-
-    pub fn intern(self: *StringTable, string: []const u8) !Id {
-        if (self.strings.get(string)) |id| return id;
-        const owned = try self.allocator.dupe(u8, string);
-        errdefer self.allocator.free(owned);
-        const id: Id = @intCast(self.strings.count());
-        try self.strings.putNoClobber(self.allocator, owned, id);
-        return id;
-    }
-
-    pub fn get(self: *const StringTable, string: []const u8) ?Id {
-        return self.strings.get(string);
-    }
-
-    fn resolve(self: *const StringTable, id: Id) []const u8 {
-        return self.strings.keys()[@intCast(id)];
-    }
-};
-
-const InputBuilder = struct {
-    database: *Jatalog,
-
-    pub fn allocator(self: *InputBuilder) std.mem.Allocator {
-        return self.database.allocator;
-    }
-
-    pub fn nilTerm(_: *InputBuilder) Term { // ziglint-ignore: Z012
-        return .nil;
-    }
-
-    pub fn atomTerm(self: *InputBuilder, atom: []const u8) !Term { // ziglint-ignore: Z012
-        return .{ .scalar = try self.database.eval.scalars.internAtom(atom) };
-    }
-
-    pub fn integerTerm(self: *InputBuilder, integer: i64) !Term { // ziglint-ignore: Z012
-        return .{ .scalar = try self.database.eval.scalars.internInteger(integer) };
-    }
-
-    pub fn floatTerm(self: *InputBuilder, float: f64) !Term { // ziglint-ignore: Z012
-        return .{ .scalar = try self.database.eval.scalars.internFloat(float) };
-    }
-
-    pub fn variableTerm(self: *InputBuilder, name: []const u8) !Term { // ziglint-ignore: Z012
-        return .{ .variable = try self.database.strings.intern(name) };
-    }
-
-    pub fn consTerm(self: *InputBuilder, head: Term, tail: Term) !Term { // ziglint-ignore: Z012
-        const pair = try self.database.allocator.create(Term.Cons);
-        pair.* = .{ .head = head, .tail = tail };
-        return .{ .cons = pair };
-    }
-
-    pub fn releaseTerm(self: *InputBuilder, term: Term) void { // ziglint-ignore: Z012
-        freeTerm(self.database.allocator, term);
-    }
-};
-
-const Materialization = union(enum) {
-    uninitialized,
-    clean,
-    dirty_from_stratum: usize,
-};
 
 pub const MaintenanceStats = struct {
     closure_facts: usize,
@@ -322,7 +226,9 @@ pub const Jatalog = struct {
         // knows exactly how many base facts it changes: the estimate the
         // model decides on and the count it later measures are the same.
         const delta = removed.len();
-        const maintain = committed.canMaintain() and
+        const maintain = materialization.canMaintain(
+            &committed,
+        ) and
             committed.eval.cost.decide(delta) == .maintain;
         if (maintain and delta > 0) {
             const span = committed.eval.cost.begin();
@@ -336,17 +242,19 @@ pub const Jatalog = struct {
         } else {
             for (0..removed.len()) |position| {
                 const fact = removed.factAt(position);
-                try committed.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+                try materialization.markBaseChanged(&committed, .{ .name = fact.predicate, .arity = fact.terms.len });
             }
         }
-        try committed.verifyShadow();
+        try materialization.verifyShadow(
+            &committed,
+        );
         self.commit(&committed);
     }
 
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const input.Term) !void {
         var staging = try self.clone();
         defer staging.deinit();
-        const expression = try staging.compileRelation(predicate, terms, false);
+        const expression = try compile.compileRelation(&staging, predicate, terms, false);
         defer freeExpr(staging.allocator, expression);
         try staging.addFactExpr(expression);
         self.commit(&staging);
@@ -356,12 +264,12 @@ pub const Jatalog = struct {
         var staging = try self.clone();
         defer staging.deinit();
         const compiled_head = switch (head) {
-            .relation => |relation| try staging.compileRelation(relation.predicate, relation.terms, false),
+            .relation => |relation| try compile.compileRelation(&staging, relation.predicate, relation.terms, false),
             else => return Error.InvalidRule,
         };
         var head_owned = true;
         defer if (head_owned) freeExpr(staging.allocator, compiled_head);
-        const compiled_body = try staging.compileGoals(body);
+        const compiled_body = try compile.compileGoals(&staging, body);
         var body_owned = true;
         defer {
             if (body_owned) for (compiled_body) |clause| freeClauseTree(staging.allocator, clause);
@@ -374,10 +282,12 @@ pub const Jatalog = struct {
     }
 
     pub fn query(self: *Jatalog, goals: []const input.Goal) !QueryResult {
-        try self.ensureMaterialized();
+        try materialization.ensureMaterialized(
+            self,
+        );
         var staging = try self.clone();
         defer staging.deinit();
-        const compiled = try staging.compileGoals(goals);
+        const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
@@ -386,10 +296,12 @@ pub const Jatalog = struct {
     }
 
     pub fn retract(self: *Jatalog, goals: []const input.Goal) !bool {
-        try self.ensureMaterialized();
+        try materialization.ensureMaterialized(
+            self,
+        );
         var staging = try self.clone();
         defer staging.deinit();
-        const compiled = try staging.compileGoals(goals);
+        const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
@@ -422,7 +334,9 @@ pub const Jatalog = struct {
         var staging = try self.clone();
         defer staging.deinit();
         const changed = try staging.applyChangesCompiled(insertions, deletions);
-        try staging.verifyShadow();
+        try materialization.verifyShadow(
+            &staging,
+        );
         if (changed) self.commit(&staging);
         return changed;
     }
@@ -434,8 +348,12 @@ pub const Jatalog = struct {
     pub fn materialize(self: *Jatalog) !void {
         var staging = try self.clone();
         defer staging.deinit();
-        try staging.ensureMaterialized();
-        try staging.verifyShadow();
+        try materialization.ensureMaterialized(
+            &staging,
+        );
+        try materialization.verifyShadow(
+            &staging,
+        );
         self.commit(&staging);
     }
 
@@ -454,7 +372,9 @@ pub const Jatalog = struct {
             &staging,
         );
         staging.materialization = .uninitialized;
-        try staging.ensureMaterialized();
+        try materialization.ensureMaterialized(
+            &staging,
+        );
         self.commit(&staging);
     }
 
@@ -474,28 +394,6 @@ pub const Jatalog = struct {
         self.eval.cost.policy = policy;
     }
 
-    /// Whether the closure is in a state incremental maintenance can start
-    /// from. A dirty closure has to be repaired regardless of cost, so the
-    /// cost model is consulted only when this holds.
-    fn canMaintain(self: *const Jatalog) bool {
-        return self.closure != null and self.materialization == .clean;
-    }
-
-    /// Compares the maintained closure against a rebuild performed on a
-    /// throwaway copy, so verification never disturbs this database.
-    fn verifyShadow(self: *Jatalog) !void {
-        if (!self.shadow_verification) return;
-        const closure = if (self.closure) |*value| value else return;
-        var staging = try self.clone();
-        defer staging.deinit();
-        var reference = try staging.facts.clone();
-        defer reference.deinit();
-        try staging.eval.expandNaive(&reference);
-        if (reference.len() != closure.len()) return Error.MaintenanceMismatch;
-        for (0..reference.len()) |index|
-            if (!try closure.contains(reference.factAt(index))) return Error.MaintenanceMismatch;
-    }
-
     fn applyChangesCompiled(
         self: *Jatalog,
         insertions: []const input.Relation,
@@ -504,7 +402,9 @@ pub const Jatalog = struct {
         // Both phases follow the one decision. The batch size is only an
         // estimate of the work ahead; what it actually changed is measured
         // afterwards.
-        const maintain = self.canMaintain() and
+        const maintain = materialization.canMaintain(
+            self,
+        ) and
             self.eval.cost.decide(insertions.len + deletions.len) == .maintain;
         const span = self.eval.cost.begin();
 
@@ -537,9 +437,9 @@ pub const Jatalog = struct {
         defer removed.deinit();
         var count: usize = 0;
         for (deletions) |relation| {
-            const expression = try self.compileRelation(relation.predicate, relation.terms, false);
+            const expression = try compile.compileRelation(self, relation.predicate, relation.terms, false);
             defer freeExpr(self.allocator, expression);
-            if (!expression.isGround()) return Error.InvalidFact;
+            if (!expression.isGround()) return error.InvalidFact;
             const terms = try self.allocator.alloc(ValueId, expression.terms.len);
             defer self.allocator.free(terms);
             for (expression.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
@@ -549,7 +449,7 @@ pub const Jatalog = struct {
             if (maintain) {
                 try copyFactInto(self.allocator, &removed, fact, false);
             } else {
-                try self.markBaseChanged(.{ .name = fact.predicate, .arity = terms.len });
+                try materialization.markBaseChanged(self, .{ .name = fact.predicate, .arity = terms.len });
             }
         }
         // `removed` is only populated while maintaining. Delete-and-rederive
@@ -585,7 +485,7 @@ pub const Jatalog = struct {
         const batch_start = if (maintain) self.closure.?.len() else 0;
         var count: usize = 0;
         for (insertions) |relation| {
-            const expression = try self.compileRelation(relation.predicate, relation.terms, false);
+            const expression = try compile.compileRelation(self, relation.predicate, relation.terms, false);
             defer freeExpr(self.allocator, expression);
             if (try self.applyInsertion(expression, maintain)) count += 1;
         }
@@ -598,78 +498,6 @@ pub const Jatalog = struct {
         return count;
     }
 
-    fn compileRelation(
-        self: *Jatalog,
-        predicate: []const u8,
-        descriptors: []const input.Term,
-        negated: bool,
-    ) !Expr {
-        if (predicate.len == 0) return Error.InvalidTerm;
-        var builder: InputBuilder = .{ .database = self };
-        return .{
-            .predicate = try self.strings.intern(predicate),
-            .terms = try input_compiler.compileTerms(&builder, descriptors),
-            .negated = negated,
-        };
-    }
-
-    fn compileGoals(self: *Jatalog, descriptors: []const input.Goal) anyerror![]Clause {
-        try input_compiler.validateGoals(self.allocator, descriptors);
-        return self.compileGoalsValidated(descriptors);
-    }
-
-    fn compileGoalsValidated(self: *Jatalog, descriptors: []const input.Goal) anyerror![]Clause {
-        const clauses = try self.allocator.alloc(Clause, descriptors.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (clauses[0..initialized]) |clause| freeClauseTree(self.allocator, clause);
-            self.allocator.free(clauses);
-        }
-        for (descriptors, clauses) |descriptor, *clause| {
-            clause.* = try self.compileGoalValidated(descriptor);
-            initialized += 1;
-        }
-        return clauses;
-    }
-
-    fn compileGoalValidated(self: *Jatalog, descriptor: input.Goal) anyerror!Clause {
-        return switch (descriptor) {
-            .relation => |relation| .{
-                .relational = try self.compileRelation(relation.predicate, relation.terms, false),
-            },
-            .negation => |relation| .{ .negated = try self.compileRelation(relation.predicate, relation.terms, true) },
-            .equality => |binary| .{ .builtin = try self.compileBuiltin(.equality, &.{ binary.left, binary.right }) },
-            .inequality => |binary| .{
-                .builtin = try self.compileBuiltin(.inequality, &.{ binary.left, binary.right }),
-            },
-            .comparison => |comparison| .{ .builtin = try self.compileBuiltin(switch (comparison.kind) {
-                .less_than => .less_than,
-                .less_or_equal => .less_or_equal,
-                .greater_than => .greater_than,
-                .greater_or_equal => .greater_or_equal,
-            }, &.{ comparison.operands.left, comparison.operands.right }) },
-            .arithmetic => |arithmetic| .{ .builtin = try self.compileBuiltin(switch (arithmetic.kind) {
-                .add => .add,
-                .subtract => .subtract,
-            }, &.{ arithmetic.output, arithmetic.left, arithmetic.right }) },
-            .aggregate => |aggregate| blk: {
-                var builder: InputBuilder = .{ .database = self };
-                const template = try input_compiler.compileTerm(&builder, aggregate.template);
-                errdefer freeTerm(self.allocator, template);
-                const output = try input_compiler.compileTerm(&builder, aggregate.output);
-                errdefer freeTerm(self.allocator, output);
-                const body = try self.compileGoalsValidated(aggregate.body);
-                break :blk .{ .aggregate = .{ .template = template, .body = body, .output = output } };
-            },
-        };
-    }
-
-    fn compileBuiltin(self: *Jatalog, kind: GoalKind, terms: []const input.Term) !Expr {
-        var result = try self.compileRelation(goalOperator(kind), terms, false);
-        result.kind = kind;
-        return result;
-    }
-
     pub fn addFactExpr(self: *Jatalog, value: Expr) !void {
         _ = try self.applyInsertion(value, false);
     }
@@ -678,7 +506,7 @@ pub const Jatalog = struct {
     /// joins the clean closure for incremental propagation; otherwise the
     /// first dependent stratum is marked dirty for the lazy rebuild path.
     fn applyInsertion(self: *Jatalog, value: Expr, propagate: bool) !bool {
-        if (!value.isGround() or value.negated) return Error.InvalidFact;
+        if (!value.isGround() or value.negated) return error.InvalidFact;
         const terms = try self.allocator.alloc(ValueId, value.terms.len);
         var terms_owned = true;
         errdefer if (terms_owned) self.allocator.free(terms);
@@ -691,7 +519,7 @@ pub const Jatalog = struct {
         if (propagate) {
             try copyFactInto(self.allocator, &self.closure.?, fact, false);
         } else {
-            try self.markBaseChanged(key);
+            try materialization.markBaseChanged(self, key);
         }
         return true;
     }
@@ -700,8 +528,8 @@ pub const Jatalog = struct {
     /// database owns `head` and every clause in `body`; on failure the caller
     /// retains ownership. The body slice itself is only borrowed.
     pub fn addRuleClauses(self: *Jatalog, head: Expr, body: []const Clause) !void {
-        const seed_argument = try self.validateRule(head, body);
-        const owned_body = try self.orderClauses(body);
+        const seed_argument = try validation.validateRule(self, head, body);
+        const owned_body = try validation.orderClauses(self, body);
         errdefer self.allocator.free(owned_body);
         const id = self.eval.next_rule_id;
         self.eval.next_rule_id += 1;
@@ -711,20 +539,26 @@ pub const Jatalog = struct {
             .body = owned_body,
             .seed_argument = seed_argument,
         });
-        self.validateRecursiveArithmetic() catch |err| {
+        validation.validateRecursiveArithmetic(
+            self,
+        ) catch |err| {
             _ = self.eval.rules.pop();
             return err;
         };
-        self.validateStratification() catch |err| {
+        validation.validateStratification(
+            self,
+        ) catch |err| {
             _ = self.eval.rules.pop();
             return err;
         };
-        self.invalidateAnalysis();
+        materialization.invalidateAnalysis(
+            self,
+        );
         if (self.closure != null) {
             // Lazy rebuild policy for rule additions: invalidate from the new
             // head's stratum now, rebuild at the next evaluation.
             const analysis = try self.eval.ensureAnalysis();
-            self.markDirty(analysis.strata.get(predicateKey(head)) orelse 0);
+            materialization.markDirty(self, analysis.strata.get(predicateKey(head)) orelse 0);
         }
     }
 
@@ -741,20 +575,22 @@ pub const Jatalog = struct {
     }
 
     fn evaluateClauses(self: *Jatalog, goals: []const Clause) !std.ArrayList(Binding) {
-        if (goals.len == 0) return Error.InvalidQuery;
+        if (goals.len == 0) return error.InvalidQuery;
         var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
         for (goals) |clause| try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
         var bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
         defer bound.deinit(self.allocator);
-        const ordered = try self.orderClauses(goals);
+        const ordered = try validation.orderClauses(self, goals);
         defer self.allocator.free(ordered);
         for (ordered) |clause|
-            try self.validateClause(clause, &bound, &outer_variables, Error.InvalidQuery);
+            try validation.validateClause(self, clause, &bound, &outer_variables, Error.InvalidQuery);
 
-        try self.ensureMaterialized();
+        try materialization.ensureMaterialized(
+            self,
+        );
         const values_before = self.eval.values.values.items.len;
-        for (goals) |clause| try self.internGroundStructuresInClause(clause);
+        for (goals) |clause| try compile.internGroundStructuresInClause(self, clause);
         if (self.eval.values.values.items.len != values_before) {
             // Novel ground query structures must join the seed set of
             // admissible structural recursion, so derive their consequences
@@ -772,7 +608,9 @@ pub const Jatalog = struct {
         }
         var initial: Binding = .{};
         defer initial.deinit(self.allocator);
-        try self.eval.matchClauses(ordered, self.closureStore(), 0, &initial, &internal_answers, null);
+        try self.eval.matchClauses(ordered, materialization.closureStore(
+            self,
+        ), 0, &initial, &internal_answers, null);
         return internal_answers;
     }
 
@@ -866,360 +704,8 @@ pub const Jatalog = struct {
         return parser.executeAll();
     }
 
-    fn closureStore(self: *Jatalog) *RelationStore {
-        if (self.closure) |*closure| return closure;
-        return &self.facts;
-    }
-
-    /// Drops everything derived from the rule set: the evaluator's cached
-    /// stratification and the auxiliary views built from it.
-    fn invalidateAnalysis(self: *Jatalog) void {
-        self.eval.invalidateAnalysis();
-        aggregate_view.dropAuxiliaryViews(
-            self,
-        );
-    }
-
-    pub fn markDirty(self: *Jatalog, level: usize) void {
-        switch (self.materialization) {
-            .uninitialized => {},
-            .clean => self.materialization = .{ .dirty_from_stratum = level },
-            .dirty_from_stratum => |existing| self.materialization = .{
-                .dirty_from_stratum = @min(existing, level),
-            },
-        }
-    }
-
-    /// Marks the first stratum that depends on a changed base predicate as
-    /// dirty. A predicate no rule reads dirties the level past the last
-    /// stratum, so the rebuild refreshes only the closure's base partition.
-    fn markBaseChanged(self: *Jatalog, key: PredicateKey) !void {
-        if (self.closure == null) return;
-        const analysis = try self.eval.ensureAnalysis();
-        self.markDirty(analysis.first_dependent.get(key) orelse analysis.max_level + 1);
-    }
-
-    /// Builds or refreshes the persistent closure. Materialization is lazy:
-    /// a database whose rule set is empty never allocates derived-state
-    /// machinery, and a dirty closure is rebuilt from its first dirty
-    /// stratum, reusing the derived facts of every stratum below it. On
-    /// failure the previous closure and state remain installed; values
-    /// interned by the aborted expansion stay in the value table and are
-    /// reclaimed at deinit.
-    pub fn ensureMaterialized(self: *Jatalog) !void {
-        if (self.eval.rules.items.len == 0) return;
-        const from_level: usize = switch (self.materialization) {
-            .clean => return,
-            .uninitialized => 0,
-            .dirty_from_stratum => |level| level,
-        };
-        // Only a dirty-stratum rebuild is the alternative an update chooses
-        // against. The first full build from `uninitialized` is a different
-        // and much larger operation, so recording it would permanently
-        // overstate what recomputation costs.
-        const repairs_update = self.materialization == .dirty_from_stratum;
-        const span = self.eval.cost.begin();
-        const closure = try self.buildClosure(from_level);
-        if (self.closure) |*old| old.deinit();
-        self.closure = closure;
-        self.materialization = .clean;
-        try aggregate_view.rebuildAuxiliaryViews(
-            self,
-        );
-        // This also runs as the fallback inside a maintenance attempt, where
-        // claiming the work keeps it out of the maintenance estimate.
-        if (repairs_update) self.eval.cost.noteRebuild(span);
-    }
-
-    fn buildClosure(self: *Jatalog, from_level: usize) !RelationStore {
-        var closure = try self.facts.clone();
-        errdefer closure.deinit();
-        if (from_level > 0) {
-            const analysis = try self.eval.ensureAnalysis();
-            if (self.closure) |*old| {
-                for (0..old.len()) |index| {
-                    if (!old.isDerived(index)) continue;
-                    const fact = old.factAt(index);
-                    const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
-                    if ((analysis.strata.get(key) orelse 0) >= from_level) continue;
-                    try copyFactInto(self.allocator, &closure, fact, true);
-                }
-            }
-        }
-        try self.eval.expandFrom(&closure, from_level);
-        return closure;
-    }
-
-    pub fn expand(self: *Jatalog, facts: *RelationStore) !void {
-        try self.eval.expandFrom(facts, 0);
-    }
-
     // Structural recursion is seeded from interned values during expansion, so
     // ground structures supplied by a query must join that seed set first.
-    fn internGroundStructuresInExpr(self: *Jatalog, expression: Expr) !void {
-        for (expression.terms) |term| try self.internGroundStructuresInTerm(term);
-    }
-
-    fn internGroundStructuresInClause(self: *Jatalog, clause: Clause) !void {
-        switch (clause) {
-            .relational, .builtin, .negated => |expression| try self.internGroundStructuresInExpr(expression),
-            .aggregate => |aggregate| {
-                try self.internGroundStructuresInTerm(aggregate.template);
-                for (aggregate.body) |body_clause|
-                    try self.internGroundStructuresInClause(body_clause);
-                try self.internGroundStructuresInTerm(aggregate.output);
-            },
-        }
-    }
-
-    fn internGroundStructuresInTerm(self: *Jatalog, term: Term) !void {
-        switch (term) {
-            .nil => _ = try self.eval.termToValue(term, null),
-            .cons => |pair| {
-                if (term.isGround()) {
-                    _ = try self.eval.termToValue(term, null);
-                    return;
-                }
-                try self.internGroundStructuresInTerm(pair.head);
-                try self.internGroundStructuresInTerm(pair.tail);
-            },
-            .scalar, .variable => {},
-        }
-    }
-
-    fn validateRule(self: *Jatalog, head: Expr, body: []const Clause) !?usize {
-        if (body.len == 0 or head.negated or isBuiltin(head)) return Error.InvalidRule;
-        const recursive_seed = try admissibleSeedArgument(head, body);
-        var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer outer_variables.deinit(self.allocator);
-        for (head.terms) |term| try collectTermVariables(self.allocator, term, &outer_variables);
-        for (body) |clause| try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
-
-        const ordered = try self.orderClauses(body);
-        defer self.allocator.free(ordered);
-        if (recursive_seed) |seed_argument| {
-            try self.validateRuleSafety(head, ordered, &outer_variables, seed_argument);
-            return seed_argument;
-        }
-        self.validateRuleSafety(head, ordered, &outer_variables, null) catch |err| switch (err) {
-            Error.InvalidRule => {
-                const seed_argument = firstStructuralArgument(head) orelse
-                    return Error.InvalidRule;
-                try self.validateRuleSafety(head, ordered, &outer_variables, seed_argument);
-                return seed_argument;
-            },
-            else => return err,
-        };
-        return null;
-    }
-
-    fn validateRuleSafety(
-        self: *Jatalog,
-        head: Expr,
-        ordered: []const Clause,
-        outer_variables: *const std.AutoHashMapUnmanaged(Id, void),
-        seed_argument: ?usize,
-    ) !void {
-        var bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer bound.deinit(self.allocator);
-        if (seed_argument) |argument|
-            try bindTermVariables(self.allocator, head.terms[argument], &bound);
-        for (ordered) |clause| try self.validateClause(clause, &bound, outer_variables, Error.InvalidRule);
-        for (head.terms) |term| if (!termVariablesBound(term, &bound)) return Error.InvalidRule;
-    }
-
-    fn admissibleSeedArgument(head: Expr, body: []const Clause) !?usize {
-        var seed: ?usize = null;
-        for (body) |clause| {
-            const call = switch (clause) {
-                .relational => |expression| expression,
-                else => continue,
-            };
-            if (call.predicate != head.predicate or call.terms.len != head.terms.len) continue;
-
-            var involves_cons = false;
-            var call_seed: ?usize = null;
-            for (head.terms, call.terms, 0..) |head_term, call_term, index| {
-                if (!termContainsCons(head_term) and !termContainsCons(call_term)) continue;
-                involves_cons = true;
-                if (!termEqual(head_term, call_term) and !isTailDescendant(head_term, call_term))
-                    return Error.NotAdmissible;
-                if (isTailDescendant(head_term, call_term) and call_seed == null) call_seed = index;
-            }
-            if (!involves_cons) continue;
-            const candidate = call_seed orelse return Error.NotAdmissible;
-            if (seed) |existing| {
-                if (existing != candidate) return Error.NotAdmissible;
-            } else seed = candidate;
-        }
-        return seed;
-    }
-
-    fn firstStructuralArgument(head: Expr) ?usize {
-        for (head.terms, 0..) |term, index|
-            if (termContainsCons(term)) return index;
-        return null;
-    }
-
-    fn validateRecursiveArithmetic(self: *Jatalog) !void {
-        for (self.eval.rules.items) |rule| {
-            if (!ruleContainsArithmetic(rule)) continue;
-            const head = predicateKey(rule.head);
-            for (rule.body) |clause| {
-                const expression = switch (clause) {
-                    .relational => |value| value,
-                    else => continue,
-                };
-                var visited: std.AutoHashMapUnmanaged(PredicateKey, void) = .empty;
-                defer visited.deinit(self.allocator);
-                const dependency = predicateKey(expression);
-                const structurally_proven = rule.seed_argument != null and std.meta.eql(dependency, head);
-                if (!structurally_proven and try self.predicateReaches(dependency, head, &visited))
-                    return Error.NotAdmissible;
-            }
-        }
-    }
-
-    fn predicateReaches(
-        self: *Jatalog,
-        current: PredicateKey,
-        target: PredicateKey,
-        visited: *std.AutoHashMapUnmanaged(PredicateKey, void),
-    ) !bool {
-        if (std.meta.eql(current, target)) return true;
-        if (visited.contains(current)) return false;
-        try visited.put(self.allocator, current, {});
-        for (self.eval.rules.items) |rule| {
-            if (!std.meta.eql(predicateKey(rule.head), current)) continue;
-            for (rule.body) |clause| {
-                const expression = switch (clause) {
-                    .relational => |value| value,
-                    else => continue,
-                };
-                if (try self.predicateReaches(predicateKey(expression), target, visited)) return true;
-            }
-        }
-        return false;
-    }
-
-    fn validateClause(
-        self: *Jatalog,
-        clause: Clause,
-        bound: *std.AutoHashMapUnmanaged(Id, void),
-        outer_variables: *const std.AutoHashMapUnmanaged(Id, void),
-        safety_error: anyerror,
-    ) anyerror!void {
-        switch (clause) {
-            .relational => |expression| for (expression.terms) |term|
-                try bindTermVariables(self.allocator, term, bound),
-            .negated => |expression| for (expression.terms) |term|
-                if (!termVariablesBound(term, bound)) return safety_error,
-            .builtin => |expression| {
-                if (isArithmetic(expression)) {
-                    if (expression.terms.len != 3 or
-                        !termVariablesBound(expression.terms[1], bound) or
-                        !termVariablesBound(expression.terms[2], bound)) return safety_error;
-                    try bindTermVariables(self.allocator, expression.terms[0], bound);
-                    return;
-                }
-                if (expression.terms.len != 2) return safety_error;
-                const a_bound = termVariablesBound(expression.terms[0], bound);
-                const b_bound = termVariablesBound(expression.terms[1], bound);
-                if (expression.kind == .equality and !expression.negated) {
-                    if (!a_bound and !b_bound) return safety_error;
-                    try bindTermVariables(self.allocator, expression.terms[0], bound);
-                    try bindTermVariables(self.allocator, expression.terms[1], bound);
-                } else if (!a_bound or !b_bound) return safety_error;
-            },
-            .aggregate => |aggregate| {
-                try self.validateAggregate(aggregate, bound, outer_variables, safety_error);
-                try bindTermVariables(self.allocator, aggregate.output, bound);
-            },
-        }
-    }
-
-    fn validateAggregate(
-        self: *Jatalog,
-        aggregate: Aggregate,
-        outer_bound: *const std.AutoHashMapUnmanaged(Id, void),
-        outer_variables: *const std.AutoHashMapUnmanaged(Id, void),
-        safety_error: anyerror,
-    ) anyerror!void {
-        if (aggregate.body.len == 0) return safety_error;
-        var inner_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer inner_variables.deinit(self.allocator);
-        try collectTermVariables(self.allocator, aggregate.template, &inner_variables);
-        for (aggregate.body) |clause| try collectClauseAllVariables(self.allocator, clause, &inner_variables);
-
-        var inner_bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer inner_bound.deinit(self.allocator);
-        var iterator = inner_variables.keyIterator();
-        while (iterator.next()) |variable| {
-            if (!outer_variables.contains(variable.*)) continue;
-            if (!outer_bound.contains(variable.*)) return safety_error;
-            try inner_bound.put(self.allocator, variable.*, {});
-        }
-
-        var inner_outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
-        defer inner_outer_variables.deinit(self.allocator);
-        try collectTermVariables(self.allocator, aggregate.template, &inner_outer_variables);
-        for (aggregate.body) |clause|
-            try collectClauseSurfaceVariables(self.allocator, clause, &inner_outer_variables);
-
-        const ordered = try self.orderClauses(aggregate.body);
-        defer self.allocator.free(ordered);
-        for (ordered) |clause|
-            try self.validateClause(clause, &inner_bound, &inner_outer_variables, safety_error);
-        if (!termVariablesBound(aggregate.template, &inner_bound)) return safety_error;
-    }
-
-    fn orderClauses(self: *Jatalog, clauses: []const Clause) ![]Clause {
-        const result = try self.allocator.alloc(Clause, clauses.len);
-        var index: usize = 0;
-        for (clauses) |clause| switch (clause) {
-            .relational => {
-                result[index] = clause;
-                index += 1;
-            },
-            .builtin => |expression| if (!expression.negated and expression.kind == .equality) {
-                result[index] = clause;
-                index += 1;
-            },
-            else => {},
-        };
-        for (clauses) |clause| switch (clause) {
-            .builtin => |expression| {
-                if (isArithmetic(expression)) {
-                    result[index] = clause;
-                    index += 1;
-                }
-            },
-            else => {},
-        };
-        for (clauses) |clause| if (clause == .aggregate) {
-            result[index] = clause;
-            index += 1;
-        };
-        for (clauses) |clause| switch (clause) {
-            .negated => {
-                result[index] = clause;
-                index += 1;
-            },
-            .builtin => |expression| if (expression.negated or
-                (expression.kind != .equality and !isArithmetic(expression)))
-            {
-                result[index] = clause;
-                index += 1;
-            },
-            else => {},
-        };
-        return result;
-    }
-
-    fn validateStratification(self: *Jatalog) !void {
-        var levels = try self.eval.computeStrata();
-        levels.deinit(self.allocator);
-    }
 
     pub fn deleteClauses(self: *Jatalog, goals: []const Clause) !bool {
         var answers = try self.evaluateClauses(goals);
@@ -1251,7 +737,7 @@ pub const Jatalog = struct {
         std.mem.sort(usize, to_remove.items, {}, std.sort.desc(usize));
         for (to_remove.items) |index| {
             const fact = self.facts.factAt(index);
-            try self.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+            try materialization.markBaseChanged(self, .{ .name = fact.predicate, .arity = fact.terms.len });
             self.facts.removeAt(index);
         }
         return to_remove.items.len > 0;
@@ -1324,7 +810,7 @@ pub const Statement = struct {
     /// shares its value identifiers and evaluation never expands.
     pub fn begin(database: *Jatalog, kind: Kind) !Statement {
         switch (kind) {
-            .query, .retraction => try database.ensureMaterialized(),
+            .query, .retraction => try materialization.ensureMaterialized(database),
             .assertion, .end => {},
         }
         return .{ .database = database, .staging = try database.clone() };
@@ -1401,15 +887,6 @@ test "negative recursion is rejected" {
     ));
 }
 
-test "a parse error after a query releases the previous result" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expectError(Error.InvalidSyntax, db.execute(
-        \\p(a). p(X)?
-        \\bad(X) :- q(X), X <>.
-    ));
-}
-
 test {
     _ = relation_store;
     _ = cost_model;
@@ -1420,6 +897,7 @@ test {
     _ = aggregate_view;
     _ = test_support;
     _ = parser_mod;
+    _ = validation;
 }
 
 test "repeated queries reuse the persistent closure without expansion" {
@@ -1697,19 +1175,6 @@ test "lists round trip through queries and nested terms unify structurally" {
     try expectBindingValue(&result.query.answers.items[0], "X", "[a, [b, []]]");
 }
 
-test "head tail patterns work in rules and cons syntax is equivalent" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\items(cons(a, cons(b, []))).
-        \\tail(T) :- items(H!T).
-        \\tail(X)?
-    );
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "X", "[b]");
-}
-
 test "repeated variables inside structures enforce equality" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -1733,17 +1198,6 @@ test "facts reject variables at every structural depth" {
     try expectBindingValue(&result.query.answers.items[0], "X", "cons(a, b)");
 }
 
-test "structural equality binds variables recursively and parse errors clean up" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute("seed(a). seed(X), [X] = [a]?");
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
-
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("broken([a, [b])."));
-}
-
 test "ground values have a deterministic structural total order" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -1757,29 +1211,6 @@ test "ground values have a deterministic structural total order" {
         &result.query.answers.items[0],
         "S",
         "[-2, 2, 10, '1', a, z, [], [-1], cons(a, z), [a], [a, b]]",
-    );
-}
-
-fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\items([a, [b], c]).
-        \\tail(T) :- items(H!T).
-        \\tail([X, c])?
-    );
-    defer result.deinit();
-    const value = try result.query.answers.items[0].getValue("X");
-    const formatted = try value.formatAlloc(allocator);
-    defer allocator.free(formatted);
-    try std.testing.expectEqualStrings("[b]", formatted);
-}
-
-test "structural parsing and evaluation release every allocation on failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        structuralAllocationScenario,
-        .{},
     );
 }
 
@@ -2028,30 +1459,6 @@ test "aggregate evaluation releases every allocation on failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         aggregateEvaluationAllocationScenario,
-        .{},
-    );
-}
-
-fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: Jatalog = .init(allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\seed(k).
-        \\nested(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
-    );
-    result.deinit();
-    var malformed = db.execute("broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.") catch |err| switch (err) {
-        Error.InvalidSyntax => return,
-        else => return err,
-    };
-    malformed.deinit();
-    return error.ExpectedInvalidSyntax;
-}
-
-test "aggregate parser errors release all partial clause trees" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        aggregateAllocationScenario,
         .{},
     );
 }
@@ -2434,122 +1841,6 @@ test "public source interface canonicalizes the complete i64 domain" {
 
     try std.testing.expectError(Error.NumericOverflow, db.execute("number(9223372036854775808)."));
     try std.testing.expectError(Error.NumericOverflow, db.execute("number(-9223372036854775809)."));
-}
-
-test "quoted numeric atoms remain distinct from numeric scalars" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
-    defer result.deinit();
-    try expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
-
-    var inequality = try db.execute("1 = '1'?");
-    defer inequality.deinit();
-    try std.testing.expectEqual(@as(usize, 0), inequality.query.answers.items.len);
-
-    var quoted_float = try db.execute("1000 = '1e3'?");
-    defer quoted_float.deinit();
-    try std.testing.expectEqual(@as(usize, 0), quoted_float.query.answers.items.len);
-
-    var nested = try db.execute("nested([1]). nested(['1']). nested([1.0]). nested([1])?");
-    defer nested.deinit();
-    try std.testing.expectEqual(@as(usize, 1), nested.query.answers.items.len);
-
-    var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
-    defer quoted_setof.deinit();
-    try expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
-
-    var arithmetic = try db.execute("01 = +0 + 1?");
-    defer arithmetic.deinit();
-    try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
-
-    try std.testing.expectError(Error.NumericType, db.execute("value(X), X < 2?"));
-}
-
-test "float literals parse and integral values canonicalize to integers" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\value(2.5). value(0.5). value(-0.025). value(1.0).
-        \\value(1). value(1e0). value(1e3). value(-0.0).
-        \\value(0). value(1e-999).
-        \\setof(X, value(X), S)?
-    );
-    defer result.deinit();
-    try expectBindingValue(
-        &result.query.answers.items[0],
-        "S",
-        "[-0.025, 0, 0.5, 1, 2.5, 1000]",
-    );
-
-    var canonical = try db.execute("nested([1.0]). nested([1])?");
-    defer canonical.deinit();
-    try std.testing.expectEqual(@as(usize, 1), canonical.query.answers.items.len);
-
-    var integral = try db.execute("value(X), X = 1e0?");
-    defer integral.deinit();
-    try std.testing.expectEqual(@as(usize, 1), integral.query.answers.items.len);
-    try std.testing.expectEqual(
-        @as(i64, 1),
-        try integral.query.answers.items[0].getInteger("X"),
-    );
-}
-
-test "float extremes format deterministically and round-trip" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try db.execute(
-        \\extreme(5e-324). extreme(2.2250738585072014e-308).
-        \\extreme(1.7976931348623157e308). extreme(-1.7976931348623157e308).
-        \\extreme(1e300).
-        \\setof(X, extreme(X), S)?
-    );
-    defer result.deinit();
-    try expectBindingValue(
-        &result.query.answers.items[0],
-        "S",
-        "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
-            "1.7976931348623157e308]",
-    );
-
-    for ([_][]const u8{
-        "extreme(5e-324)?",
-        "extreme(2.2250738585072014e-308)?",
-        "extreme(1.7976931348623157e308)?",
-        "extreme(-1.7976931348623157e308)?",
-        "extreme(1e300)?",
-    }) |query| {
-        var ground = try db.execute(query);
-        defer ground.deinit();
-        try std.testing.expectEqual(@as(usize, 1), ground.query.answers.items.len);
-    }
-
-    var formatted = try db.execute("half(0.5). half(X)?");
-    defer formatted.deinit();
-    const value = try formatted.query.answers.items[0].getValue("X");
-    const spelled = try value.formatAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(spelled);
-    try std.testing.expectEqualStrings("0.5", spelled);
-    try std.testing.expectEqual(ResultValue.Kind.float, value.kind());
-    try std.testing.expectError(Error.TypeMismatch, value.getInteger());
-}
-
-test "non-finite and malformed numeric source reports stable errors" {
-    var db: Jatalog = .init(std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(1e400)."));
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(-1e400)."));
-    try std.testing.expectError(Error.NumericOverflow, db.execute("value(2e308)."));
-
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e+)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.2.3)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(12abc)."));
-    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.)."));
-
-    var absent = try db.execute("value(X)?");
-    defer absent.deinit();
-    try std.testing.expectEqual(@as(usize, 0), absent.query.answers.items.len);
 }
 
 test "mixed numeric comparison and query-local float literals" {

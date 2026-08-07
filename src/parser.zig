@@ -28,6 +28,11 @@ const goalKind = syntax.goalKind;
 const goalOperator = syntax.goalOperator;
 const isVariable = syntax.isVariable;
 const classifyExpr = syntax.classifyExpr;
+const Error = root.Error;
+const input = root.input;
+const ResultValue = root.ResultValue;
+const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
+const expectBindingValue = @import("test_support.zig").expectBindingValue;
 
 pub const Parser = struct {
     jatalog: *Jatalog,
@@ -421,3 +426,199 @@ pub const Parser = struct {
         return end == self.source.len or !(std.ascii.isAlphanumeric(self.source[end]) or self.source[end] == '_');
     }
 };
+
+test "a parse error after a query releases the previous result" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.InvalidSyntax, db.execute(
+        \\p(a). p(X)?
+        \\bad(X) :- q(X), X <>.
+    ));
+}
+
+test "head tail patterns work in rules and cons syntax is equivalent" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\items(cons(a, cons(b, []))).
+        \\tail(T) :- items(H!T).
+        \\tail(X)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try expectBindingValue(&result.query.answers.items[0], "X", "[b]");
+}
+
+test "structural equality binds variables recursively and parse errors clean up" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute("seed(a). seed(X), [X] = [a]?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
+    try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
+
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("broken([a, [b])."));
+}
+
+fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\items([a, [b], c]).
+        \\tail(T) :- items(H!T).
+        \\tail([X, c])?
+    );
+    defer result.deinit();
+    const value = try result.query.answers.items[0].getValue("X");
+    const formatted = try value.formatAlloc(allocator);
+    defer allocator.free(formatted);
+    try std.testing.expectEqualStrings("[b]", formatted);
+}
+
+test "structural parsing and evaluation release every allocation on failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        structuralAllocationScenario,
+        .{},
+    );
+}
+
+fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\seed(k).
+        \\nested(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
+    );
+    result.deinit();
+    var malformed = db.execute("broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.") catch |err| switch (err) {
+        Error.InvalidSyntax => return,
+        else => return err,
+    };
+    malformed.deinit();
+    return error.ExpectedInvalidSyntax;
+}
+
+test "aggregate parser errors release all partial clause trees" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        aggregateAllocationScenario,
+        .{},
+    );
+}
+
+test "quoted numeric atoms remain distinct from numeric scalars" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
+    defer result.deinit();
+    try expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
+
+    var inequality = try db.execute("1 = '1'?");
+    defer inequality.deinit();
+    try std.testing.expectEqual(@as(usize, 0), inequality.query.answers.items.len);
+
+    var quoted_float = try db.execute("1000 = '1e3'?");
+    defer quoted_float.deinit();
+    try std.testing.expectEqual(@as(usize, 0), quoted_float.query.answers.items.len);
+
+    var nested = try db.execute("nested([1]). nested(['1']). nested([1.0]). nested([1])?");
+    defer nested.deinit();
+    try std.testing.expectEqual(@as(usize, 1), nested.query.answers.items.len);
+
+    var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
+    defer quoted_setof.deinit();
+    try expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
+
+    var arithmetic = try db.execute("01 = +0 + 1?");
+    defer arithmetic.deinit();
+    try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
+
+    try std.testing.expectError(Error.NumericType, db.execute("value(X), X < 2?"));
+}
+
+test "non-finite and malformed numeric source reports stable errors" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(1e400)."));
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(-1e400)."));
+    try std.testing.expectError(Error.NumericOverflow, db.execute("value(2e308)."));
+
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1e+)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.2.3)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(12abc)."));
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("value(1.)."));
+
+    var absent = try db.execute("value(X)?");
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent.query.answers.items.len);
+}
+
+test "float literals parse and integral values canonicalize to integers" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\value(2.5). value(0.5). value(-0.025). value(1.0).
+        \\value(1). value(1e0). value(1e3). value(-0.0).
+        \\value(0). value(1e-999).
+        \\setof(X, value(X), S)?
+    );
+    defer result.deinit();
+    try expectBindingValue(
+        &result.query.answers.items[0],
+        "S",
+        "[-0.025, 0, 0.5, 1, 2.5, 1000]",
+    );
+
+    var canonical = try db.execute("nested([1.0]). nested([1])?");
+    defer canonical.deinit();
+    try std.testing.expectEqual(@as(usize, 1), canonical.query.answers.items.len);
+
+    var integral = try db.execute("value(X), X = 1e0?");
+    defer integral.deinit();
+    try std.testing.expectEqual(@as(usize, 1), integral.query.answers.items.len);
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        try integral.query.answers.items[0].getInteger("X"),
+    );
+}
+
+test "float extremes format deterministically and round-trip" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\extreme(5e-324). extreme(2.2250738585072014e-308).
+        \\extreme(1.7976931348623157e308). extreme(-1.7976931348623157e308).
+        \\extreme(1e300).
+        \\setof(X, extreme(X), S)?
+    );
+    defer result.deinit();
+    try expectBindingValue(
+        &result.query.answers.items[0],
+        "S",
+        "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
+            "1.7976931348623157e308]",
+    );
+
+    for ([_][]const u8{
+        "extreme(5e-324)?",
+        "extreme(2.2250738585072014e-308)?",
+        "extreme(1.7976931348623157e308)?",
+        "extreme(-1.7976931348623157e308)?",
+        "extreme(1e300)?",
+    }) |query| {
+        var ground = try db.execute(query);
+        defer ground.deinit();
+        try std.testing.expectEqual(@as(usize, 1), ground.query.answers.items.len);
+    }
+
+    var formatted = try db.execute("half(0.5). half(X)?");
+    defer formatted.deinit();
+    const value = try formatted.query.answers.items[0].getValue("X");
+    const spelled = try value.formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(spelled);
+    try std.testing.expectEqualStrings("0.5", spelled);
+    try std.testing.expectEqual(ResultValue.Kind.float, value.kind());
+    try std.testing.expectError(Error.TypeMismatch, value.getInteger());
+}

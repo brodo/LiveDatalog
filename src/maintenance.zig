@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const materialization = @import("materialization.zig");
 const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 
@@ -54,8 +55,8 @@ pub fn propagateInsertions(db: *Jatalog, batch_start: usize) !void {
     while (level <= max_level) : (level += 1) {
         if (try insertionBlocked(db, level, batch_start)) {
             db.rebuild_fallbacks += 1;
-            db.markDirty(level);
-            try db.ensureMaterialized();
+            materialization.markDirty(db, level);
+            try materialization.ensureMaterialized(db);
             return;
         }
         try propagateLevel(db, &db.closure.?, &analysis.strata, level, batch_start);
@@ -151,8 +152,8 @@ pub fn propagateDeletions(db: *Jatalog, deleted: *RelationStore) !void {
     while (level <= analysis.max_level) : (level += 1) {
         if (try deletionBlocked(db, level, deleted)) {
             db.rebuild_fallbacks += 1;
-            db.markDirty(level);
-            try db.ensureMaterialized();
+            materialization.markDirty(db, level);
+            try materialization.ensureMaterialized(db);
             return;
         }
         try overdeleteLevel(db, &old_closure, deleted, &analysis.strata, level);

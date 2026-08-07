@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const materialization = @import("materialization.zig");
 
 const Jatalog = root.Jatalog;
 const Answer = root.Answer;
@@ -32,7 +33,7 @@ pub fn expectSemiNaiveMatchesNaive(db: *Jatalog) !void {
     defer staging.deinit();
     var semi = try staging.facts.clone();
     defer semi.deinit();
-    try staging.expand(&semi);
+    try materialization.expand(&staging, &semi);
     var naive = try staging.facts.clone();
     defer naive.deinit();
     try staging.eval.expandNaive(&naive);
