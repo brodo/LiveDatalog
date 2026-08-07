@@ -29,7 +29,6 @@ const goalOperator = syntax.goalOperator;
 const isVariable = syntax.isVariable;
 const classifyExpr = syntax.classifyExpr;
 const Error = root.Error;
-const input = root.input;
 const ResultValue = root.ResultValue;
 const expectAnswerCount = @import("test_support.zig").expectAnswerCount;
 const expectBindingValue = @import("test_support.zig").expectBindingValue;

@@ -8,8 +8,7 @@ const syntax = @import("syntax.zig");
 const results = @import("results.zig");
 const evaluator = @import("evaluator.zig");
 const test_support = @import("test_support.zig");
-const parser_mod = @import("parser.zig");
-const expectBindingValue = test_support.expectBindingValue;
+const parser = @import("parser.zig");
 const maintenance = @import("maintenance.zig");
 const compile = @import("compile.zig");
 const materialization = @import("materialization.zig");
@@ -18,75 +17,12 @@ const aggregate_view = @import("aggregate_view.zig");
 
 /// Re-exported so embedders name one error set, whichever layer produced it.
 pub const Error = errors.Error;
-const Fact = relation_store.Fact;
-const StringTable = compile.StringTable;
-const InputBuilder = compile.InputBuilder;
-const Materialization = materialization.Materialization;
-const AuxiliaryView = aggregate_view.AuxiliaryView;
-const StratumImpact = maintenance.StratumImpact;
-const copyFactInto = relation_store.copyFactInto;
-const appendFactCopy = relation_store.appendFactCopy;
-const collectPredicateKeys = relation_store.collectPredicateKeys;
-const Value = evaluator.Value;
-const ValueTable = evaluator.ValueTable;
-const Analysis = evaluator.Analysis;
-const ruleActiveAt = evaluator.ruleActiveAt;
-const ruleStratum = evaluator.ruleStratum;
-const Evaluator = evaluator.Evaluator;
-const ResultNode = results.ResultNode;
-const ResultCons = results.ResultCons;
 pub const ResultValue = results.ResultValue;
-const isProperResultList = results.isProperResultList;
-const freeResultNode = results.freeResultNode;
 pub const Answer = results.Answer;
 pub const QueryResult = results.QueryResult;
 pub const ExecutionResult = results.ExecutionResult;
-const Id = syntax.Id;
-const ValueId = syntax.ValueId;
-const Term = syntax.Term;
-const GoalKind = syntax.GoalKind;
-const Expr = syntax.Expr;
-const Rule = syntax.Rule;
-const DeltaConstraint = syntax.DeltaConstraint;
-const Aggregate = syntax.Aggregate;
-const Clause = syntax.Clause;
-const Binding = syntax.Binding;
-const predicateKey = syntax.predicateKey;
-const outerClauses = syntax.outerClauses;
-const maintainableAggregateIndex = syntax.maintainableAggregateIndex;
-const clausesReadGrownAnywhere = syntax.clausesReadGrownAnywhere;
-const clausesReadGrownNonPositively = syntax.clausesReadGrownNonPositively;
-const noteBodyDependencies = syntax.noteBodyDependencies;
-const freeExpr = syntax.freeExpr;
-const freeRule = syntax.freeRule;
-const cloneTerm = syntax.cloneTerm;
-const cloneExpr = syntax.cloneExpr;
-const cloneClause = syntax.cloneClause;
-const cloneRule = syntax.cloneRule;
-const freeClauseTree = syntax.freeClauseTree;
-const freeTerm = syntax.freeTerm;
-const termVariablesBound = syntax.termVariablesBound;
-const bindTermVariables = syntax.bindTermVariables;
-const collectTermVariables = syntax.collectTermVariables;
-const collectExprVariables = syntax.collectExprVariables;
-const collectClauseSurfaceVariables = syntax.collectClauseSurfaceVariables;
-const collectClauseAllVariables = syntax.collectClauseAllVariables;
-const isVariable = syntax.isVariable;
-const goalKind = syntax.goalKind;
-const goalOperator = syntax.goalOperator;
-const termContainsCons = syntax.termContainsCons;
-const termEqual = syntax.termEqual;
-const isTailDescendant = syntax.isTailDescendant;
-const bindingsEqual = syntax.bindingsEqual;
-const classifyExpr = syntax.classifyExpr;
-const ruleContainsArithmetic = syntax.ruleContainsArithmetic;
-const isBuiltin = syntax.isBuiltin;
-const isArithmetic = syntax.isArithmetic;
-const CostModel = cost_model.CostModel;
 /// Re-exported so callers select a policy without importing the model.
 pub const MaintenancePolicy = cost_model.MaintenancePolicy;
-const PredicateKey = relation_store.PredicateKey;
-const RelationStore = relation_store.RelationStore;
 
 pub const MaintenanceStats = struct {
     closure_facts: usize,
@@ -117,18 +53,18 @@ pub const MaintenanceStats = struct {
 
 pub const Jatalog = struct {
     allocator: std.mem.Allocator,
-    strings: StringTable,
+    strings: compile.StringTable,
     /// The program: interned values, rules, their analysis, and the
     /// machinery that evaluates them against a fact store.
-    eval: Evaluator,
-    facts: RelationStore,
+    eval: evaluator.Evaluator,
+    facts: relation_store.RelationStore,
     /// Persistent derived closure: the base facts plus every derived fact,
     /// exposed to evaluation as one unified read view. Null until the first
     /// evaluation on a database with rules.
-    closure: ?RelationStore = null,
-    materialization: Materialization = .uninitialized,
+    closure: ?relation_store.RelationStore = null,
+    materialization: materialization.Materialization = .uninitialized,
     /// Auxiliary views for maintained aggregate rules with projected heads.
-    auxiliary: std.ArrayList(AuxiliaryView) = .empty,
+    auxiliary: std.ArrayList(aggregate_view.AuxiliaryView) = .empty,
     /// Counts facts added to the closure by incremental batch propagation,
     /// distinguishing incrementally added facts from rebuilt facts.
     propagated_facts: usize = 0,
@@ -212,14 +148,14 @@ pub const Jatalog = struct {
     fn commitRetraction(self: *Jatalog, staging: *Jatalog) !void {
         var committed = try self.clone();
         defer committed.deinit();
-        var removed: RelationStore = .init(committed.allocator);
+        var removed: relation_store.RelationStore = .init(committed.allocator);
         defer removed.deinit();
         var index = committed.facts.len();
         while (index > 0) {
             index -= 1;
             const fact = committed.facts.factAt(index);
             if (try staging.facts.contains(fact)) continue;
-            try copyFactInto(committed.allocator, &removed, fact, false);
+            try relation_store.copyFactInto(committed.allocator, &removed, fact, false);
             committed.facts.removeAt(index);
         }
         // Retraction resolves its goals before deciding, so unlike a batch it
@@ -233,10 +169,10 @@ pub const Jatalog = struct {
         if (maintain and delta > 0) {
             const span = committed.eval.cost.begin();
             try maintenance.propagateDeletions(&committed, &removed);
-            var touched: RelationStore = .init(committed.allocator);
+            var touched: relation_store.RelationStore = .init(committed.allocator);
             defer touched.deinit();
             for (0..removed.len()) |position|
-                try copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
+                try relation_store.copyFactInto(committed.allocator, &touched, removed.factAt(position), false);
             if (touched.len() > 0) try aggregate_view.maintainAggregates(&committed, &touched);
             committed.eval.cost.noteMaintenance(delta, span);
         } else {
@@ -255,7 +191,7 @@ pub const Jatalog = struct {
         var staging = try self.clone();
         defer staging.deinit();
         const expression = try compile.compileRelation(&staging, predicate, terms, false);
-        defer freeExpr(staging.allocator, expression);
+        defer syntax.freeExpr(staging.allocator, expression);
         try staging.addFactExpr(expression);
         self.commit(&staging);
     }
@@ -268,11 +204,11 @@ pub const Jatalog = struct {
             else => return Error.InvalidRule,
         };
         var head_owned = true;
-        defer if (head_owned) freeExpr(staging.allocator, compiled_head);
+        defer if (head_owned) syntax.freeExpr(staging.allocator, compiled_head);
         const compiled_body = try compile.compileGoals(&staging, body);
         var body_owned = true;
         defer {
-            if (body_owned) for (compiled_body) |clause| freeClauseTree(staging.allocator, clause);
+            if (body_owned) for (compiled_body) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled_body);
         }
         try staging.addRuleClauses(compiled_head, compiled_body);
@@ -289,7 +225,7 @@ pub const Jatalog = struct {
         defer staging.deinit();
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
-            for (compiled) |clause| freeClauseTree(staging.allocator, clause);
+            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
         return staging.queryClauses(compiled);
@@ -303,7 +239,7 @@ pub const Jatalog = struct {
         defer staging.deinit();
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
-            for (compiled) |clause| freeClauseTree(staging.allocator, clause);
+            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
         const changed = try staging.deleteClauses(compiled);
@@ -410,7 +346,7 @@ pub const Jatalog = struct {
 
         // Facts the aggregate phase must reconsider: every fact this batch
         // took out of the closure, and every fact it derived into it.
-        var touched: RelationStore = .init(self.allocator);
+        var touched: relation_store.RelationStore = .init(self.allocator);
         defer touched.deinit();
         const deleted = try self.applyDeletions(deletions, maintain, &touched);
         const inserted = try self.applyInsertions(insertions, maintain, &touched);
@@ -431,23 +367,23 @@ pub const Jatalog = struct {
         self: *Jatalog,
         deletions: []const input.Relation,
         maintain: bool,
-        touched: *RelationStore,
+        touched: *relation_store.RelationStore,
     ) !usize {
-        var removed: RelationStore = .init(self.allocator);
+        var removed: relation_store.RelationStore = .init(self.allocator);
         defer removed.deinit();
         var count: usize = 0;
         for (deletions) |relation| {
             const expression = try compile.compileRelation(self, relation.predicate, relation.terms, false);
-            defer freeExpr(self.allocator, expression);
+            defer syntax.freeExpr(self.allocator, expression);
             if (!expression.isGround()) return error.InvalidFact;
-            const terms = try self.allocator.alloc(ValueId, expression.terms.len);
+            const terms = try self.allocator.alloc(syntax.ValueId, expression.terms.len);
             defer self.allocator.free(terms);
             for (expression.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
-            const fact: Fact = .{ .predicate = expression.predicate, .terms = terms };
+            const fact: relation_store.Fact = .{ .predicate = expression.predicate, .terms = terms };
             if (!try self.facts.removeFact(fact)) continue;
             count += 1;
             if (maintain) {
-                try copyFactInto(self.allocator, &removed, fact, false);
+                try relation_store.copyFactInto(self.allocator, &removed, fact, false);
             } else {
                 try materialization.markBaseChanged(self, .{ .name = fact.predicate, .arity = terms.len });
             }
@@ -459,7 +395,7 @@ pub const Jatalog = struct {
         if (removed.len() > 0) {
             try maintenance.propagateDeletions(self, &removed);
             for (0..removed.len()) |index|
-                try copyFactInto(self.allocator, touched, removed.factAt(index), false);
+                try relation_store.copyFactInto(self.allocator, touched, removed.factAt(index), false);
         }
         return count;
     }
@@ -475,7 +411,7 @@ pub const Jatalog = struct {
         self: *Jatalog,
         insertions: []const input.Relation,
         maintain: bool,
-        touched: *RelationStore,
+        touched: *relation_store.RelationStore,
     ) !usize {
         // Maintaining the deletions cannot have taken the closure out from
         // under this phase: a delete-and-rederive fallback repairs the
@@ -486,38 +422,38 @@ pub const Jatalog = struct {
         var count: usize = 0;
         for (insertions) |relation| {
             const expression = try compile.compileRelation(self, relation.predicate, relation.terms, false);
-            defer freeExpr(self.allocator, expression);
+            defer syntax.freeExpr(self.allocator, expression);
             if (try self.applyInsertion(expression, maintain)) count += 1;
         }
         if (!maintain or self.closure.?.len() == batch_start) return count;
         try maintenance.propagateInsertions(self, batch_start);
         if (self.materialization == .clean) {
             for (batch_start..self.closure.?.len()) |index|
-                try copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
+                try relation_store.copyFactInto(self.allocator, touched, self.closure.?.factAt(index), false);
         }
         return count;
     }
 
-    pub fn addFactExpr(self: *Jatalog, value: Expr) !void {
+    pub fn addFactExpr(self: *Jatalog, value: syntax.Expr) !void {
         _ = try self.applyInsertion(value, false);
     }
 
     /// Inserts one ground base fact. When `propagate` is set the fact also
     /// joins the clean closure for incremental propagation; otherwise the
     /// first dependent stratum is marked dirty for the lazy rebuild path.
-    fn applyInsertion(self: *Jatalog, value: Expr, propagate: bool) !bool {
+    fn applyInsertion(self: *Jatalog, value: syntax.Expr, propagate: bool) !bool {
         if (!value.isGround() or value.negated) return error.InvalidFact;
-        const terms = try self.allocator.alloc(ValueId, value.terms.len);
+        const terms = try self.allocator.alloc(syntax.ValueId, value.terms.len);
         var terms_owned = true;
         errdefer if (terms_owned) self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
-        const fact: Fact = .{ .predicate = value.predicate, .terms = terms };
-        const key: PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
+        const fact: relation_store.Fact = .{ .predicate = value.predicate, .terms = terms };
+        const key: relation_store.PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
         const added = try self.facts.insert(fact, false);
         terms_owned = false;
         if (!added) return false;
         if (propagate) {
-            try copyFactInto(self.allocator, &self.closure.?, fact, false);
+            try relation_store.copyFactInto(self.allocator, &self.closure.?, fact, false);
         } else {
             try materialization.markBaseChanged(self, key);
         }
@@ -527,7 +463,7 @@ pub const Jatalog = struct {
     /// Adds a rule whose body may contain aggregate clauses. On success the
     /// database owns `head` and every clause in `body`; on failure the caller
     /// retains ownership. The body slice itself is only borrowed.
-    pub fn addRuleClauses(self: *Jatalog, head: Expr, body: []const Clause) !void {
+    pub fn addRuleClauses(self: *Jatalog, head: syntax.Expr, body: []const syntax.Clause) !void {
         const seed_argument = try validation.validateRule(self, head, body);
         const owned_body = try validation.orderClauses(self, body);
         errdefer self.allocator.free(owned_body);
@@ -558,14 +494,14 @@ pub const Jatalog = struct {
             // Lazy rebuild policy for rule additions: invalidate from the new
             // head's stratum now, rebuild at the next evaluation.
             const analysis = try self.eval.ensureAnalysis();
-            materialization.markDirty(self, analysis.strata.get(predicateKey(head)) orelse 0);
+            materialization.markDirty(self, analysis.strata.get(syntax.predicateKey(head)) orelse 0);
         }
     }
 
     /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
     /// their structural terms remain caller-owned and may be freed immediately
     /// after this function returns.
-    pub fn queryClauses(self: *Jatalog, goals: []const Clause) !QueryResult {
+    pub fn queryClauses(self: *Jatalog, goals: []const syntax.Clause) !QueryResult {
         var internal_answers = try self.evaluateClauses(goals);
         defer {
             for (internal_answers.items) |*answer| answer.deinit(self.allocator);
@@ -574,12 +510,12 @@ pub const Jatalog = struct {
         return self.copyQueryResult(internal_answers.items);
     }
 
-    fn evaluateClauses(self: *Jatalog, goals: []const Clause) !std.ArrayList(Binding) {
+    fn evaluateClauses(self: *Jatalog, goals: []const syntax.Clause) !std.ArrayList(syntax.Binding) {
         if (goals.len == 0) return error.InvalidQuery;
-        var outer_variables: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        var outer_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
         defer outer_variables.deinit(self.allocator);
-        for (goals) |clause| try collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
-        var bound: std.AutoHashMapUnmanaged(Id, void) = .empty;
+        for (goals) |clause| try syntax.collectClauseSurfaceVariables(self.allocator, clause, &outer_variables);
+        var bound: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
         defer bound.deinit(self.allocator);
         const ordered = try validation.orderClauses(self, goals);
         defer self.allocator.free(ordered);
@@ -601,12 +537,12 @@ pub const Jatalog = struct {
             }
         }
 
-        var internal_answers: std.ArrayList(Binding) = .empty;
+        var internal_answers: std.ArrayList(syntax.Binding) = .empty;
         errdefer {
             for (internal_answers.items) |*answer| answer.deinit(self.allocator);
             internal_answers.deinit(self.allocator);
         }
-        var initial: Binding = .{};
+        var initial: syntax.Binding = .{};
         defer initial.deinit(self.allocator);
         try self.eval.matchClauses(ordered, materialization.closureStore(
             self,
@@ -614,7 +550,7 @@ pub const Jatalog = struct {
         return internal_answers;
     }
 
-    fn copyQueryResult(self: *const Jatalog, bindings: []const Binding) !QueryResult {
+    fn copyQueryResult(self: *const Jatalog, bindings: []const syntax.Binding) !QueryResult {
         var result: QueryResult = .{ .allocator = self.allocator };
         errdefer result.deinit();
         for (bindings) |binding| {
@@ -628,7 +564,7 @@ pub const Jatalog = struct {
                     .name = name,
                     .value = .{ .node = owned_value },
                 }) catch |err| {
-                    freeResultNode(self.allocator, owned_value);
+                    results.freeResultNode(self.allocator, owned_value);
                     return err;
                 };
             }
@@ -637,8 +573,8 @@ pub const Jatalog = struct {
         return result;
     }
 
-    fn copyResultNode(self: *const Jatalog, value: ValueId) !*ResultNode {
-        const node = try self.allocator.create(ResultNode);
+    fn copyResultNode(self: *const Jatalog, value: syntax.ValueId) !*results.ResultNode {
+        const node = try self.allocator.create(results.ResultNode);
         errdefer self.allocator.destroy(node);
         node.* = switch (self.eval.values.get(value)) {
             .scalar => |scalar_id| switch (self.eval.scalars.get(scalar_id)) {
@@ -648,10 +584,10 @@ pub const Jatalog = struct {
             },
             .nil => .nil,
             .cons => |value_pair| blk: {
-                const pair = try self.allocator.create(ResultCons);
+                const pair = try self.allocator.create(results.ResultCons);
                 errdefer self.allocator.destroy(pair);
                 pair.head = try self.copyResultNode(value_pair.head);
-                errdefer freeResultNode(self.allocator, pair.head);
+                errdefer results.freeResultNode(self.allocator, pair.head);
                 pair.tail = try self.copyResultNode(value_pair.tail);
                 break :blk .{ .cons = pair };
             },
@@ -671,7 +607,7 @@ pub const Jatalog = struct {
         var projected: usize = 0;
         var auxiliary_tuples: usize = 0;
         for (self.eval.rules.items) |rule| {
-            if (maintainableAggregateIndex(rule) == null) continue;
+            if (syntax.maintainableAggregateIndex(rule) == null) continue;
             var found = false;
             for (self.auxiliary.items) |*view| {
                 if (view.rule_id != rule.id) continue;
@@ -700,14 +636,14 @@ pub const Jatalog = struct {
     }
 
     pub fn execute(self: *Jatalog, source: []const u8) !ExecutionResult {
-        var parser: parser_mod.Parser = .{ .jatalog = self, .source = source };
-        return parser.executeAll();
+        var statement_parser: parser.Parser = .{ .jatalog = self, .source = source };
+        return statement_parser.executeAll();
     }
 
     // Structural recursion is seeded from interned values during expansion, so
     // ground structures supplied by a query must join that seed set first.
 
-    pub fn deleteClauses(self: *Jatalog, goals: []const Clause) !bool {
+    pub fn deleteClauses(self: *Jatalog, goals: []const syntax.Clause) !bool {
         var answers = try self.evaluateClauses(goals);
         defer {
             for (answers.items) |*answer| answer.deinit(self.allocator);
@@ -743,7 +679,7 @@ pub const Jatalog = struct {
         return to_remove.items.len > 0;
     }
 
-    fn writeValue(self: *const Jatalog, writer: *std.Io.Writer, value: ValueId) !void {
+    fn writeValue(self: *const Jatalog, writer: *std.Io.Writer, value: syntax.ValueId) !void {
         switch (self.eval.values.get(value)) {
             .scalar => |scalar_id| try self.eval.scalars.write(writer, scalar_id),
             .nil => try writer.writeAll("[]"),
@@ -774,7 +710,7 @@ pub const Jatalog = struct {
         }
     }
 
-    fn isProperList(self: *const Jatalog, value: ValueId) bool {
+    fn isProperList(self: *const Jatalog, value: syntax.ValueId) bool {
         var current = value;
         while (true) switch (self.eval.values.get(current)) {
             .nil => return true,
@@ -843,7 +779,7 @@ pub const Statement = struct {
 };
 
 test "string table maps strings to stable ids and back" {
-    var table: StringTable = .init(std.testing.allocator);
+    var table: compile.StringTable = .init(std.testing.allocator);
     defer table.deinit();
     const alice = try table.intern("alice");
     try std.testing.expectEqual(alice, try table.intern("alice"));
@@ -896,7 +832,7 @@ test {
     _ = maintenance;
     _ = aggregate_view;
     _ = test_support;
-    _ = parser_mod;
+    _ = parser;
     _ = validation;
 }
 
@@ -1142,7 +1078,7 @@ test "materialize rebuild and stats form the explicit maintenance API" {
         input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
     }, &.{}));
     var collected = try db.execute("collected(g, S)?");
-    try expectBindingValue(&collected.query.answers.items[0], "S", "[m1, m2]");
+    try test_support.expectBindingValue(&collected.query.answers.items[0], "S", "[m1, m2]");
     collected.deinit();
     try std.testing.expect(db.maintenanceStats().maintained_groups > before_member.maintained_groups);
     try test_support.expectClosureMatchesRebuild(&db);
@@ -1172,7 +1108,7 @@ test "lists round trip through queries and nested terms unify structurally" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "X", "[a, [b, []]]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "X", "[a, [b, []]]");
 }
 
 test "repeated variables inside structures enforce equality" {
@@ -1195,7 +1131,7 @@ test "facts reject variables at every structural depth" {
 
     var result = try db.execute("improper(a!b). improper(X)?");
     defer result.deinit();
-    try expectBindingValue(&result.query.answers.items[0], "X", "cons(a, b)");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "X", "cons(a, b)");
 }
 
 test "ground values have a deterministic structural total order" {
@@ -1207,7 +1143,7 @@ test "ground values have a deterministic structural total order" {
         \\setof(X, value(X), S)?
     );
     defer result.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.query.answers.items[0],
         "S",
         "[-2, 2, 10, '1', a, z, [], [-1], cons(a, z), [a], [a, b]]",
@@ -1309,8 +1245,8 @@ test "positive recursion may complete below an aggregate stratum" {
     defer result.deinit();
     var levels = try db.eval.computeStrata();
     defer levels.deinit(std.testing.allocator);
-    const reachable: PredicateKey = .{ .name = db.strings.get("reachable").?, .arity = 2 };
-    const all_reachable: PredicateKey = .{ .name = db.strings.get("all_reachable").?, .arity = 1 };
+    const reachable: relation_store.PredicateKey = .{ .name = db.strings.get("reachable").?, .arity = 2 };
+    const all_reachable: relation_store.PredicateKey = .{ .name = db.strings.get("all_reachable").?, .arity = 1 };
     try std.testing.expectEqual(@as(usize, 0), levels.get(reachable).?);
     try std.testing.expectEqual(@as(usize, 1), levels.get(all_reachable).?);
 }
@@ -1326,8 +1262,8 @@ test "negation and aggregate strict edges share one dependency graph" {
     defer result.deinit();
     var levels = try db.eval.computeStrata();
     defer levels.deinit(std.testing.allocator);
-    const allowed: PredicateKey = .{ .name = db.strings.get("allowed").?, .arity = 1 };
-    const summary: PredicateKey = .{ .name = db.strings.get("summary").?, .arity = 1 };
+    const allowed: relation_store.PredicateKey = .{ .name = db.strings.get("allowed").?, .arity = 1 };
+    const summary: relation_store.PredicateKey = .{ .name = db.strings.get("summary").?, .arity = 1 };
     try std.testing.expectEqual(@as(usize, 1), levels.get(allowed).?);
     try std.testing.expectEqual(@as(usize, 2), levels.get(summary).?);
 }
@@ -1349,9 +1285,9 @@ test "grouped setof is sorted, deduplicated, and includes empty groups" {
     for (result.query.answers.items) |*answer| {
         const person = try answer.getAtom("X");
         if (std.mem.eql(u8, person, "alice")) {
-            try expectBindingValue(answer, "S", "[bob, carol]");
+            try test_support.expectBindingValue(answer, "S", "[bob, carol]");
         } else if (std.mem.eql(u8, person, "bob")) {
-            try expectBindingValue(answer, "S", "[]");
+            try test_support.expectBindingValue(answer, "S", "[]");
         } else return error.UnexpectedPerson;
     }
 }
@@ -1362,7 +1298,7 @@ test "setof evaluates directly in queries" {
     var result = try db.execute("item(c). item(a). setof(X, item(X), S)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "S", "[a, c]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a, c]");
 }
 
 test "setof sees completed recursive strata and preserves structural templates" {
@@ -1377,7 +1313,7 @@ test "setof sees completed recursive strata and preserves structural templates" 
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.query.answers.items[0],
         "S",
         "[[b, a], [c, a], [c, b], [d, a], [d, b], [d, c]]",
@@ -1395,8 +1331,8 @@ test "nested and multiple setof goals evaluate from correlated bindings" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "All", "[a, b]");
-    try expectBindingValue(&result.query.answers.items[0], "Groups", "[[g1, [a, b]], [g2, []]]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "All", "[a, b]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "Groups", "[[g1, [a, b]], [g2, []]]");
 }
 
 test "setof recomputes after retraction" {
@@ -1411,7 +1347,7 @@ test "setof recomputes after retraction" {
     result = try db.execute("items(S)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "S", "[a]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a]");
 }
 
 test "setof ordering is independent of insertion and rule order" {
@@ -1587,13 +1523,13 @@ test "ground list query inputs seed recursive evaluation" {
     var open_result = try db.execute("sum(Input, Total)?");
     defer open_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), open_result.query.answers.items.len);
-    try expectBindingValue(&open_result.query.answers.items[0], "Input", "[]");
+    try test_support.expectBindingValue(&open_result.query.answers.items[0], "Input", "[]");
     try std.testing.expectEqual(@as(i64, 0), try open_result.query.answers.items[0].getInteger("Total"));
 
     var structural_result = try db.execute("Value = [a, b]?");
     defer structural_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), structural_result.query.answers.items.len);
-    try expectBindingValue(&structural_result.query.answers.items[0], "Value", "[a, b]");
+    try test_support.expectBindingValue(&structural_result.query.answers.items[0], "Value", "[a, b]");
 }
 
 test "member and collectfirst are ordinary admissible list relations" {
@@ -1638,7 +1574,7 @@ test "non-recursive rules may construct structural head values" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
 }
 
 test "structurally recursive rules retain their proven input seed" {
@@ -1652,7 +1588,7 @@ test "structurally recursive rules retain their proven input seed" {
     );
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
 }
 
 test "recursive arithmetic generators are not admissible" {
@@ -1720,10 +1656,10 @@ test "embedding API constructs structural aggregate rules and queries" {
     for (result.answers.items) |*answer| {
         const person_name = try answer.getAtom("x");
         if (std.mem.eql(u8, person_name, "alice")) {
-            try expectBindingValue(answer, "children", "[bob]");
+            try test_support.expectBindingValue(answer, "children", "[bob]");
         } else {
             try std.testing.expectEqualStrings("bob", person_name);
-            try expectBindingValue(answer, "children", "[]");
+            try test_support.expectBindingValue(answer, "children", "[]");
         }
     }
 }
@@ -1750,7 +1686,7 @@ test "typed nested setof matches source aggregate semantics" {
         groups,
     )});
     defer result.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.answers.items[0],
         "groups",
         "[[g1, [a]], [g2, []]]",
@@ -1768,7 +1704,7 @@ fn embeddedAggregateAllocationScenario(allocator: std.mem.Allocator) !void {
     const body = [_]input.Goal{input.relation("item", &.{x})};
     var result = try db.query(&.{input.setof(input.list(&.{x}), &body, output)});
     defer result.deinit();
-    try expectBindingValue(&result.answers.items[0], "output", "[[a], [b]]");
+    try test_support.expectBindingValue(&result.answers.items[0], "output", "[[a], [b]]");
 }
 
 test "embedding aggregate ownership is allocation safe" {
@@ -1800,7 +1736,7 @@ test "aggregate retraction is correct across the complete language tour" {
     result = try db.execute("children(alice, S), numchildren(alice, N)?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try expectBindingValue(&result.query.answers.items[0], "S", "[]");
+    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[]");
     try std.testing.expectEqual(@as(i64, 0), try result.query.answers.items[0].getInteger("N"));
 }
 
@@ -1833,7 +1769,7 @@ test "public source interface canonicalizes the complete i64 domain" {
         \\setof(X, number(X), Values)?
     );
     defer result.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &result.query.answers.items[0],
         "Values",
         "[-9223372036854775808, 0, 1, 9223372036854775807]",
@@ -1951,7 +1887,7 @@ test "mixed equality and ordering are exact at numeric boundaries" {
         \\setof(X, near(X), S)?
     );
     defer ordered.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &ordered.query.answers.items[0],
         "S",
         "[0.9999999999999999, 1, 1.0000000000000002]",
@@ -1967,7 +1903,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
         \\setof(X, one(X), S)?
     );
     defer dedup.deinit();
-    try expectBindingValue(&dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
+    try test_support.expectBindingValue(&dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
 
     try test_support.expectAnswerCount(&db, "nested([1.0, 2.5]). nested([1, 2.5])?", 1);
     try test_support.expectAnswerCount(&db, "pair(cons(0.5, 1.0)). pair(cons(0.5, 1))?", 1);
@@ -1978,7 +1914,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
         \\grouped(Out)?
     );
     defer grouped.deinit();
-    try expectBindingValue(
+    try test_support.expectBindingValue(
         &grouped.query.answers.items[0],
         "Out",
         "[[g, [0.5, 1]], [h, [2.5]]]",
@@ -2214,7 +2150,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
     const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
     try db.addFact("improper", &.{input.cons(&pair)});
     result = try db.query(&.{input.relation("improper", &.{input.variable("value")})});
-    try expectBindingValue(&result.answers.items[0], "value", "cons(head, tail)");
+    try test_support.expectBindingValue(&result.answers.items[0], "value", "cons(head, tail)");
     result.deinit();
 
     try db.addFact("items", &.{input.list(&.{ input.integer(1), input.integer(2) })});
@@ -2226,7 +2162,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
         &.{input.relation("items", &.{input.cons(&list_pair)})},
     );
     result = try db.query(&.{input.relation("tail", &.{input.variable("result")})});
-    try expectBindingValue(&result.answers.items[0], "result", "[2]");
+    try test_support.expectBindingValue(&result.answers.items[0], "result", "[2]");
     result.deinit();
 
     try std.testing.expect(try db.retract(&.{input.relation("age", &.{

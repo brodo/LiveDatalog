@@ -13,19 +13,14 @@ const input = root.input;
 const input_compiler = @import("input_compiler.zig");
 
 const Jatalog = root.Jatalog;
-const Error = root.Error;
 const Id = syntax.Id;
 const Term = syntax.Term;
 const Expr = syntax.Expr;
 const Clause = syntax.Clause;
-const Aggregate = syntax.Aggregate;
 const GoalKind = syntax.GoalKind;
-const freeExpr = syntax.freeExpr;
 const freeClauseTree = syntax.freeClauseTree;
-const goalKind = syntax.goalKind;
 const goalOperator = syntax.goalOperator;
 const freeTerm = syntax.freeTerm;
-const classifyExpr = syntax.classifyExpr;
 
 /// Interns predicate and variable symbols used by a database. IDs are
 /// insertion indexes, which makes `resolve` a reverse lookup into the ordered

@@ -17,10 +17,8 @@ const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 
 const Jatalog = root.Jatalog;
-const Error = root.Error;
 const PredicateKey = relation_store.PredicateKey;
 const Id = syntax.Id;
-const Term = syntax.Term;
 const Expr = syntax.Expr;
 const Clause = syntax.Clause;
 const Rule = syntax.Rule;
@@ -34,11 +32,9 @@ const termEqual = syntax.termEqual;
 const isTailDescendant = syntax.isTailDescendant;
 const termVariablesBound = syntax.termVariablesBound;
 const bindTermVariables = syntax.bindTermVariables;
-const collectExprVariables = syntax.collectExprVariables;
 const collectClauseSurfaceVariables = syntax.collectClauseSurfaceVariables;
 const collectClauseAllVariables = syntax.collectClauseAllVariables;
 const collectTermVariables = syntax.collectTermVariables;
-const clausesReadGrownNonPositively = syntax.clausesReadGrownNonPositively;
 
 pub fn validateRule(db: *Jatalog, head: Expr, body: []const Clause) !?usize {
     if (body.len == 0 or head.negated or isBuiltin(head)) return error.InvalidRule;

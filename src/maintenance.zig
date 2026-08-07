@@ -25,7 +25,6 @@ const ValueId = relation_store.ValueId;
 const copyFactInto = relation_store.copyFactInto;
 const collectPredicateKeys = relation_store.collectPredicateKeys;
 const Rule = syntax.Rule;
-const Clause = syntax.Clause;
 const Binding = syntax.Binding;
 const predicateKey = syntax.predicateKey;
 const outerClauses = syntax.outerClauses;
