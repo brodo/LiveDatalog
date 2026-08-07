@@ -1,4 +1,3 @@
-//! Turning input into stored syntax: symbol interning, typed descriptors, and
 //! the ground structures a statement mentions.
 //!
 //! Compilation always runs against whichever database it is pointed at, which
@@ -7,53 +6,13 @@
 //! and discards that copy unless the statement commits.
 
 const std = @import("std");
-const root = @import("root.zig");
+const database = @import("database.zig");
+const input = @import("input.zig");
 const syntax = @import("syntax.zig");
 const input_compiler = @import("input_compiler.zig");
 
-/// Interns predicate and variable symbols used by a database. IDs are
-/// insertion indexes, which makes `resolve` a reverse lookup into the ordered
-/// keys of the same StringArrayHashMapUnmanaged.
-pub const StringTable = struct {
-    allocator: std.mem.Allocator,
-    strings: std.StringArrayHashMapUnmanaged(syntax.Id) = .empty,
-
-    pub fn init(allocator: std.mem.Allocator) StringTable {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *StringTable) void {
-        for (self.strings.keys()) |string| self.allocator.free(string);
-        self.strings.deinit(self.allocator);
-        self.* = undefined;
-    }
-
-    pub fn clone(self: *const StringTable) !StringTable {
-        var result: StringTable = .init(self.allocator);
-        errdefer result.deinit();
-        for (self.strings.keys()) |string| _ = try result.intern(string);
-        return result;
-    }
-
-    pub fn intern(self: *StringTable, string: []const u8) !syntax.Id {
-        if (self.strings.get(string)) |id| return id;
-        const owned = try self.allocator.dupe(u8, string);
-        errdefer self.allocator.free(owned);
-        const id: syntax.Id = @intCast(self.strings.count());
-        try self.strings.putNoClobber(self.allocator, owned, id);
-        return id;
-    }
-
-    pub fn get(self: *const StringTable, string: []const u8) ?syntax.Id {
-        return self.strings.get(string);
-    }
-
-    pub fn resolve(self: *const StringTable, id: syntax.Id) []const u8 {
-        return self.strings.keys()[@intCast(id)];
-    }
-};
 pub const InputBuilder = struct {
-    database: *root.Jatalog,
+    database: *database.Database,
 
     pub fn allocator(self: *InputBuilder) std.mem.Allocator {
         return self.database.allocator;
@@ -91,9 +50,9 @@ pub const InputBuilder = struct {
 };
 
 pub fn compileRelation(
-    db: *root.Jatalog,
+    db: *database.Database,
     predicate: []const u8,
-    descriptors: []const root.input.Term,
+    descriptors: []const input.Term,
     negated: bool,
 ) !syntax.Expr {
     if (predicate.len == 0) return error.InvalidTerm;
@@ -104,11 +63,11 @@ pub fn compileRelation(
         .negated = negated,
     };
 }
-pub fn compileGoals(db: *root.Jatalog, descriptors: []const root.input.Goal) anyerror![]syntax.Clause {
+pub fn compileGoals(db: *database.Database, descriptors: []const input.Goal) anyerror![]syntax.Clause {
     try input_compiler.validateGoals(db.allocator, descriptors);
     return compileGoalsValidated(db, descriptors);
 }
-pub fn compileGoalsValidated(db: *root.Jatalog, descriptors: []const root.input.Goal) anyerror![]syntax.Clause {
+pub fn compileGoalsValidated(db: *database.Database, descriptors: []const input.Goal) anyerror![]syntax.Clause {
     const clauses = try db.allocator.alloc(syntax.Clause, descriptors.len);
     var initialized: usize = 0;
     errdefer {
@@ -121,7 +80,7 @@ pub fn compileGoalsValidated(db: *root.Jatalog, descriptors: []const root.input.
     }
     return clauses;
 }
-fn compileGoalValidated(db: *root.Jatalog, descriptor: root.input.Goal) anyerror!syntax.Clause {
+fn compileGoalValidated(db: *database.Database, descriptor: input.Goal) anyerror!syntax.Clause {
     return switch (descriptor) {
         .relation => |relation| .{
             .relational = try compileRelation(db, relation.predicate, relation.terms, false),
@@ -152,15 +111,15 @@ fn compileGoalValidated(db: *root.Jatalog, descriptor: root.input.Goal) anyerror
         },
     };
 }
-pub fn compileBuiltin(db: *root.Jatalog, kind: syntax.GoalKind, terms: []const root.input.Term) !syntax.Expr {
+pub fn compileBuiltin(db: *database.Database, kind: syntax.GoalKind, terms: []const input.Term) !syntax.Expr {
     var result = try compileRelation(db, syntax.goalOperator(kind), terms, false);
     result.kind = kind;
     return result;
 }
-pub fn internGroundStructuresInExpr(db: *root.Jatalog, expression: syntax.Expr) !void {
+pub fn internGroundStructuresInExpr(db: *database.Database, expression: syntax.Expr) !void {
     for (expression.terms) |term| try internGroundStructuresInTerm(db, term);
 }
-pub fn internGroundStructuresInClause(db: *root.Jatalog, clause: syntax.Clause) !void {
+pub fn internGroundStructuresInClause(db: *database.Database, clause: syntax.Clause) !void {
     switch (clause) {
         .relational, .builtin, .negated => |expression| try internGroundStructuresInExpr(db, expression),
         .aggregate => |aggregate| {
@@ -171,7 +130,7 @@ pub fn internGroundStructuresInClause(db: *root.Jatalog, clause: syntax.Clause) 
         },
     }
 }
-fn internGroundStructuresInTerm(db: *root.Jatalog, term: syntax.Term) !void {
+fn internGroundStructuresInTerm(db: *database.Database, term: syntax.Term) !void {
     switch (term) {
         .nil => _ = try db.eval.termToValue(term, null),
         .cons => |pair| {

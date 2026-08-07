@@ -11,30 +11,33 @@
 //! the transaction primitives those are built from.
 
 const std = @import("std");
-const test_support = @import("test_support.zig");
-const root = @import("root.zig");
+const database = @import("database.zig");
+const statement = @import("statement.zig");
+const results = @import("results.zig");
 const syntax = @import("syntax.zig");
+const errors = @import("errors.zig");
+const test_support = @import("test_support.zig");
 
 pub const Parser = struct {
-    jatalog: *root.Jatalog,
+    jatalog: *database.Database,
     source: []const u8,
     index: usize = 0,
 
-    pub fn executeAll(self: *Parser) !root.ExecutionResult {
-        var last: ?root.ExecutionResult = null;
+    pub fn executeAll(self: *Parser) !results.ExecutionResult {
+        var last: ?results.ExecutionResult = null;
         errdefer if (last) |*result| result.deinit();
         while (true) {
             self.skipSpace();
             if (self.index == self.source.len) return last orelse .none;
             if (last) |*result| result.deinit();
             last = null;
-            var statement = try root.Statement.begin(self.jatalog, self.peekStatementKind());
-            defer statement.deinit();
+            var transaction = try statement.Statement.begin(self.jatalog, self.peekStatementKind());
+            defer transaction.deinit();
             var statement_parser = self.*;
-            statement_parser.jatalog = statement.target();
+            statement_parser.jatalog = transaction.target();
             const statement_result = try statement_parser.executeStatement();
             self.index = statement_parser.index;
-            try statement.commit(statement_result);
+            try transaction.commit(statement_result);
             last = statement_result;
         }
     }
@@ -42,7 +45,7 @@ pub const Parser = struct {
     /// Classifies the next statement by scanning for its terminator without
     /// interning anything, mirroring the tokenizer's comment, quote, and
     /// digit-dot-digit rules.
-    fn peekStatementKind(self: *const Parser) root.Statement.Kind {
+    fn peekStatementKind(self: *const Parser) statement.Statement.Kind {
         var index = self.index;
         while (index < self.source.len) : (index += 1) {
             const byte = self.source[index];
@@ -80,7 +83,7 @@ pub const Parser = struct {
         return .end;
     }
 
-    fn executeStatement(self: *Parser) !root.ExecutionResult {
+    fn executeStatement(self: *Parser) !results.ExecutionResult {
         const first = try self.parseClause();
         var first_owned = true;
         errdefer if (first_owned) syntax.freeClauseTree(self.jatalog.allocator, first);
@@ -103,7 +106,7 @@ pub const Parser = struct {
                 if (!self.consume(",")) break;
             }
             try self.expect(".");
-            try self.jatalog.addRuleClauses(head, body.items);
+            try statement.addRuleClauses(self.jatalog, head, body.items);
             first_owned = false;
             return .none;
         }
@@ -113,7 +116,7 @@ pub const Parser = struct {
                 .relational => |expression| expression,
                 else => return error.InvalidFact,
             };
-            try self.jatalog.addFactExpr(fact);
+            try statement.addFactExpr(self.jatalog, fact);
             syntax.freeClauseTree(self.jatalog.allocator, first);
             first_owned = false;
             return .none;
@@ -133,8 +136,8 @@ pub const Parser = struct {
                 return err;
             };
         }
-        if (self.consume("?")) return .{ .query = try self.jatalog.queryClauses(goals.items) };
-        if (self.consume("~")) return .{ .changed = try self.jatalog.deleteClauses(goals.items) };
+        if (self.consume("?")) return .{ .query = try statement.queryClauses(self.jatalog, goals.items) };
+        if (self.consume("~")) return .{ .changed = try statement.deleteClauses(self.jatalog, goals.items) };
         return error.InvalidSyntax;
     }
 
@@ -408,19 +411,27 @@ pub const Parser = struct {
     }
 };
 
+/// Runs a source program against `db`, which is what `Jatalog.execute` does one
+/// layer up. Spelled out here so the parser's own tests need nothing above the
+/// parser to build the database they parse into.
+fn execute(db: *database.Database, source: []const u8) !results.ExecutionResult {
+    var statement_parser: Parser = .{ .jatalog = db, .source = source };
+    return statement_parser.executeAll();
+}
+
 test "a parse error after a query releases the previous result" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute(
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db,
         \\p(a). p(X)?
         \\bad(X) :- q(X), X <>.
     ));
 }
 
 test "head tail patterns work in rules and cons syntax is equivalent" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute(
+    var result = try execute(&db,
         \\items(cons(a, cons(b, []))).
         \\tail(T) :- items(H!T).
         \\tail(X)?
@@ -431,20 +442,20 @@ test "head tail patterns work in rules and cons syntax is equivalent" {
 }
 
 test "structural equality binds variables recursively and parse errors clean up" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute("seed(a). seed(X), [X] = [a]?");
+    var result = try execute(&db, "seed(a). seed(X), [X] = [a]?");
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
 
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("broken([a, [b])."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "broken([a, [b])."));
 }
 
 fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: root.Jatalog = .init(allocator);
+    var db: database.Database = .init(allocator);
     defer db.deinit();
-    var result = try db.execute(
+    var result = try execute(&db,
         \\items([a, [b], c]).
         \\tail(T) :- items(H!T).
         \\tail([X, c])?
@@ -461,15 +472,16 @@ test "structural parsing and evaluation release every allocation on failure" {
 }
 
 fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: root.Jatalog = .init(allocator);
+    var db: database.Database = .init(allocator);
     defer db.deinit();
-    var result = try db.execute(
+    var result = try execute(&db,
         \\seed(k).
         \\nested(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
     );
     result.deinit();
-    var malformed = db.execute("broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.") catch |err| switch (err) {
-        root.Error.InvalidSyntax => return,
+    const malformed_source = "broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.";
+    var malformed = execute(&db, malformed_source) catch |err| switch (err) {
+        errors.Error.InvalidSyntax => return,
         else => return err,
     };
     malformed.deinit();
@@ -481,57 +493,57 @@ test "aggregate parser errors release all partial clause trees" {
 }
 
 test "quoted numeric atoms remain distinct from numeric scalars" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute("value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
+    var result = try execute(&db, "value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
     defer result.deinit();
     try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
 
-    var inequality = try db.execute("1 = '1'?");
+    var inequality = try execute(&db, "1 = '1'?");
     defer inequality.deinit();
     try std.testing.expectEqual(@as(usize, 0), inequality.query.answers.items.len);
 
-    var quoted_float = try db.execute("1000 = '1e3'?");
+    var quoted_float = try execute(&db, "1000 = '1e3'?");
     defer quoted_float.deinit();
     try std.testing.expectEqual(@as(usize, 0), quoted_float.query.answers.items.len);
 
-    var nested = try db.execute("nested([1]). nested(['1']). nested([1.0]). nested([1])?");
+    var nested = try execute(&db, "nested([1]). nested(['1']). nested([1.0]). nested([1])?");
     defer nested.deinit();
     try std.testing.expectEqual(@as(usize, 1), nested.query.answers.items.len);
 
-    var quoted_setof = try db.execute("text('2.5'). text(2.5). setof(X, text(X), S)?");
+    var quoted_setof = try execute(&db, "text('2.5'). text(2.5). setof(X, text(X), S)?");
     defer quoted_setof.deinit();
     try test_support.expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
 
-    var arithmetic = try db.execute("01 = +0 + 1?");
+    var arithmetic = try execute(&db, "01 = +0 + 1?");
     defer arithmetic.deinit();
     try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
 
-    try std.testing.expectError(root.Error.NumericType, db.execute("value(X), X < 2?"));
+    try std.testing.expectError(errors.Error.NumericType, execute(&db, "value(X), X < 2?"));
 }
 
 test "non-finite and malformed numeric source reports stable errors" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(1e400)."));
-    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(-1e400)."));
-    try std.testing.expectError(root.Error.NumericOverflow, db.execute("value(2e308)."));
+    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(1e400)."));
+    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(-1e400)."));
+    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(2e308)."));
 
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1e)."));
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1e+)."));
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1.2.3)."));
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(12abc)."));
-    try std.testing.expectError(root.Error.InvalidSyntax, db.execute("value(1.)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1e)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1e+)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1.2.3)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(12abc)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1.)."));
 
-    var absent = try db.execute("value(X)?");
+    var absent = try execute(&db, "value(X)?");
     defer absent.deinit();
     try std.testing.expectEqual(@as(usize, 0), absent.query.answers.items.len);
 }
 
 test "float literals parse and integral values canonicalize to integers" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute(
+    var result = try execute(&db,
         \\value(2.5). value(0.5). value(-0.025). value(1.0).
         \\value(1). value(1e0). value(1e3). value(-0.0).
         \\value(0). value(1e-999).
@@ -544,11 +556,11 @@ test "float literals parse and integral values canonicalize to integers" {
         "[-0.025, 0, 0.5, 1, 2.5, 1000]",
     );
 
-    var canonical = try db.execute("nested([1.0]). nested([1])?");
+    var canonical = try execute(&db, "nested([1.0]). nested([1])?");
     defer canonical.deinit();
     try std.testing.expectEqual(@as(usize, 1), canonical.query.answers.items.len);
 
-    var integral = try db.execute("value(X), X = 1e0?");
+    var integral = try execute(&db, "value(X), X = 1e0?");
     defer integral.deinit();
     try std.testing.expectEqual(@as(usize, 1), integral.query.answers.items.len);
     try std.testing.expectEqual(
@@ -558,9 +570,9 @@ test "float literals parse and integral values canonicalize to integers" {
 }
 
 test "float extremes format deterministically and round-trip" {
-    var db: root.Jatalog = .init(std.testing.allocator);
+    var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute(
+    var result = try execute(&db,
         \\extreme(5e-324). extreme(2.2250738585072014e-308).
         \\extreme(1.7976931348623157e308). extreme(-1.7976931348623157e308).
         \\extreme(1e300).
@@ -581,17 +593,17 @@ test "float extremes format deterministically and round-trip" {
         "extreme(-1.7976931348623157e308)?",
         "extreme(1e300)?",
     }) |query| {
-        var ground = try db.execute(query);
+        var ground = try execute(&db, query);
         defer ground.deinit();
         try std.testing.expectEqual(@as(usize, 1), ground.query.answers.items.len);
     }
 
-    var formatted = try db.execute("half(0.5). half(X)?");
+    var formatted = try execute(&db, "half(0.5). half(X)?");
     defer formatted.deinit();
     const value = try formatted.query.answers.items[0].getValue("X");
     const spelled = try value.formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(spelled);
     try std.testing.expectEqualStrings("0.5", spelled);
-    try std.testing.expectEqual(root.ResultValue.Kind.float, value.kind());
-    try std.testing.expectError(root.Error.TypeMismatch, value.getInteger());
+    try std.testing.expectEqual(results.ResultValue.Kind.float, value.kind());
+    try std.testing.expectError(errors.Error.TypeMismatch, value.getInteger());
 }

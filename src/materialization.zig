@@ -4,29 +4,25 @@
 //! Materialization is lazy. An update marks the first stratum that depends on
 //! what it changed, and the next evaluation repairs from there, reusing the
 //! derived facts of every stratum below. The tri-state that records this is
-//! the pivot the whole maintenance layer turns on: `canMaintain` is what the
-//! cost model is only consulted behind, and `markDirty` plus
-//! `ensureMaterialized` are the fallback every incremental path abandons to.
+//! the pivot the whole maintenance layer turns on: it lives on the database
+//! itself, along with the predicates that read and set it, and
+//! `ensureMaterialized` here is the fallback every incremental path abandons
+//! to.
+//!
+//! The auxiliary views projected aggregate rules keep are derived state too,
+//! so they are built and dropped here, on the same schedule as the closure
+//! they are computed from.
 
-const root = @import("root.zig");
+const std = @import("std");
+const database = @import("database.zig");
+const auxiliary_view = @import("auxiliary_view.zig");
+const errors = @import("errors.zig");
 const relation_store = @import("relation_store.zig");
-const aggregate_view = @import("aggregate_view.zig");
+const syntax = @import("syntax.zig");
 
-pub const Materialization = union(enum) {
-    uninitialized,
-    clean,
-    dirty_from_stratum: usize,
-};
-
-/// Whether the closure is in a state incremental maintenance can start
-/// from. A dirty closure has to be repaired regardless of cost, so the
-/// cost model is consulted only when this holds.
-pub fn canMaintain(db: *const root.Jatalog) bool {
-    return db.closure != null and db.materialization == .clean;
-}
 /// Compares the maintained closure against a rebuild performed on a
 /// throwaway copy, so verification never disturbs this database.
-pub fn verifyShadow(db: *root.Jatalog) !void {
+pub fn verifyShadow(db: *database.Database) !void {
     if (!db.shadow_verification) return;
     const closure = if (db.closure) |*value| value else return;
     var staging = try db.clone();
@@ -38,32 +34,11 @@ pub fn verifyShadow(db: *root.Jatalog) !void {
     for (0..reference.len()) |index|
         if (!try closure.contains(reference.factAt(index))) return error.MaintenanceMismatch;
 }
-pub fn closureStore(db: *root.Jatalog) *relation_store.RelationStore {
-    if (db.closure) |*closure| return closure;
-    return &db.facts;
-}
 /// Drops everything derived from the rule set: the evaluator's cached
 /// stratification and the auxiliary views built from it.
-pub fn invalidateAnalysis(db: *root.Jatalog) void {
+pub fn invalidateAnalysis(db: *database.Database) void {
     db.eval.invalidateAnalysis();
-    aggregate_view.dropAuxiliaryViews(db);
-}
-pub fn markDirty(db: *root.Jatalog, level: usize) void {
-    switch (db.materialization) {
-        .uninitialized => {},
-        .clean => db.materialization = .{ .dirty_from_stratum = level },
-        .dirty_from_stratum => |existing| db.materialization = .{
-            .dirty_from_stratum = @min(existing, level),
-        },
-    }
-}
-/// Marks the first stratum that depends on a changed base predicate as
-/// dirty. A predicate no rule reads dirties the level past the last
-/// stratum, so the rebuild refreshes only the closure's base partition.
-pub fn markBaseChanged(db: *root.Jatalog, key: relation_store.PredicateKey) !void {
-    if (db.closure == null) return;
-    const analysis = try db.eval.ensureAnalysis();
-    markDirty(db, analysis.first_dependent.get(key) orelse analysis.max_level + 1);
+    dropAuxiliaryViews(db);
 }
 /// Builds or refreshes the persistent closure. Materialization is lazy:
 /// a database whose rule set is empty never allocates derived-state
@@ -72,7 +47,7 @@ pub fn markBaseChanged(db: *root.Jatalog, key: relation_store.PredicateKey) !voi
 /// failure the previous closure and state remain installed; values
 /// interned by the aborted expansion stay in the value table and are
 /// reclaimed at deinit.
-pub fn ensureMaterialized(db: *root.Jatalog) !void {
+pub fn ensureMaterialized(db: *database.Database) !void {
     if (db.eval.rules.items.len == 0) return;
     const from_level: usize = switch (db.materialization) {
         .clean => return,
@@ -89,12 +64,12 @@ pub fn ensureMaterialized(db: *root.Jatalog) !void {
     if (db.closure) |*old| old.deinit();
     db.closure = closure;
     db.materialization = .clean;
-    try aggregate_view.rebuildAuxiliaryViews(db);
+    try rebuildAuxiliaryViews(db);
     // This also runs as the fallback inside a maintenance attempt, where
     // claiming the work keeps it out of the maintenance estimate.
     if (repairs_update) db.eval.cost.noteRebuild(span);
 }
-fn buildClosure(db: *root.Jatalog, from_level: usize) !relation_store.RelationStore {
+fn buildClosure(db: *database.Database, from_level: usize) !relation_store.RelationStore {
     var closure = try db.facts.clone();
     errdefer closure.deinit();
     if (from_level > 0) {
@@ -112,6 +87,151 @@ fn buildClosure(db: *root.Jatalog, from_level: usize) !relation_store.RelationSt
     try db.eval.expandFrom(&closure, from_level);
     return closure;
 }
-pub fn expand(db: *root.Jatalog, facts: *relation_store.RelationStore) !void {
+pub fn expand(db: *database.Database, facts: *relation_store.RelationStore) !void {
     try db.eval.expandFrom(facts, 0);
+}
+
+pub fn dropAuxiliaryViews(db: *database.Database) void {
+    for (db.auxiliary.items) |*view| view.deinit(db.allocator);
+    db.auxiliary.clearRetainingCapacity();
+}
+pub fn auxiliaryFor(db: *database.Database, rule_id: u32) ?*auxiliary_view.AuxiliaryView {
+    for (db.auxiliary.items) |*view| if (view.rule_id == rule_id) return view;
+    return null;
+}
+/// Rebuilds every projected aggregate view from the materialized
+/// closure. Views are built into a temporary list and installed only on
+/// success, so a failure leaves the previous views in place.
+pub fn rebuildAuxiliaryViews(db: *database.Database) !void {
+    var built: std.ArrayList(auxiliary_view.AuxiliaryView) = .empty;
+    errdefer {
+        for (built.items) |*view| view.deinit(db.allocator);
+        built.deinit(db.allocator);
+    }
+    for (db.eval.rules.items) |rule| {
+        const clause_index = syntax.maintainableAggregateIndex(rule) orelse continue;
+        var view = (try buildAuxiliaryView(db, rule, clause_index)) orelse continue;
+        built.append(db.allocator, view) catch |err| {
+            view.deinit(db.allocator);
+            return err;
+        };
+    }
+    for (db.auxiliary.items) |*view| view.deinit(db.allocator);
+    db.auxiliary.deinit(db.allocator);
+    db.auxiliary = built;
+}
+/// Returns the projected variables of a maintained aggregate rule: the
+/// outer-goal variables its head omits. An empty result means the head
+/// retains every outer variable, so each head tuple already belongs to
+/// exactly one group and no auxiliary view is needed.
+fn projectedVariables(db: *database.Database, rule: syntax.Rule, clause_index: usize) ![]syntax.Id {
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
+    defer db.allocator.free(outer);
+    var outer_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
+    defer outer_variables.deinit(db.allocator);
+    for (outer) |clause|
+        try syntax.collectClauseSurfaceVariables(db.allocator, clause, &outer_variables);
+    var head_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
+    defer head_variables.deinit(db.allocator);
+    for (rule.head.terms) |term| try syntax.collectTermVariables(db.allocator, term, &head_variables);
+
+    var projected: std.ArrayList(syntax.Id) = .empty;
+    errdefer projected.deinit(db.allocator);
+    var iterator = outer_variables.keyIterator();
+    while (iterator.next()) |variable| {
+        if (!head_variables.contains(variable.*))
+            try projected.append(db.allocator, variable.*);
+    }
+    std.mem.sort(syntax.Id, projected.items, {}, std.sort.asc(syntax.Id));
+    return projected.toOwnedSlice(db.allocator);
+}
+fn buildAuxiliaryView(db: *database.Database, rule: syntax.Rule, clause_index: usize) !?auxiliary_view.AuxiliaryView {
+    const projected = try projectedVariables(db, rule, clause_index);
+    var projected_owned = true;
+    defer if (projected_owned) db.allocator.free(projected);
+    if (projected.len == 0) return null;
+    // The lookup mask addresses one bit per auxiliary column.
+    if (projected.len + rule.head.terms.len > 64) return null;
+
+    var view: auxiliary_view.AuxiliaryView = .{
+        .rule_id = rule.id,
+        .projected = projected,
+        .head_arity = rule.head.terms.len,
+        .tuples = .init(db.allocator),
+    };
+    projected_owned = false;
+    errdefer view.deinit(db.allocator);
+
+    const outer = try syntax.outerClauses(db.allocator, rule, clause_index);
+    defer db.allocator.free(outer);
+    var groups: std.ArrayList(syntax.Binding) = .empty;
+    defer {
+        for (groups.items) |*group| group.deinit(db.allocator);
+        groups.deinit(db.allocator);
+    }
+    var initial: syntax.Binding = .{};
+    defer initial.deinit(db.allocator);
+    db.eval.matchClauses(
+        outer,
+        &db.closure.?,
+        0,
+        &initial,
+        &groups,
+        null,
+    ) catch |err| switch (err) {
+        errors.Error.NumericType, errors.Error.NumericOverflow => return view,
+        else => return err,
+    };
+    for (groups.items) |*group| try recordGroupTuples(db, rule, &view, group);
+    return view;
+}
+/// Records the auxiliary tuples one group contributes: its projected
+/// values followed by each head tuple the rule derives for it.
+fn recordGroupTuples(
+    db: *database.Database,
+    rule: syntax.Rule,
+    view: *auxiliary_view.AuxiliaryView,
+    group: *const syntax.Binding,
+) !void {
+    var answers: std.ArrayList(syntax.Binding) = .empty;
+    defer {
+        for (answers.items) |*answer| answer.deinit(db.allocator);
+        answers.deinit(db.allocator);
+    }
+    db.eval.matchClauses(
+        rule.body,
+        &db.closure.?,
+        0,
+        group,
+        &answers,
+        null,
+    ) catch |err| switch (err) {
+        errors.Error.NumericType, errors.Error.NumericOverflow => return,
+        else => return err,
+    };
+    for (answers.items) |*answer| {
+        const head_fact = try db.eval.deriveFact(rule.head, answer);
+        defer db.allocator.free(head_fact.terms);
+        const terms = (try auxiliaryTerms(db, view, group, head_fact)) orelse continue;
+        _ = view.tuples.insert(.{ .predicate = view.rule_id, .terms = terms }, false) catch |err| {
+            db.allocator.free(terms);
+            return err;
+        };
+    }
+}
+pub fn auxiliaryTerms(
+    db: *database.Database,
+    view: *const auxiliary_view.AuxiliaryView,
+    group: *const syntax.Binding,
+    head: relation_store.Fact,
+) !?[]relation_store.ValueId {
+    const terms = try db.allocator.alloc(relation_store.ValueId, view.arity());
+    var owned = true;
+    defer if (owned) db.allocator.free(terms);
+    for (view.projected, 0..) |variable, index| {
+        terms[index] = group.values.get(variable) orelse return null;
+    }
+    @memcpy(terms[view.projected.len..], head.terms);
+    owned = false;
+    return terms;
 }

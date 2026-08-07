@@ -12,11 +12,11 @@
 //! its bindings already made.
 
 const std = @import("std");
-const root = @import("root.zig");
+const database = @import("database.zig");
 const syntax = @import("syntax.zig");
 const relation_store = @import("relation_store.zig");
 
-pub fn validateRule(db: *root.Jatalog, head: syntax.Expr, body: []const syntax.Clause) !?usize {
+pub fn validateRule(db: *database.Database, head: syntax.Expr, body: []const syntax.Clause) !?usize {
     if (body.len == 0 or head.negated or syntax.isBuiltin(head)) return error.InvalidRule;
     const recursive_seed = try admissibleSeedArgument(head, body);
     var outer_variables: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
@@ -42,7 +42,7 @@ pub fn validateRule(db: *root.Jatalog, head: syntax.Expr, body: []const syntax.C
     return null;
 }
 fn validateRuleSafety(
-    db: *root.Jatalog,
+    db: *database.Database,
     head: syntax.Expr,
     ordered: []const syntax.Clause,
     outer_variables: *const std.AutoHashMapUnmanaged(syntax.Id, void),
@@ -86,7 +86,7 @@ fn firstStructuralArgument(head: syntax.Expr) ?usize {
         if (syntax.termContainsCons(term)) return index;
     return null;
 }
-pub fn validateRecursiveArithmetic(db: *root.Jatalog) !void {
+pub fn validateRecursiveArithmetic(db: *database.Database) !void {
     for (db.eval.rules.items) |rule| {
         if (!syntax.ruleContainsArithmetic(rule)) continue;
         const head = syntax.predicateKey(rule.head);
@@ -105,7 +105,7 @@ pub fn validateRecursiveArithmetic(db: *root.Jatalog) !void {
     }
 }
 fn predicateReaches(
-    db: *root.Jatalog,
+    db: *database.Database,
     current: relation_store.PredicateKey,
     target: relation_store.PredicateKey,
     visited: *std.AutoHashMapUnmanaged(relation_store.PredicateKey, void),
@@ -126,7 +126,7 @@ fn predicateReaches(
     return false;
 }
 pub fn validateClause(
-    db: *root.Jatalog,
+    db: *database.Database,
     clause: syntax.Clause,
     bound: *std.AutoHashMapUnmanaged(syntax.Id, void),
     outer_variables: *const std.AutoHashMapUnmanaged(syntax.Id, void),
@@ -161,7 +161,7 @@ pub fn validateClause(
     }
 }
 fn validateAggregate(
-    db: *root.Jatalog,
+    db: *database.Database,
     aggregate: syntax.Aggregate,
     outer_bound: *const std.AutoHashMapUnmanaged(syntax.Id, void),
     outer_variables: *const std.AutoHashMapUnmanaged(syntax.Id, void),
@@ -194,7 +194,7 @@ fn validateAggregate(
         try validateClause(db, clause, &inner_bound, &inner_outer_variables, safety_error);
     if (!syntax.termVariablesBound(aggregate.template, &inner_bound)) return safety_error;
 }
-pub fn orderClauses(db: *root.Jatalog, clauses: []const syntax.Clause) ![]syntax.Clause {
+pub fn orderClauses(db: *database.Database, clauses: []const syntax.Clause) ![]syntax.Clause {
     const result = try db.allocator.alloc(syntax.Clause, clauses.len);
     var index: usize = 0;
     for (clauses) |clause| switch (clause) {
@@ -236,7 +236,7 @@ pub fn orderClauses(db: *root.Jatalog, clauses: []const syntax.Clause) ![]syntax
     };
     return result;
 }
-pub fn validateStratification(db: *root.Jatalog) !void {
+pub fn validateStratification(db: *database.Database) !void {
     var levels = try db.eval.computeStrata();
     levels.deinit(db.allocator);
 }

@@ -1,5 +1,9 @@
 //! Assertions shared by the test suites of several modules.
 //!
+//! These take a `Database` rather than the public `Jatalog`, and reach no
+//! higher than materialization, so a module's tests can use them without
+//! importing anything above that module.
+//!
 //! Most check a database against a reference computed a different way, which
 //! is the property the whole engine rests on: maintaining the closure
 //! incrementally, rebuilding it from a dirty stratum and expanding it naively
@@ -9,8 +13,9 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const root = @import("root.zig");
+const database = @import("database.zig");
 const materialization = @import("materialization.zig");
+const results = @import("results.zig");
 
 /// Runs `scenario` once per allocation site with that allocation forced to
 /// fail, which is the coverage `std.testing.checkAllAllocationFailures` gives,
@@ -154,7 +159,7 @@ fn shardCount(site_count: usize) usize {
 /// Compares the maintained closure against a naive expansion of the same
 /// base facts, on a clone so the database under test is left untouched.
 /// Every incremental path must agree with this reference.
-pub fn expectClosureMatchesRebuild(db: *root.Jatalog) !void {
+pub fn expectClosureMatchesRebuild(db: *database.Database) !void {
     var staging = try db.clone();
     defer staging.deinit();
     var rebuilt = try staging.facts.clone();
@@ -167,7 +172,7 @@ pub fn expectClosureMatchesRebuild(db: *root.Jatalog) !void {
 }
 /// Compares the semi-naive closure against the naive reference closure on a
 /// staging clone, so the database under test is left untouched.
-pub fn expectSemiNaiveMatchesNaive(db: *root.Jatalog) !void {
+pub fn expectSemiNaiveMatchesNaive(db: *database.Database) !void {
     var staging = try db.clone();
     defer staging.deinit();
     var semi = try staging.facts.clone();
@@ -180,16 +185,9 @@ pub fn expectSemiNaiveMatchesNaive(db: *root.Jatalog) !void {
     for (0..naive.len()) |index|
         try std.testing.expect(try semi.contains(naive.factAt(index)));
 }
-/// Runs one source query and asserts how many answers it produces.
-pub fn expectAnswerCount(db: *root.Jatalog, source: []const u8, expected: usize) !void {
-    var result = try db.execute(source);
-    defer result.deinit();
-    try std.testing.expectEqual(expected, result.query.answers.items.len);
-}
-
 /// Formats one answer binding and compares it with its source spelling.
 pub fn expectBindingValue(
-    binding: *const root.Answer,
+    binding: *const results.Answer,
     variable: []const u8,
     expected: []const u8,
 ) !void {

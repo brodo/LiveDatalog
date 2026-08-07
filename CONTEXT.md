@@ -97,3 +97,15 @@ are rebuildable caches over it. Pattern indexes are candidate prefilters:
 evaluation unifies every candidate, so indexing can never change which facts
 match, only how quickly candidates are found. Base and derived facts share
 one store per evaluation but stay distinguishable through a per-entry flag.
+
+### Database
+
+The engine's state: the interned program, the base facts, the derived closure,
+the auxiliary views, and the materialization tri-state (`database.zig`). Every
+layer between the state and the public interface — compilation, validation,
+materialization, maintenance, aggregate views, statements, parsing — operates
+on a `Database` and does not name the interface above it.
+
+`Jatalog` is what an embedder holds: it owns one `Database` and exposes the
+operations that change it. The split is what makes the engine's imports
+acyclic; see [ADR 0002](docs/adr/0002-acyclic-module-layering.md).
