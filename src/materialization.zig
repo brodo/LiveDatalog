@@ -171,10 +171,10 @@ fn buildAuxiliaryView(db: *database.Database, rule: syntax.Rule, clause_index: u
     }
     var initial: syntax.Binding = .{};
     defer initial.deinit(db.allocator);
-    db.eval.matchClauses(
-        outer,
+    db.eval.solve(
         &db.closure.?,
-        0,
+        rule.head,
+        outer,
         &initial,
         &groups,
         null,
@@ -198,10 +198,10 @@ fn recordGroupTuples(
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
     }
-    db.eval.matchClauses(
-        rule.body,
+    db.eval.solve(
         &db.closure.?,
-        0,
+        rule.head,
+        rule.body,
         group,
         &answers,
         null,

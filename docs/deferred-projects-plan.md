@@ -396,6 +396,75 @@ P2 was completed on 2026-08-06 with these decisions:
 - Benchmarks include sparse joins, dense joins, recursive closure, empty
   aggregates, and large aggregate groups.
 
+### Completed decisions
+
+P3 was completed on 2026-08-07:
+
+- Clause order is now decided twice, and the two decisions are deliberately
+  kept apart. `validation.orderClauses` still fixes the stored order at
+  admission time and is unchanged, so no program's admissibility moved. The
+  new `planner.zig` reorders that already-safe body again at evaluation time,
+  purely on cost. Keeping admission out of it is what makes the planner
+  unable to fail: the stored order is a witness that a safe order exists.
+- A clause is *ready* when the variables it consumes are bound, by exactly the
+  condition `validation.validateClause` admits it under, so any order the
+  planner produces is one admission would have accepted. Readiness is monotone
+  in the bound set, so a greedy walk that always places some ready clause
+  cannot strand the rest; if nothing is ready, no safe order of the remainder
+  existed and the planner falls back to the order it was handed.
+- Among ready clauses it takes the one expected to examine the fewest
+  candidates. `RelationStore.selectivity` is the statistic: the relation's
+  size and the number of groups an index on the bound positions splits it
+  into. A `setof` is costed by its inner plan, and a built-in at zero, so
+  neither needs a special case to land before the joins that would run it
+  repeatedly — they do not multiply their input, and costing them by their own
+  work puts them where that matters.
+- A correlated `setof` is ready only once every variable it shares with the
+  surrounding body is bound, which is the same condition that makes it
+  correlated to one group. Its inner body is planned from the outer bindings,
+  which is what lets it collect members through an index on the group key.
+- Sorting was **not** avoided. A pattern index emits insertion order, never
+  the canonical structural order, so the phase's precondition for skipping the
+  sort is not met and `setof` keeps its sort-and-deduplicate path.
+- `matchClauses` walks a `Plan` rather than a clause slice, because a step
+  carries more than its clause: the stored body position a semi-naive delta
+  restriction names — translated through `Plan.constrain`, so the restriction
+  follows the occurrence rather than the slot — and the inner plan of a
+  `setof`. Every body solve in the engine now goes through `Evaluator.solve`.
+- An answer names its variables in the order the *query* writes them, not the
+  order evaluation bound them. This had to change with the planner: binding
+  order is join order, and join order now moves with the data, so what a
+  caller reads would otherwise have moved with it too.
+- `selectivity` never builds an index, and `RelationStore.lookup` builds one
+  on the *second* request for a pattern rather than the first. A single probe
+  cannot repay a pass over the relation plus a group per distinct key, and the
+  whole relation is already a valid candidate set under P1's superset
+  contract. Deciding this in the store rather than in the planner was the
+  second attempt: a planner-side rule based on the estimated row count fed
+  back on itself — a plan that declined to index left the index unbuilt, so
+  the next plan saw no statistic and declined again, which cost 3x on
+  structural deletion and gave back the whole recursive-closure win.
+- The public interface gained `setPlanPolicy` (`.cost_based` by default,
+  `.source_order` for the pre-P3 order) and `explainQuery`, which renders the
+  chosen order, each goal's index positions, and the candidates the planner
+  expected. Both policies are differentially tested to produce the same
+  closure and the same answers.
+- Measured on the existing benchmarks: recomputing an edge change on the
+  25-node closure improved 1.41x, maintaining one 1.16x, and incremental
+  structural leaf deletion 1.09x; repeated materialized queries and the
+  aggregation query workload were unchanged. The new
+  `benchmark-join-planning` compares the planned order against the stored
+  order directly and finds 1.40x on a sparse join and 1.02–1.06x on the other
+  four shapes. Numbers and the limitation they expose are in
+  [`aggregation-performance.md`](aggregation-performance.md).
+- The limitation worth recording: a statement runs on a clone, and cloning
+  drops the store's caches, so query planning sees relation sizes but never an
+  index statistic, and any index a query uses is built for that query alone.
+  Planning is therefore cardinality-driven on the query path and fully
+  statistic-driven on the rule-evaluation path, where the store lives across
+  rounds. Making caches survive `clone` is the lever, and it is P1 lifecycle
+  work rather than planning work.
+
 # Project M: persistent and incremental view maintenance
 
 Chapter 5 defines differential relations and the CReaM optimization for

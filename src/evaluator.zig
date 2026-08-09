@@ -17,6 +17,7 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const syntax = @import("syntax.zig");
+const planner = @import("planner.zig");
 const relation_store = @import("relation_store.zig");
 const cost_model = @import("cost_model.zig");
 
@@ -135,6 +136,8 @@ pub const Evaluator = struct {
     expansions: usize = 0,
     /// Chooses between maintaining and recomputing, and learns both costs.
     cost: cost_model.CostModel = .{},
+    /// How a body's clause order is chosen before it is solved.
+    plan_policy: planner.PlanPolicy = .cost_based,
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         return .{
@@ -161,6 +164,7 @@ pub const Evaluator = struct {
             .next_rule_id = self.next_rule_id,
             .expansions = self.expansions,
             .cost = self.cost,
+            .plan_policy = self.plan_policy,
         };
         errdefer result.scalars.deinit();
         result.values = try self.values.clone();
@@ -318,6 +322,44 @@ pub const Evaluator = struct {
         }
     }
 
+    /// Plans `clauses` against `facts` and solves them in the planned order.
+    ///
+    /// A caller that addresses a body occurrence by its stored position — a
+    /// semi-naive delta round is the only one that does — passes it in
+    /// `constraint` and this translates it to the position the plan gave it,
+    /// so the restriction follows the clause rather than the slot.
+    pub fn solve(
+        self: *Evaluator,
+        facts: *relation_store.RelationStore,
+        head: ?syntax.Expr,
+        clauses: []const syntax.Clause,
+        bindings: *const syntax.Binding,
+        answers: *std.ArrayList(syntax.Binding),
+        constraint: ?syntax.DeltaConstraint,
+    ) !void {
+        var chosen = try self.planFor(facts, head, clauses, bindings);
+        defer chosen.deinit();
+        try self.matchClauses(&chosen, facts, 0, bindings, answers, chosen.constrain(constraint));
+    }
+
+    /// Plans `clauses` taking whatever `bindings` already fixes as bound.
+    pub fn planFor(
+        self: *Evaluator,
+        facts: *relation_store.RelationStore,
+        head: ?syntax.Expr,
+        clauses: []const syntax.Clause,
+        bindings: *const syntax.Binding,
+    ) !planner.Plan {
+        return planner.plan(
+            self.allocator,
+            facts,
+            head,
+            clauses,
+            bindings.values.keys(),
+            self.plan_policy,
+        );
+    }
+
     pub fn applyRule(
         self: *Evaluator,
         facts: *relation_store.RelationStore,
@@ -330,6 +372,12 @@ pub const Evaluator = struct {
             answers.deinit(self.allocator);
         }
         if (rule.seed_argument) |argument| {
+            // One plan serves every seed value. A seed unification that
+            // succeeds binds the whole seed term, so every iteration that gets
+            // as far as solving the body starts from the same bound variables;
+            // planning on the first of them is planning for all of them.
+            var chosen: ?planner.Plan = null;
+            defer if (chosen) |*value| value.deinit();
             const value_count = self.values.values.items.len;
             for (0..value_count) |value| {
                 var initial: syntax.Binding = .{};
@@ -340,8 +388,10 @@ pub const Evaluator = struct {
                     &initial,
                 );
                 if (seeded) {
+                    if (chosen == null)
+                        chosen = try self.planFor(facts, rule.head, rule.body, &initial);
                     self.matchClauses(
-                        rule.body,
+                        &chosen.?,
                         facts,
                         0,
                         &initial,
@@ -356,7 +406,7 @@ pub const Evaluator = struct {
         } else {
             var initial: syntax.Binding = .{};
             defer initial.deinit(self.allocator);
-            try self.matchClauses(rule.body, facts, 0, &initial, &answers, constraint);
+            try self.solve(facts, rule.head, rule.body, &initial, &answers, constraint);
         }
         for (answers.items) |*answer| {
             const derived = try self.deriveFact(rule.head, answer);
@@ -389,15 +439,22 @@ pub const Evaluator = struct {
         };
     }
 
+    /// Solves a plan from step `index`, extending `bindings` and appending one
+    /// answer per complete solution.
+    ///
+    /// The plan rather than the clause slice is what is walked, because a step
+    /// carries more than its clause: the stored body position a delta
+    /// restriction names, and the inner plan of a `setof`.
     pub fn matchClauses(
         self: *Evaluator,
-        clauses: []const syntax.Clause,
+        plan: *const planner.Plan,
         facts: *relation_store.RelationStore,
         index: usize,
         bindings: *const syntax.Binding,
         answers: *std.ArrayList(syntax.Binding),
         constraint: ?syntax.DeltaConstraint,
     ) !void {
+        const clauses = plan.clauses;
         if (index == clauses.len) {
             var answer = try bindings.clone(self.allocator);
             answers.append(self.allocator, answer) catch |err| {
@@ -413,7 +470,7 @@ pub const Evaluator = struct {
                 for (inner_answers.items) |*answer| answer.deinit(self.allocator);
                 inner_answers.deinit(self.allocator);
             }
-            try self.matchClauses(aggregate.body, facts, 0, bindings, &inner_answers, null);
+            try self.matchClauses(plan.steps[index].inner.?, facts, 0, bindings, &inner_answers, null);
 
             var values: std.ArrayList(syntax.ValueId) = .empty;
             defer values.deinit(self.allocator);
@@ -443,7 +500,7 @@ pub const Evaluator = struct {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
             if (try self.unifyValueTerm(list, aggregate.output, &next))
-                try self.matchClauses(clauses, facts, index + 1, &next, answers, constraint);
+                try self.matchClauses(plan, facts, index + 1, &next, answers, constraint);
             return;
         }
         const expression = switch (clauses[index]) {
@@ -457,7 +514,7 @@ pub const Evaluator = struct {
             defer next.deinit(self.allocator);
             const matched = try self.evalBuiltin(expression, &next);
             if (matched != expression.negated)
-                try self.matchClauses(clauses, facts, index + 1, &next, answers, constraint);
+                try self.matchClauses(plan, facts, index + 1, &next, answers, constraint);
             return;
         }
         if (expression.negated) {
@@ -466,7 +523,7 @@ pub const Evaluator = struct {
                 defer next.deinit(self.allocator);
                 if (try self.unify(facts.factAt(candidate), expression, &next)) return;
             }
-            try self.matchClauses(clauses, facts, index + 1, bindings, answers, constraint);
+            try self.matchClauses(plan, facts, index + 1, bindings, answers, constraint);
             return;
         }
         for (try self.lookupCandidates(facts, expression, bindings)) |candidate| {
@@ -477,7 +534,7 @@ pub const Evaluator = struct {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
             if (try self.unify(facts.factAt(candidate), expression, &next))
-                try self.matchClauses(clauses, facts, index + 1, &next, answers, constraint);
+                try self.matchClauses(plan, facts, index + 1, &next, answers, constraint);
         }
     }
 

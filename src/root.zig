@@ -18,6 +18,7 @@ const input_compiler = @import("input_compiler.zig");
 const maintenance = @import("maintenance.zig");
 const materialization = @import("materialization.zig");
 const parser = @import("parser.zig");
+const planner = @import("planner.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const scalar = @import("scalar.zig");
@@ -39,6 +40,8 @@ pub const QueryResult = results.QueryResult;
 pub const ExecutionResult = results.ExecutionResult;
 /// Re-exported so callers select a policy without importing the model.
 pub const MaintenancePolicy = cost_model.MaintenancePolicy;
+/// Re-exported so callers select a policy without importing the planner.
+pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
 pub const Statement = statement.Statement;
 
@@ -203,6 +206,33 @@ pub const Jatalog = struct {
     /// one specific path regardless of cost.
     pub fn setMaintenancePolicy(self: *Jatalog, policy: cost_model.MaintenancePolicy) void {
         self.state.eval.cost.policy = policy;
+    }
+
+    /// Selects the order a rule body or query is solved in. The default is
+    /// `.cost_based`, which reorders goals whose bindings allow it by how many
+    /// candidate facts each is expected to examine. `.source_order` keeps the
+    /// order admission stored, which is what the engine did before it planned;
+    /// both produce the same answers, so this is a cost choice only.
+    pub fn setPlanPolicy(self: *Jatalog, policy: planner.PlanPolicy) void {
+        self.state.eval.plan_policy = policy;
+    }
+
+    /// Renders the plan these goals would be solved under: the clause order,
+    /// the index each goal is looked up through, and the candidates the
+    /// planner expected it to examine. The caller owns the returned text.
+    ///
+    /// Planning reads the closure's statistics, so this materializes the
+    /// database exactly as running the query would, and answers nothing.
+    pub fn explainQuery(self: *Jatalog, goals: []const input.Goal) ![]u8 {
+        try materialization.ensureMaterialized(&self.state);
+        var staging = try self.state.clone();
+        defer staging.deinit();
+        const compiled = try compile.compileGoals(&staging, goals);
+        defer {
+            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
+            staging.allocator.free(compiled);
+        }
+        return statement.explainClauses(&staging, compiled);
     }
 
     /// Records how the maintained views are classified and how much work
@@ -3100,6 +3130,7 @@ test "a rebuild fallback is charged to the rebuild estimate, not to maintenance"
     // and rebuilds. The rebuild is real work, but it is recomputation work:
     // charging it to the maintenance estimate as well would let one event
     // push both estimates in opposite directions.
+    const before = db.state.eval.cost.work;
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
     }));
@@ -3107,10 +3138,15 @@ test "a rebuild fallback is charged to the rebuild estimate, not to maintenance"
     try std.testing.expect(stats.rebuild_fallbacks > 0);
     try std.testing.expect(stats.rebuild_work != null);
     try std.testing.expect(stats.maintenance_work_per_fact != null);
-    // One base fact changed, so the per-fact estimate is the whole measured
-    // maintenance cost. With the rebuild excluded it is only the abandoned
-    // over-deletion attempt, which is far cheaper than the rebuild itself.
-    try std.testing.expect(stats.maintenance_work_per_fact.? < stats.rebuild_work.?);
+    // Both estimates are this database's first, so each is the raw
+    // observation. One base fact changed, so the per-fact estimate is the
+    // whole maintenance measurement — and the two together must account for
+    // the batch exactly once. Were the rebuild counted on both sides, this sum
+    // would exceed the work the batch actually did.
+    try std.testing.expectEqual(
+        db.state.eval.cost.work - before,
+        stats.rebuild_work.? + stats.maintenance_work_per_fact.?,
+    );
 }
 
 test "the cost model changes the path taken but never the result" {
@@ -3904,4 +3940,196 @@ fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
 
 test "aggregate maintenance releases every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(aggregateMaintenanceAllocationScenario);
+}
+
+// Join planning (P3). The planner reorders goals whose bindings allow it, so
+// the properties worth pinning are that it never reorders past a binding, that
+// reordering does not change what a program means, and that the order it chose
+// can be inspected.
+
+/// The program the planning tests query: two relations of very different size,
+/// a filter over each, and one correlated aggregate.
+const planning_program =
+    \\few(a). few(b). few(c).
+    \\many(a). many(b). many(c). many(d). many(e). many(f). many(g). many(h).
+    \\skip(c).
+    \\member(a, one). member(a, two). member(b, three).
+;
+
+test "the planner solves the smaller relation first" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(planning_program);
+    setup.deinit();
+
+    // Written most-selective-last on purpose: `many` has eight facts and no
+    // bound argument, `few` has one. Solving `few` first turns the second goal
+    // into a one-candidate index lookup instead of an eight-fact scan.
+    const explained = try db.explainQuery(&.{
+        input.relation("many", &.{input.variable("X")}),
+        input.relation("few", &.{input.variable("X")}),
+    });
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings(
+        \\few/1 join scan ~3
+        \\many/1 join index {0} ~8
+        \\
+    , explained);
+}
+
+test "planning never moves a goal before the bindings it needs" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(planning_program);
+    setup.deinit();
+
+    // Every goal but the first is cheaper than `many(X)` and would be hoisted
+    // on cost alone: the negation and the comparison examine nothing, the
+    // arithmetic examines nothing, and the aggregate's inner relation is
+    // smaller. None of them may move, because each consumes a variable only
+    // the goals before it bind.
+    const explained = try db.explainQuery(&.{
+        input.relation("many", &.{input.variable("X")}),
+        input.not("skip", &.{input.variable("X")}),
+        input.setof(
+            input.variable("T"),
+            &.{input.relation("member", &.{ input.variable("X"), input.variable("T") })},
+            input.variable("S"),
+        ),
+        input.relation("few", &.{input.variable("Y")}),
+        input.notEqual(input.variable("X"), input.variable("Y")),
+    });
+    defer std.testing.allocator.free(explained);
+    try std.testing.expectEqualStrings(
+        \\few/1 join scan ~3
+        \\many/1 join scan ~8
+        \\<>/2 filter
+        \\skip/1 anti-join index {0} ~1
+        \\setof aggregate
+        \\  member/2 join index {0} ~3
+        \\
+    , explained);
+}
+
+test "a plan chosen on cost answers exactly what the stored order answers" {
+    // The two policies are the same program solved in two different orders.
+    // Nothing else about the databases differs, so any disagreement in the
+    // answers or in the closure is a planning bug rather than a cost decision.
+    const program =
+        \\edge(a, b). edge(b, c). edge(c, d). edge(d, e). edge(b, e).
+        \\node(a). node(b). node(c). node(d). node(e). node(f).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\unreached(X) :- node(X), not path(a, X).
+        \\reach(X, S) :- node(X), setof(Y, path(X, Y), S).
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\breadth(X, N) :- reach(X, S), length(S, N).
+    ;
+    const question = "breadth(X, N), unreached(U), N < 4?";
+
+    var planned: Jatalog = .init(std.testing.allocator);
+    defer planned.deinit();
+    var stored: Jatalog = .init(std.testing.allocator);
+    defer stored.deinit();
+    stored.setPlanPolicy(.source_order);
+    for ([_]*Jatalog{ &planned, &stored }) |db| {
+        var setup = try db.execute(program);
+        setup.deinit();
+        try db.materialize();
+    }
+
+    try std.testing.expectEqual(
+        stored.state.closure.?.len(),
+        planned.state.closure.?.len(),
+    );
+    for (0..stored.state.closure.?.len()) |index|
+        try std.testing.expect(try planned.state.closure.?.contains(stored.state.closure.?.factAt(index)));
+
+    var planned_result = try planned.execute(question);
+    defer planned_result.deinit();
+    var stored_result = try stored.execute(question);
+    defer stored_result.deinit();
+    const planned_lines = try answerLines(&planned_result.query);
+    defer freeLines(planned_lines);
+    const stored_lines = try answerLines(&stored_result.query);
+    defer freeLines(stored_lines);
+    try std.testing.expectEqual(stored_lines.len, planned_lines.len);
+    for (stored_lines, planned_lines) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+}
+
+/// One line per answer, sorted, so two runs can be compared as sets. Answers
+/// name their variables in the order the query does, which is what makes the
+/// lines comparable across plans in the first place.
+fn answerLines(result: *const results.QueryResult) ![][]u8 {
+    const allocator = std.testing.allocator;
+    const lines = try allocator.alloc([]u8, result.answers.items.len);
+    var written: usize = 0;
+    errdefer {
+        for (lines[0..written]) |line| allocator.free(line);
+        allocator.free(lines);
+    }
+    for (result.answers.items, lines) |*answer, *line| {
+        var text: std.Io.Writer.Allocating = .init(allocator);
+        defer text.deinit();
+        for (answer.bindings.items) |binding| {
+            const value = try binding.value.formatAlloc(allocator);
+            defer allocator.free(value);
+            text.writer.print("{s}={s};", .{ binding.name, value }) catch return error.OutOfMemory;
+        }
+        line.* = try text.toOwnedSlice();
+        written += 1;
+    }
+    std.mem.sort([]u8, lines, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return lines;
+}
+
+fn freeLines(lines: [][]u8) void {
+    for (lines) |line| std.testing.allocator.free(line);
+    std.testing.allocator.free(lines);
+}
+
+test "an answer names its variables in the query's order, not the plan's" {
+    // The plan is a cost decision and moves with the data; what a caller reads
+    // must not. Here the planner solves `few` first, and the answer still
+    // leads with the variable the query leads with.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var setup = try db.execute(planning_program);
+    setup.deinit();
+    var result = try db.execute("many(X), few(Y)?");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 24), result.query.answers.items.len);
+    for (result.query.answers.items) |answer| {
+        try std.testing.expectEqualStrings("X", answer.bindings.items[0].name);
+        try std.testing.expectEqualStrings("Y", answer.bindings.items[1].name);
+    }
+}
+
+fn planningAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute(
+        \\edge(a, b). edge(b, c). node(a). node(b). node(c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\reach(X, S) :- node(X), setof(Y, path(X, Y), S).
+    );
+    setup.deinit();
+    var result = try db.execute("reach(a, S), not path(a, a)?");
+    result.deinit();
+    const explained = try db.explainQuery(&.{
+        input.relation("reach", &.{ input.variable("X"), input.variable("S") }),
+        input.not("path", &.{ input.variable("X"), input.variable("X") }),
+    });
+    allocator.free(explained);
+}
+
+test "planning and explaining release every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(planningAllocationScenario);
 }

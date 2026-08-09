@@ -384,3 +384,83 @@ over-deletes a seeded rule's head. `benchmark-maintenance` measured 642794,
 712348, 867990 and 339653 ns/batch for the four incremental rows, and the
 25-node baseline 133875 ns/change with incremental maintenance against
 1101254 with recomputation — all within host variation of the M6 records.
+
+## 2026-08-07 after P3 (join planning)
+
+P3 reorders an already-safe body at evaluation time by how many candidate
+facts each goal is expected to examine. Two things are measured: whether the
+planned order beats the stored order on the shapes the phase named, and
+whether the planning itself costs anything on the workloads that were already
+fast.
+
+### The planned order against the stored order
+
+```sh
+zig build benchmark-join-planning -Doptimize=ReleaseFast
+```
+
+Each workload runs twice on identical databases, once with `.source_order` —
+the order admission stores, which is what the engine did before this phase —
+and once with `.cost_based`. Both are checked to answer the same rows.
+
+| Workload | Stored order | Planned | Ratio |
+| --- | --- | --- | --- |
+| sparse join | 145664 | 103702 | 1.40x |
+| dense join | 169370 | 160200 | 1.06x |
+| recursive closure | 32158 | 32704 | 0.98x |
+| empty aggregate | 111483 | 107764 | 1.03x |
+| large aggregate groups | 81712 | 80231 | 1.02x |
+
+Medians of five process-level samples, ns/query, arm64, macOS 26.5.0, Zig
+0.16.0, `ReleaseFast`.
+
+Only the sparse join moves much, and that is the expected shape: it is the one
+where the two orders differ in how many bindings the join produces rather than
+only in which index answers it. The other four are cases where the source
+order was already the order the planner picks — which is the honest result for
+hand-written programs, and the reason the planner is worth more to rule
+evaluation, where a body is re-solved once per delta round, than to a query
+asked once.
+
+### The existing workloads
+
+| Workload | Before P3 | After P3 | Ratio |
+| --- | --- | --- | --- |
+| aggregation, 10 queries (ns/query) | 52987 | 52566 | 1.01x |
+| aggregation, incremental edge change (ns) | 117495 | 101433 | 1.16x |
+| aggregation, recomputed edge change (ns) | 896745 | 637033 | 1.41x |
+| materialization, repeated query (ns) | 22462 | 23087 | 0.97x |
+| structural leaf, incremental delete (ns) | 170368 | 156956 | 1.09x |
+| structural base, incremental delete (ns) | 4673427 | 4620493 | 1.01x |
+
+Medians of five process-level samples on the same host. `benchmark-maintenance`
+and `benchmark-projected-aggregate` are within host variation of their M6 and
+M5 records; the projected-aggregate workload is about 5% slower, which is
+planning overhead on one- and two-goal bodies that planning cannot improve.
+
+Recomputing a stratum is where planning pays: a rebuild re-solves every rule
+body once per delta round, so a better order is charged for once and collected
+many times.
+
+### What the numbers exposed
+
+Two findings the phase did not set out to make.
+
+The first attempt let the *planner* decide whether to look a goal up through
+an index or scan the relation, from its running estimate of how many bindings
+would reach the goal. That fed back on itself: a plan that declined to build
+an index left the index unbuilt, so the next plan saw no statistic for it and
+declined again. It fixed the sparse join and cost 3x on structural deletion
+while giving back the whole recursive-closure gain. The decision belongs to
+the store, which can see how often a pattern is asked for — `lookup` now
+answers the first request for a pattern with the relation and builds the index
+on the second — and with that in place the sparse join is 1.40x faster with no
+loss anywhere else.
+
+The second is a limit on how much planning can know. Every statement runs on a
+clone, and cloning drops the store's caches, so a query's planner sees
+relation sizes but never an index statistic, and any index the query uses is
+built for that one query. Planning is fully statistic-driven only on the
+rule-evaluation path, where the store lives across delta rounds — which is
+also where the measured gains are. Making the caches survive `clone` is the
+lever for the query path, and it is P1 lifecycle work.

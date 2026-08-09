@@ -256,10 +256,10 @@ fn sweepVanishedGroups(
             for (solutions.items) |*solution| solution.deinit(db.allocator);
             solutions.deinit(db.allocator);
         }
-        db.eval.matchClauses(
-            outer,
+        db.eval.solve(
             &db.closure.?,
-            0,
+            rule.head,
+            outer,
             &seed,
             &solutions,
             null,
@@ -347,10 +347,10 @@ fn deriveGroupHeads(
         for (answers.items) |*answer| answer.deinit(db.allocator);
         answers.deinit(db.allocator);
     }
-    db.eval.matchClauses(
-        rule.body,
+    db.eval.solve(
         &db.closure.?,
-        0,
+        rule.head,
+        rule.body,
         group,
         &answers,
         null,
@@ -377,10 +377,10 @@ fn collectAggregateGroups(
         for (solutions.items) |*solution| solution.deinit(db.allocator);
         solutions.deinit(db.allocator);
     }
-    db.eval.matchClauses(
-        outer,
+    db.eval.solve(
         &db.closure.?,
-        0,
+        null,
+        outer,
         seed,
         &solutions,
         null,

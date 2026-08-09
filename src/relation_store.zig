@@ -50,12 +50,35 @@ const FactContext = struct {
 
 const no_entries: [0]u32 = .{};
 
+/// How many facts a relation holds and how many distinct keys an index on a
+/// given mask projects them onto. A planner divides one by the other to
+/// estimate what a lookup on that mask will return, without knowing the
+/// values it will be given.
+pub const Selectivity = struct {
+    facts: usize,
+    /// Distinct projected keys the index holds, or null when there is no index
+    /// on that mask yet. An empty relation reports one (empty) key.
+    groups: ?usize,
+
+    /// Candidates a lookup on this mask is expected to return. An index that
+    /// does not exist yet is assumed to give nothing away, so a mask whose
+    /// index has never been built rates no better than a scan. Building it to
+    /// find out is what this deliberately does not do; the first lookup builds
+    /// it, and the next plan sees what it is worth.
+    pub fn estimate(self: Selectivity) usize {
+        return self.facts / (self.groups orelse 1);
+    }
+};
+
 pub const RelationStore = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
     membership: ?Membership = null,
     buckets: ?Buckets = null,
     patterns: Patterns = .empty,
+    /// Patterns asked for once and answered with a scan. The second request
+    /// is what builds the index; see `lookup`.
+    requested: std.AutoHashMapUnmanaged(PatternId, void) = .empty,
 
     const Entry = struct {
         fact: Fact,
@@ -125,6 +148,8 @@ pub const RelationStore = struct {
         while (iterator.next()) |pattern| pattern.deinit(self.allocator);
         self.patterns.deinit(self.allocator);
         self.patterns = .empty;
+        self.requested.deinit(self.allocator);
+        self.requested = .empty;
     }
 
     pub fn clone(self: *const RelationStore) !RelationStore {
@@ -253,8 +278,16 @@ pub const RelationStore = struct {
     /// Returns candidate indices, in insertion order, for facts whose terms
     /// at the positions set in `mask` may equal `bound` (listed in ascending
     /// position order). Candidates are a superset of the exact matches, so
-    /// callers must verify each candidate. The pattern index for `mask` is
-    /// created on first use.
+    /// callers must verify each candidate.
+    ///
+    /// The pattern index for `mask` is created on the *second* request, not
+    /// the first. Building one costs a pass over the relation and a group per
+    /// distinct key, which a single probe cannot repay — the whole relation is
+    /// a valid candidate set and answering with it examines no more facts than
+    /// building the index would touch, without allocating any. A pattern asked
+    /// for twice will almost certainly be asked for again, so that is where
+    /// the index is worth its construction. Set membership rather than a count
+    /// is enough: the question is only whether this is the first request.
     pub fn lookup(
         self: *RelationStore,
         key: PredicateKey,
@@ -262,9 +295,33 @@ pub const RelationStore = struct {
         bound: []const ValueId,
     ) ![]const u32 {
         if (mask == 0) return self.predicateEntries(key);
-        const pattern = try self.ensurePattern(.{ .name = key.name, .arity = key.arity, .mask = mask });
+        const id: PatternId = .{ .name = key.name, .arity = key.arity, .mask = mask };
+        if (self.patterns.getPtr(id) == null) {
+            const first = try self.requested.getOrPut(self.allocator, id);
+            if (!first.found_existing) return self.predicateEntries(key);
+        }
+        const pattern = try self.ensurePattern(id);
         const group = pattern.groups.get(tupleHash(bound)) orelse return &no_entries;
         return group.items;
+    }
+
+    /// The relation's size, and the number of groups an index on `mask` splits
+    /// it into if such an index has already been built.
+    ///
+    /// This never builds one. An index costs a pass over the relation and one
+    /// group per distinct key, which is a price worth paying for a lookup that
+    /// is going to happen and pure loss for a plan that is not chosen — so a
+    /// planner is told about the indexes that exist, and evaluating the plan it
+    /// picks is what creates the rest.
+    pub fn selectivity(self: *RelationStore, key: PredicateKey, mask: u64) !Selectivity {
+        const facts = (try self.predicateEntries(key)).len;
+        if (mask == 0 or facts == 0) return .{ .facts = facts, .groups = 1 };
+        const pattern = self.patterns.getPtr(.{
+            .name = key.name,
+            .arity = key.arity,
+            .mask = mask,
+        }) orelse return .{ .facts = facts, .groups = null };
+        return .{ .facts = facts, .groups = @max(1, pattern.groups.count()) };
     }
 
     fn ensureMembership(self: *RelationStore) !*Membership {
@@ -333,6 +390,14 @@ fn testFact(allocator: std.mem.Allocator, predicate: Id, terms: []const ValueId)
     return .{ .predicate = predicate, .terms = try allocator.dupe(ValueId, terms) };
 }
 
+/// Looks up through the pattern index rather than through the scan the first
+/// request for a pattern is answered with. Both are valid candidate sets; a
+/// test that pins the exact one has to ask twice to get it.
+fn indexedLookup(store: *RelationStore, key: PredicateKey, mask: u64, bound: []const ValueId) ![]const u32 {
+    _ = try store.lookup(key, mask, bound);
+    return store.lookup(key, mask, bound);
+}
+
 test "insert duplicate insert membership and predicate buckets" {
     var store: RelationStore = .init(std.testing.allocator);
     defer store.deinit();
@@ -357,9 +422,9 @@ test "predicate names reused at different arities never share an index" {
     try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 7, &.{5}), false));
     try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 7, &.{ 5, 5 }), false));
 
-    const unary = try store.lookup(.{ .name = 7, .arity = 1 }, 0b1, &.{5});
+    const unary = try indexedLookup(&store, .{ .name = 7, .arity = 1 }, 0b1, &.{5});
     try std.testing.expectEqualSlices(u32, &.{0}, unary);
-    const binary = try store.lookup(.{ .name = 7, .arity = 2 }, 0b1, &.{5});
+    const binary = try indexedLookup(&store, .{ .name = 7, .arity = 2 }, 0b1, &.{5});
     try std.testing.expectEqualSlices(u32, &.{1}, binary);
     try std.testing.expectEqualSlices(u32, &.{0}, try store.predicateEntries(.{ .name = 7, .arity = 1 }));
     try std.testing.expectEqualSlices(u32, &.{1}, try store.predicateEntries(.{ .name = 7, .arity = 2 }));
@@ -375,19 +440,19 @@ test "pattern lookups stay consistent across inserts deletes and clear" {
     try std.testing.expectEqualSlices(
         u32,
         &.{ 0, 1 },
-        try store.lookup(.{ .name = 3, .arity = 2 }, 0b10, &.{100}),
+        try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b10, &.{100}),
     );
     try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 3, &.{ 3, 100 }), true));
     try std.testing.expect(try store.insert(try testFact(std.testing.allocator, 3, &.{ 3, 200 }), true));
     try std.testing.expectEqualSlices(
         u32,
         &.{ 0, 1, 2 },
-        try store.lookup(.{ .name = 3, .arity = 2 }, 0b10, &.{100}),
+        try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b10, &.{100}),
     );
     try std.testing.expectEqualSlices(
         u32,
         &.{2},
-        try store.lookup(.{ .name = 3, .arity = 2 }, 0b11, &.{ 3, 100 }),
+        try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b11, &.{ 3, 100 }),
     );
     try std.testing.expect(!store.isDerived(0));
     try std.testing.expect(store.isDerived(2));
@@ -396,7 +461,7 @@ test "pattern lookups stay consistent across inserts deletes and clear" {
     try std.testing.expectEqualSlices(
         u32,
         &.{ 0, 1 },
-        try store.lookup(.{ .name = 3, .arity = 2 }, 0b10, &.{100}),
+        try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b10, &.{100}),
     );
     try std.testing.expect(!try store.contains(.{ .predicate = 3, .terms = @constCast(&[_]ValueId{ 2, 100 }) }));
 
@@ -410,8 +475,35 @@ test "pattern lookups stay consistent across inserts deletes and clear" {
     try std.testing.expectEqualSlices(
         u32,
         &.{0},
-        try store.lookup(.{ .name = 3, .arity = 2 }, 0b11, &.{ 2, 100 }),
+        try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b11, &.{ 2, 100 }),
     );
+}
+
+test "a pattern index is built on the second request, not the first" {
+    // A single probe cannot repay a pass over the relation and a group per
+    // distinct key, so the first request for a pattern is answered with the
+    // relation instead. That is a candidate set like any other — the caller
+    // unifies every candidate — and it is what keeps a query that touches a
+    // large relation once from paying to index it.
+    var store: RelationStore = .init(std.testing.allocator);
+    defer store.deinit();
+    for (0..4) |value| _ = try store.insert(
+        try testFact(std.testing.allocator, 5, &.{ @intCast(value), 9 }),
+        false,
+    );
+
+    const key: PredicateKey = .{ .name = 5, .arity = 2 };
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, try store.lookup(key, 0b01, &.{2}));
+    try std.testing.expectEqual(@as(usize, 0), store.patterns.count());
+    try std.testing.expectEqualSlices(u32, &.{2}, try store.lookup(key, 0b01, &.{2}));
+    try std.testing.expectEqual(@as(usize, 1), store.patterns.count());
+
+    // Selectivity reports what the index says once it exists, and admits to
+    // knowing nothing before that, so planning cannot mistake an unmeasured
+    // pattern for a measured one.
+    try std.testing.expectEqual(@as(?usize, 4), (try store.selectivity(key, 0b01)).groups);
+    try std.testing.expectEqual(@as(?usize, null), (try store.selectivity(key, 0b10)).groups);
+    try std.testing.expectEqual(@as(usize, 4), (try store.selectivity(key, 0b10)).estimate());
 }
 
 test "support counts duplicates and exact removal keeps indexes consistent" {

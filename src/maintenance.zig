@@ -410,7 +410,7 @@ fn solveRest(
     bindings: *const syntax.Binding,
     answers: *std.ArrayList(syntax.Binding),
 ) !bool {
-    db.eval.matchClauses(rest, old_closure, 0, bindings, answers, null) catch |err| switch (err) {
+    db.eval.solve(old_closure, null, rest, bindings, answers, null) catch |err| switch (err) {
         errors.Error.NumericType, errors.Error.NumericOverflow => return false,
         else => return err,
     };
@@ -483,10 +483,10 @@ fn hasAlternativeDerivation(db: *database.Database, fact: relation_store.Fact) !
             for (answers.items) |*answer| answer.deinit(db.allocator);
             answers.deinit(db.allocator);
         }
-        db.eval.matchClauses(
-            rule.body,
+        db.eval.solve(
             &db.closure.?,
-            0,
+            rule.head,
+            rule.body,
             &bindings,
             &answers,
             null,

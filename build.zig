@@ -194,6 +194,21 @@ pub fn build(b: *std.Build) void {
     );
     structural_benchmark_step.dependOn(&b.addRunArtifact(structural_benchmark_exe).step);
 
+    const planning_benchmark_exe = b.addExecutable(.{
+        .name = "join-planning-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/join_planning.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const planning_benchmark_step = b.step(
+        "benchmark-join-planning",
+        "Compare the planned clause order with the stored order across join and aggregate shapes",
+    );
+    planning_benchmark_step.dependOn(&b.addRunArtifact(planning_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

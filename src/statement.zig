@@ -81,7 +81,56 @@ pub fn queryClauses(db: *database.Database, goals: []const syntax.Clause) !resul
         for (internal_answers.items) |*answer| answer.deinit(db.allocator);
         internal_answers.deinit(db.allocator);
     }
-    return db.copyQueryResult(internal_answers.items);
+    const order = try queryVariableOrder(db, goals);
+    defer db.allocator.free(order);
+    return db.copyQueryResult(internal_answers.items, order);
+}
+
+/// The query's variables in the order it first mentions them, which is the
+/// order its answers list them in. Built from the goals as written rather than
+/// from the plan, so that what a caller sees does not move when the planner
+/// picks a different join order.
+fn queryVariableOrder(db: *database.Database, goals: []const syntax.Clause) ![]syntax.Id {
+    var order: std.ArrayList(syntax.Id) = .empty;
+    errdefer order.deinit(db.allocator);
+    var seen: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
+    defer seen.deinit(db.allocator);
+    for (goals) |clause| try appendClauseVariables(db, clause, &seen, &order);
+    return order.toOwnedSlice(db.allocator);
+}
+
+/// Appends the variables a goal binds at its surface — the ones that can reach
+/// an answer — in the order the goal writes them.
+fn appendClauseVariables(
+    db: *database.Database,
+    clause: syntax.Clause,
+    seen: *std.AutoHashMapUnmanaged(syntax.Id, void),
+    order: *std.ArrayList(syntax.Id),
+) !void {
+    switch (clause) {
+        .relational, .builtin, .negated => |expression| for (expression.terms) |term|
+            try appendTermVariables(db, term, seen, order),
+        .aggregate => |aggregate| try appendTermVariables(db, aggregate.output, seen, order),
+    }
+}
+
+fn appendTermVariables(
+    db: *database.Database,
+    term: syntax.Term,
+    seen: *std.AutoHashMapUnmanaged(syntax.Id, void),
+    order: *std.ArrayList(syntax.Id),
+) !void {
+    switch (term) {
+        .variable => |variable| {
+            const entry = try seen.getOrPut(db.allocator, variable);
+            if (!entry.found_existing) try order.append(db.allocator, variable);
+        },
+        .cons => |pair| {
+            try appendTermVariables(db, pair.head, seen, order);
+            try appendTermVariables(db, pair.tail, seen, order);
+        },
+        else => {},
+    }
 }
 
 pub fn evaluateClauses(db: *database.Database, goals: []const syntax.Clause) !std.ArrayList(syntax.Binding) {
@@ -116,8 +165,24 @@ pub fn evaluateClauses(db: *database.Database, goals: []const syntax.Clause) !st
     }
     var initial: syntax.Binding = .{};
     defer initial.deinit(db.allocator);
-    try db.eval.matchClauses(ordered, db.closureStore(), 0, &initial, &internal_answers, null);
+    try db.eval.solve(db.closureStore(), null, ordered, &initial, &internal_answers, null);
     return internal_answers;
+}
+
+/// The plan a query's goals would be solved under, rendered for a caller that
+/// wants to see the clause order and the indexes it chose. Planning reads the
+/// materialized closure's statistics, so this materializes first, exactly as
+/// evaluating the query would.
+pub fn explainClauses(db: *database.Database, goals: []const syntax.Clause) ![]u8 {
+    if (goals.len == 0) return error.InvalidQuery;
+    const ordered = try validation.orderClauses(db, goals);
+    defer db.allocator.free(ordered);
+    try materialization.ensureMaterialized(db);
+    var initial: syntax.Binding = .{};
+    defer initial.deinit(db.allocator);
+    var chosen = try db.eval.planFor(db.closureStore(), null, ordered, &initial);
+    defer chosen.deinit();
+    return chosen.explainAlloc(db.allocator, &db.strings);
 }
 
 /// Resolves a retraction's goals to the exact base facts they name, and hands

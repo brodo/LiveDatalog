@@ -181,6 +181,34 @@ be compared against a fresh rebuild before the change commits, reporting a
 disagreement as `MaintenanceMismatch`. It roughly doubles update cost and is
 meant for tests.
 
+### Join planning
+
+Goals are solved in the order the engine judges cheapest, not the order they
+are written. A goal may only move to a position where the variables it
+consumes are already bound — a negation, comparison, arithmetic goal, or
+correlated `setof` never overtakes what binds it — and among the goals that
+may run next the engine takes the one expected to examine the fewest facts,
+using the relation sizes and index statistics the store already keeps.
+Answers do not depend on the order: they name their variables as the query
+does, and the same rows come back either way.
+
+```zig
+database.setPlanPolicy(.cost_based);   // default
+database.setPlanPolicy(.source_order); // solve goals as written
+
+const plan = try database.explainQuery(&.{
+    input.relation("many", &.{input.variable("X")}),
+    input.relation("few", &.{input.variable("X")}),
+});
+defer allocator.free(plan);
+// few/1 join scan ~3
+// many/1 join index {0} ~8
+```
+
+`explainQuery` renders the chosen order, the argument positions each goal is
+looked up on, and the candidates the planner expected to examine. It answers
+nothing; the caller owns the returned text.
+
 Floats follow the finite-value policy from
 [ADR 0001](docs/adr/0001-finite-f64-scalars.md): compiling `input.float`
 reports `NumericType` for NaN and `NumericOverflow` for an infinity, and an

@@ -184,27 +184,53 @@ pub const Database = struct {
         return self.facts.factAt(self.facts.len() - 1);
     }
 
-    pub fn copyQueryResult(self: *const Database, bindings: []const syntax.Binding) !results.QueryResult {
+    /// Copies internal bindings out as owned answers, listing each answer's
+    /// variables in `order` — the order the query mentions them — ahead of any
+    /// the caller did not name.
+    ///
+    /// Without `order` an answer would list its variables in the order
+    /// evaluation happened to bind them, which is the join order, which the
+    /// planner chooses on cost. What a caller sees would then move with the
+    /// data. The query's own spelling does not, so that is what is used.
+    pub fn copyQueryResult(
+        self: *const Database,
+        bindings: []const syntax.Binding,
+        order: []const syntax.Id,
+    ) !results.QueryResult {
         var result: results.QueryResult = .{ .allocator = self.allocator };
         errdefer result.deinit();
         for (bindings) |binding| {
             var answer: results.Answer = .{ .allocator = self.allocator };
             errdefer answer.deinit();
+            for (order) |variable| {
+                const value = binding.values.get(variable) orelse continue;
+                try self.appendAnswerBinding(&answer, variable, value);
+            }
             for (binding.values.keys(), binding.values.values()) |variable, value| {
-                const name = try self.allocator.dupe(u8, self.strings.resolve(variable));
-                errdefer self.allocator.free(name);
-                const owned_value = try self.copyResultNode(value);
-                answer.bindings.append(self.allocator, .{
-                    .name = name,
-                    .value = .{ .node = owned_value },
-                }) catch |err| {
-                    results.freeResultNode(self.allocator, owned_value);
-                    return err;
-                };
+                if (std.mem.indexOfScalar(syntax.Id, order, variable) != null) continue;
+                try self.appendAnswerBinding(&answer, variable, value);
             }
             try result.answers.append(self.allocator, answer);
         }
         return result;
+    }
+
+    fn appendAnswerBinding(
+        self: *const Database,
+        answer: *results.Answer,
+        variable: syntax.Id,
+        value: syntax.ValueId,
+    ) !void {
+        const name = try self.allocator.dupe(u8, self.strings.resolve(variable));
+        errdefer self.allocator.free(name);
+        const owned_value = try self.copyResultNode(value);
+        answer.bindings.append(self.allocator, .{
+            .name = name,
+            .value = .{ .node = owned_value },
+        }) catch |err| {
+            results.freeResultNode(self.allocator, owned_value);
+            return err;
+        };
     }
 
     fn copyResultNode(self: *const Database, value: syntax.ValueId) !*results.ResultNode {
