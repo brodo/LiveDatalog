@@ -464,3 +464,61 @@ built for that one query. Planning is fully statistic-driven only on the
 rule-evaluation path, where the store lives across delta rounds — which is
 also where the measured gains are. Making the caches survive `clone` is the
 lever for the query path, and it is P1 lifecycle work.
+
+## 2026-08-08 caches that survive a clone
+
+The limitation P3 recorded was that every statement runs on a clone, and
+cloning dropped the store's lookup caches. Measured before changing anything,
+by counting entries scanned during a cache rebuild:
+
+| Workload | Entries cloned | Membership rebuilt | Buckets rebuilt | Pattern rebuilt |
+| --- | --- | --- | --- | --- |
+| 10 join queries over a 20,500-fact closure | 205000 | 0 | 203000 | 203000 |
+| 10 single-goal queries over the same | 205000 | 0 | 203000 | 0 |
+| loading 2000 facts with `addFact` | 1999000 | 1999000 | 0 | 0 |
+
+So a join query made three passes over the closure where one was inherent:
+the clone itself, plus a rebuild of the buckets and of the one pattern index
+it used. Membership, which a query never probes, was rebuilt in full on every
+`addFact` instead.
+
+`RelationStore.clone` now carries the caches that are worth carrying. Buckets
+and pattern indexes describe the entry list by position and are keyed by
+hashes of interned value identifiers, both of which a clone preserves exactly.
+Membership is keyed by facts, so a copy would have to re-key and rehash — which
+is what building it costs — and it stays lazy.
+
+Pattern indexes are carried only when dense. Copying an index costs an
+allocation per group; rebuilding it costs a hash per entry. Copying every index
+unconditionally was measured first, and it cost 19% on the repeated-query
+workload — a 666-fact closure holding seven indexes over 360 groups, almost
+none of which that query touches. Gating on density turned that into a gain.
+
+Best of ten samples per side, pooled from two independent runs, ns, arm64,
+macOS 26.5.0, Zig 0.16.0, `ReleaseFast`:
+
+| Workload | Before | After | Ratio |
+| --- | --- | --- | --- |
+| join planning, recursive closure | 31816 | 21750 | 1.46x |
+| materialization, repeated query | 22475 | 19668 | 1.14x |
+| maintenance, insert-only batch | 605415 | 544614 | 1.11x |
+| join planning, large groups | 80547 | 73539 | 1.10x |
+| join planning, empty aggregate | 102647 | 96493 | 1.06x |
+| aggregation, incremental edge change | 100454 | 95370 | 1.05x |
+| maintenance, mixed batch | 821093 | 800657 | 1.03x |
+| join planning, dense join | 166160 | 164435 | 1.01x |
+| maintenance, delete-only batch | 711476 | 702021 | 1.01x |
+| aggregation, 10 queries | 52016 | 52512 | 0.99x |
+| aggregation, recomputed edge change | 650825 | 658229 | 0.99x |
+| join planning, sparse join | 98843 | 106487 | 0.93x |
+
+The sparse join is not a regression from this change, and the reason is worth
+recording because the number looks like one. That workload has no rules, so
+nothing ever populates a cache on the committed store: instrumenting the
+copy shows twenty clones copying zero buckets and zero groups. Guarding the
+copy at run time so it provably does nothing did not recover the difference
+either, and adding an unrelated never-called function to the same file moved
+the figure by the same amount. It is code layout. A benchmark whose inner loop
+is a 2001-entry clone is sensitive to it at roughly this magnitude, in both
+plan policies at once, which is also why both columns of that row move
+together.

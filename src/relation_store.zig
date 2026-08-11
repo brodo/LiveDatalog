@@ -152,6 +152,29 @@ pub const RelationStore = struct {
         self.requested = .empty;
     }
 
+    /// A copy sharing nothing with this store.
+    ///
+    /// The lookup caches are copied rather than dropped. They describe the
+    /// entry list by *position* — a bucket and an index group hold entry
+    /// indices, and a group is keyed by a hash of interned value identifiers —
+    /// and cloning preserves both order and identifiers, so every index and
+    /// every hash means in the copy exactly what it meant here. Rebuilding
+    /// them would cost a pass over the relation hashing each fact again, which
+    /// is what a statement used to pay on every clone: the caches are the
+    /// reason a query over a materialized closure did three passes over it
+    /// instead of one.
+    ///
+    /// Membership is the exception and stays lazy. Its keys are facts rather
+    /// than positions, so a copy has to re-key them against the copy's own
+    /// terms — and a hash map cannot be copied without rehashing its keys, so
+    /// copying one costs what building one costs. There is nothing to save,
+    /// and a statement that never probes membership would pay it for nothing.
+    ///
+    /// `requested` does not carry over either, and must not: it records that a
+    /// pattern was asked for once *here*, and `lookup` defers building an index
+    /// until the second ask precisely so that a lookup happening once does not
+    /// pay for one. A copy that inherited the record would build on its own
+    /// first ask, which for a per-statement copy is every ask.
     pub fn clone(self: *const RelationStore) !RelationStore {
         var result: RelationStore = .init(self.allocator);
         errdefer result.deinit();
@@ -163,6 +186,74 @@ pub const RelationStore = struct {
                 .derived = entry.derived,
                 .support = entry.support,
             });
+        }
+        try result.adoptCaches(self);
+        return result;
+    }
+
+    /// Takes over the caches worth carrying from the store being cloned.
+    fn adoptCaches(self: *RelationStore, source: *const RelationStore) !void {
+        if (source.buckets) |*buckets| self.buckets = try cloneBuckets(self.allocator, buckets);
+        self.patterns = try clonePatterns(self.allocator, &source.patterns);
+    }
+
+    fn cloneBuckets(allocator: std.mem.Allocator, source: *const Buckets) !Buckets {
+        var result: Buckets = .empty;
+        errdefer {
+            var iterator = result.valueIterator();
+            while (iterator.next()) |bucket| bucket.deinit(allocator);
+            result.deinit(allocator);
+        }
+        try result.ensureTotalCapacity(allocator, source.count());
+        var iterator = source.iterator();
+        while (iterator.next()) |entry| {
+            const bucket = try entry.value_ptr.clone(allocator);
+            result.putAssumeCapacity(entry.key_ptr.*, bucket);
+        }
+        return result;
+    }
+
+    /// Copies the pattern indexes worth carrying over, and drops the rest for
+    /// the copy to rebuild if it wants them.
+    ///
+    /// A group is a list of its own, so copying an index costs an allocation
+    /// per group, while rebuilding it costs a hash per entry. An index whose
+    /// groups are large is therefore far cheaper to copy than to rebuild, and
+    /// one whose groups are nearly singletons is not — a near-unique index
+    /// over a thousand facts is a thousand allocations to copy and a thousand
+    /// hashes to rebuild, and the copy is the slower of the two and is paid
+    /// whether or not the copy ever looks at it.
+    ///
+    /// So density decides. `min_group_size` is where the two costs crossed on
+    /// this engine's workloads: below it, copying a materialized closure's
+    /// near-unique indexes cost more per statement than the lookups they
+    /// saved.
+    fn clonePatterns(allocator: std.mem.Allocator, source: *const Patterns) !Patterns {
+        const min_group_size = 4;
+        var result: Patterns = .empty;
+        errdefer {
+            var iterator = result.valueIterator();
+            while (iterator.next()) |pattern| pattern.deinit(allocator);
+            result.deinit(allocator);
+        }
+        var iterator = source.iterator();
+        while (iterator.next()) |entry| {
+            const groups = entry.value_ptr.groups.count();
+            if (groups == 0) continue;
+            var members: usize = 0;
+            var counting = entry.value_ptr.groups.valueIterator();
+            while (counting.next()) |group| members += group.items.len;
+            if (members < groups *| min_group_size) continue;
+
+            var pattern: PatternIndex = .{};
+            errdefer pattern.deinit(allocator);
+            try pattern.groups.ensureTotalCapacity(allocator, @intCast(groups));
+            var copying = entry.value_ptr.groups.iterator();
+            while (copying.next()) |group| {
+                const copy = try group.value_ptr.clone(allocator);
+                pattern.groups.putAssumeCapacity(group.key_ptr.*, copy);
+            }
+            try result.put(allocator, entry.key_ptr.*, pattern);
         }
         return result;
     }
@@ -477,6 +568,45 @@ test "pattern lookups stay consistent across inserts deletes and clear" {
         &.{0},
         try indexedLookup(&store, .{ .name = 3, .arity = 2 }, 0b11, &.{ 2, 100 }),
     );
+}
+
+test "a clone keeps the index caches worth copying and rebuilds the rest" {
+    var store: RelationStore = .init(std.testing.allocator);
+    defer store.deinit();
+    // Eight facts whose first argument takes two values and whose second is
+    // unique: an index on the first is dense, one on the second is not.
+    for (0..8) |value| _ = try store.insert(
+        try testFact(std.testing.allocator, 1, &.{ @intCast(value / 4), @intCast(value) }),
+        false,
+    );
+    const key: PredicateKey = .{ .name = 1, .arity = 2 };
+    const dense = try indexedLookup(&store, key, 0b01, &.{1});
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7 }, dense);
+    _ = try indexedLookup(&store, key, 0b10, &.{3});
+    try std.testing.expectEqual(@as(usize, 2), store.patterns.count());
+
+    var copy = try store.clone();
+    defer copy.deinit();
+
+    // The buckets and the dense index come across, and answer on the first
+    // ask — they describe the entry list by position, and the position of
+    // every entry is what a clone preserves.
+    try std.testing.expectEqual(@as(usize, 1), copy.patterns.count());
+    try std.testing.expect(copy.buckets != null);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7 }, try copy.lookup(key, 0b01, &.{1}));
+
+    // The near-unique index does not, and neither does the record that it was
+    // ever asked for, so the copy's first ask is answered by a scan exactly as
+    // a fresh store's would be.
+    try std.testing.expectEqual(@as(usize, 8), (try copy.lookup(key, 0b10, &.{3})).len);
+    try std.testing.expectEqualSlices(u32, &.{3}, try copy.lookup(key, 0b10, &.{3}));
+
+    // A copied cache is a live cache: it absorbs the copy's own inserts, and
+    // the store it came from is untouched by them.
+    _ = try copy.insert(try testFact(std.testing.allocator, 1, &.{ 1, 99 }), true);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7, 8 }, try copy.lookup(key, 0b01, &.{1}));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 5, 6, 7 }, try store.lookup(key, 0b01, &.{1}));
+    try std.testing.expectEqual(@as(usize, 8), store.len());
 }
 
 test "a pattern index is built on the second request, not the first" {

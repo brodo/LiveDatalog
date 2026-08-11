@@ -457,13 +457,35 @@ P3 was completed on 2026-08-07:
   order directly and finds 1.40x on a sparse join and 1.02–1.06x on the other
   four shapes. Numbers and the limitation they expose are in
   [`aggregation-performance.md`](aggregation-performance.md).
-- The limitation worth recording: a statement runs on a clone, and cloning
-  drops the store's caches, so query planning sees relation sizes but never an
-  index statistic, and any index a query uses is built for that query alone.
-  Planning is therefore cardinality-driven on the query path and fully
-  statistic-driven on the rule-evaluation path, where the store lives across
-  rounds. Making caches survive `clone` is the lever, and it is P1 lifecycle
-  work rather than planning work.
+- The limitation P3 recorded — a statement runs on a clone, cloning dropped
+  the store's caches, so query planning saw relation sizes but never an index
+  statistic and any index a query used was built for that query alone — was
+  taken as a follow-up rather than left. `RelationStore.clone` now carries the
+  caches, with three decisions:
+  - The buckets and the pattern indexes describe the entry list by *position*,
+    and a group is keyed by a hash of interned value identifiers. Cloning
+    preserves both order and identifiers, so every index and every hash means
+    in the copy exactly what it meant in the original. Measured before the
+    change: a join query over a 20,500-fact closure made three passes over it,
+    one to clone the entries and one each to rebuild the buckets and the
+    pattern index it used.
+  - Membership stays lazy, and must. Its keys are facts rather than positions,
+    so a copy has to re-key them against the copy's own terms, and a hash map
+    cannot be copied without rehashing — copying one costs what building one
+    costs, and a statement that never probes membership would pay it for
+    nothing. Queries never probe it at all.
+  - A pattern index is carried only when it is *dense*. A group is a list of
+    its own, so copying an index costs an allocation per group while
+    rebuilding it costs a hash per entry; a near-unique index is therefore
+    slower to copy than to rebuild, and is paid whether or not the copy looks
+    at it. Copying every index unconditionally was measured first and cost 19%
+    on the repeated-query workload, whose 666-fact closure holds seven indexes
+    over 360 groups. The density gate turned that into a 14% gain.
+  - `requested` does not carry over either. It records that a pattern was asked
+    for once *here*, and `lookup` defers building an index to the second ask
+    precisely so a lookup happening once does not pay for one; a copy that
+    inherited the record would build on its own first ask, which for a
+    per-statement copy is every ask.
 
 # Project M: persistent and incremental view maintenance
 
