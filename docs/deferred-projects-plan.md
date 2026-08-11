@@ -1335,6 +1335,123 @@ F1 was completed on 2026-08-11:
 - Recursive query rules can consume reconstructed base relations even though
   view definitions themselves are not recursive.
 
+### Completed decisions
+
+F2 was completed on 2026-08-11:
+
+- The lowering question F1 left open is answered, and the answer is the one
+  F1's reasoning forces. There is a way from the IR back into `syntax`, and it
+  is `folding.lowerPlan`: it takes a `Plan` rather than arbitrary IR, and it
+  returns `error.PlanNotExecutable` for a plan still holding a Skolem term.
+  That is not a weakened version of F1's rule but the same rule stated
+  positively — a Skolem term has no executable meaning, so *removing every one
+  of them* is what earns the way back, and a plan that has been through
+  elimination needs no representation for what it no longer contains. `syntax`
+  gained nothing: no Skolem term, no generated-relation identity, no marker of
+  any kind. Anything that cannot be lowered is refused rather than represented,
+  which is what keeps an unproved plan away from the evaluator.
+- Skolem elimination is not a substitution, because there is nothing to
+  substitute: a Skolem term names a value that exists and cannot be produced.
+  What it *is* is fully described by its function and its arguments, so the
+  relation holding it is split — one relation per assignment of a function to
+  each column, that column spread across the arguments the function was applied
+  to — and the query's rules are instantiated once per combination of splits
+  they can read. The answers are then the tuples of the split whose columns all
+  stayed ordinary, which is exactly the answers a Skolem term never reached.
+  This is a plan transformation and not a runtime filter, which matters: a
+  filter would mean the plan is only correct when executed by something that
+  knows to apply it, and a plan is supposed to *be* the query.
+- It terminates for a structural reason worth stating, because it is the reason
+  this phase is bounded at all: a Skolem term is built only in the head of an
+  inverse rule, out of values read from a stored extension, so Skolem terms
+  never nest and the set of splits is finite. F5 rejects recursive list
+  functions for the same reason from the other side — there the terms *would*
+  nest.
+- One Skolem function per projected variable, shared by every inverse rule of
+  that view. The dissertation's notation suggests one per goal and per
+  position; its own example refutes that reading, and so does correctness.
+  `v(X, Z) :- edge(X, Y), edge(Y, Z)` reconstructs `edge(X, f(X, Z))` and
+  `edge(f(X, Z), Z)`, and the even-length path only exists because the node in
+  the middle is the same term in both halves. Different functions would
+  reconstruct two dangling half-edges.
+- `foldQuery` now takes the query's rules as well as its goals, because
+  Chapter 6's plan is `Q ∪ V⁻¹` and a recursive `Q` is the case the Inverse
+  Method exists for. Without them there is no `Q` to take the union with, and
+  the phase's headline example — a transitive closure over a relation that only
+  a non-recursive view remembers — cannot be stated.
+- The split with no function in any column *is* the relation it came from,
+  rather than a first split alongside the others. That is what lets a goal over
+  an available relation, and the query's own goals, stay exactly as written:
+  the answers a caller asked for are by definition the ones with no
+  reconstructed value in them, so they are the tuples of the unsplit relation.
+  The other splits get a hygienic identity in the IR — `Predicate.generated`,
+  carrying the relation it came from for reading and a plan-local tag for
+  identity — and a name only at lowering time, interned with a `$` no source
+  program can produce. Naming them earlier would mean a fold writing into a
+  database's string table for a plan that might never run.
+- A relation read under negation or inside an aggregate is refused, and a rule
+  instance whose comparison would see a reconstructed value is dropped. These
+  look alike and are opposites. A reconstruction is *contained* in the relation
+  it stands for, so reading what is not in it, or counting what is, answers
+  **more** than the query — that breaks containment and cannot be traded for
+  anything, so the fold is `unsupported`. Dropping an instance answers **less**,
+  which is always sound, so it is allowed and reported: the guarantee falls
+  from `maximally_contained` to `contained`, and the transformation list says
+  which of the two happened. Chapter 6's Theorem 6.2.1 covers the undropped
+  case exactly.
+- The refusal has to be transitive, and checking it relation by relation left
+  a hole worth recording because it was reachable and unsound. A predicate the
+  *query* defines is not reconstructed, so the first version skipped it — but a
+  rule is no more exact than what its body reads, so `reach(X, Y) :- edge(X, Y)`
+  over a reconstructed `edge` knows less of `reach` than the query does, and
+  `not reach(X, Y)` is therefore true of more. With edges `a→x`, `x→b` and
+  `a→b`, the view stores only `(a, b)`, the query answers nothing, and the plan
+  answered `(a, b)`. Exactness is now a fixpoint over the query's own rules
+  rather than a property of one relation.
+- `view_inversion_unimplemented` is gone, replaced by preconditions that name
+  what is actually missing: a relation no view mentions, a relation only
+  uninvertible views mention, and per view whether its definition recurses, is
+  not a conjunction of positive relations, or mentions a list. The last three
+  are F3's, F4's and F5's work stated as this phase's refusals, which is what
+  makes an `unsupported` outcome a description of the problem rather than of
+  the implementation.
+- A lowered plan names a view by the name its extension is stored under, so two
+  relations a plan may read cannot share a name and arity. `foldQuery` checks
+  this over the views the plan touches and reports `predicate_name_ambiguous`
+  rather than lowering an aliased plan, because the failure mode is a plan
+  silently reading a relation the fold exists to avoid reading. F6's explicit
+  view selection is where this stops being a check and becomes an argument.
+- A plan's variable executes under the name it renders under — `X#4`, spelling
+  and identity, from one function both paths call. Two distinct variables
+  printing alike would be one variable to whoever reads the plan; two printing
+  alike in a *lowered* plan would be one variable to the evaluator, which is
+  the same confusion with teeth.
+- Inverting a view produces rules for every goal of its body, including goals
+  reading relations that were available anyway. That looks wasteful and is
+  sound and occasionally useful: an inverse rule states that a fact existed, so
+  adding reconstructed tuples to an available relation can only add derivations
+  the original database supported. Views that reconstruct nothing the query
+  needs are not inverted at all.
+- The containment claim is checked by exhaustion over every graph on three
+  nodes — all 512 — with the oracle computed by bit operations rather than by
+  the engine, because a sweep that asked the engine for the answers and then
+  asked it again through a plan would agree with itself whatever either did.
+  This is the phase's one expensive test: the suite goes from about five
+  seconds to about eleven. The cost is the method showing through, not the
+  test being careless — the splits of a binary relation are quadratic in the
+  view's extension, so a dense graph makes a plan with a few hundred derived
+  facts, five hundred times over.
+- Not performance relevant to the engine: nothing in this phase runs during
+  evaluation and no benchmark changed. The suite goes from 152 tests to 159.
+- Two limits worth writing down rather than discovering later. Splitting is
+  exponential in principle — the number of splits of a relation is bounded by
+  the number of functions raised to its arity — and nothing caps it; in
+  practice the fixpoint only ever records splits some rule can actually derive,
+  which is why the even-length-path plan has eight rules. And mutual recursion
+  between views is invisible, because a catalog holds one rule per view and a
+  mutually recursive view cannot be written down at all; the recursion check
+  covers the self-reference that can be.
+
 ## F3: conjunctive `setof` view inversion
 
 ### Scope
@@ -1447,8 +1564,8 @@ Use one session and one commit per phase unless a phase proves too large:
 12. M7 deletion through seeded structural rules — **done 2026-08-07**
 13. P3 join planning and aggregate lookup — **done 2026-08-07**
 14. F1 folding IR and view catalog — **done 2026-08-11**
-15. F2 ordinary Inverse Method — **next**
-16. F3 conjunctive aggregate inversion
+15. F2 ordinary Inverse Method — **done 2026-08-11**
+16. F3 conjunctive aggregate inversion — **next**
 17. F4 soundness restrictions
 18. F5 list functions and dependency chase
 19. F6 execution and view selection
@@ -1495,6 +1612,9 @@ Each phase ends with:
   of it**: a plan renders as Datalog extended with generated function terms,
   deliberately spelled so that it is not valid user input, because while no
   executable form exists the rendering is the only way to read a plan at all.
-  Whether callers are also handed the executable form is F6's question.
+  **F2 answered the other half**: an executable form exists, produced by
+  `lowerPlan` and only for a plan proved free of Skolem terms. It is not public
+  — folding has no public surface yet — so whether callers are handed it, and
+  alongside what, is still F6's question.
 - Is `maximally_contained` useful to embedders without an accompanying
   explanation of which source relations could not be reconstructed?

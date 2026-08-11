@@ -230,6 +230,78 @@ kinds: a float that canonicalized to an integer when it was stored, such as
 `1.0`, is retrieved with `getInteger`, and `getFloat` returns only values
 that remained floats, such as `2.5`.
 
+## Query folding
+
+*Not yet reachable from the embedding API.* Folding is built and tested but has
+no public entry point, because there is no way for an embedder to declare a
+view yet. This section describes what the engine can already do so that the
+restrictions below are on record; see [CONTEXT.md](CONTEXT.md) for the
+vocabulary and `docs/deferred-projects-plan.md` for the remaining phases.
+
+Query folding answers a query against stored *view extensions* rather than the
+relations the views were computed from — the case where the original data is
+gone, or is too expensive to read. A view is a rule whose results were kept:
+given `v(X, Z) :- edge(X, Y), edge(Y, Z)` and a stored `v`, a fold rewrites a
+query over `edge` into one over `v`, by inverting the definition into rules
+that reconstruct what its body must have read.
+
+A fold returns a plan *and* a guarantee, because the rewrite can lose answers:
+
+| Guarantee | Meaning |
+| --- | --- |
+| `equivalent` | The same answers as the query. Nothing was reconstructed. |
+| `maximally_contained` | Every answer is the query's, and no plan over these views returns more. |
+| `contained` | Every answer is the query's, with nothing claimed about how many. |
+| `unsupported` | No plan at all — not an empty one. |
+
+Answers are lost rather than invented because a view remembers less than the
+relations behind it. `v` above records that *some* node sits between `X` and
+`Z` without recording which, so the reconstructed fact names that node with an
+internal term the plan can join on but never return. A query for paths of any
+length, folded over `v`, gets the paths of even length.
+
+### When a fold is refused
+
+`unsupported` is the honest answer rather than a plan that is not contained in
+the query. A fold is refused when:
+
+- **a relation is not reachable at all** — nothing declares it available and no
+  view's body mentions it;
+- **the only views that mention it cannot be inverted** — a definition that
+  reads what it defines is recursive, one containing `setof` or a negated goal
+  is not conjunctive, and one mentioning a list needs the functional-dependency
+  work; each is reported separately, naming the view;
+- **a view's extension is withheld** by the availability policy;
+- **two relations a plan may read share a name and arity**, which a lowered
+  plan could not tell apart;
+- **a relation the plan would know incompletely is read under negation or
+  inside an aggregate.**
+
+The last one is the subtle one, and it is the reason folding cannot be applied
+silently. A reconstruction is *contained* in the relation it stands for: it
+holds what the views prove existed, which can be less than what was there.
+Reading such a relation positively is therefore safe — fewer facts, fewer
+answers. Asking what is **not** in it inverts that: `not edge(X, Y)` succeeds
+for every edge the views could not prove, so the plan would answer **more**
+than the query, which is exactly the containment the guarantee promises. An
+aggregate is the same failure counting instead of testing: `setof(Y, edge(X,
+Y), S)` over a reconstruction binds a shorter list, and every downstream
+comparison against it is then wrong in an unpredictable direction.
+
+This is not something a plan can trade away, so there is no guarantee weak
+enough to cover it and the fold refuses. It applies transitively: a predicate
+the query derives from a reconstructed relation is no more exact than the
+relation, so negating that predicate is refused too. Declaring the underlying
+relation available with the catalog's availability policy removes the
+objection, because what is there is then known exactly and nothing is
+reconstructed.
+
+By contrast, a goal that merely *compares* a reconstructed value — `X != Z`
+where one of them is a node the view did not keep — costs answers rather than
+soundness. Those rule instances are dropped, the fold still returns a plan, and
+the guarantee falls from `maximally_contained` to `contained` with the drop
+recorded in the plan's list of transformations.
+
 ## Development
 
 Run the complete test suite:

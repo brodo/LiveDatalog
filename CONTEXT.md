@@ -148,14 +148,24 @@ inspects rather than a substitution it performs, and `unsupported` carries no
 plan at all rather than an empty one, so a fold that found nothing cannot be
 read as one that succeeded with nothing in it.
 
+A fold's input is the query's goals *and* the rules it defines its own
+predicates by, because the plan is the query's program together with the
+inverse rules of the views it needs — Chapter 6's `Q ∪ V⁻¹`. A query already
+inside the availability boundary is its own plan and the fold is `equivalent`;
+one that needed a reconstruction is `maximally_contained`, or `contained` when
+eliminating Skolem terms had to drop rule instances.
+
 ### Folding IR
 
 The terms, goals and rules a fold reasons about (`fold_ir.zig`), deliberately
 separate from `syntax`, which is what the evaluator runs. Inversion introduces
 terms naming a value some fact must have had — Skolem terms — and equalities
-nobody wrote, and neither has an executable meaning until a later phase proves
-the plan runnable, so `syntax` has no representation for them: the IR is
-lowered from `syntax` and never lifted back. Identity here is an entry in a
+nobody wrote, and neither has an executable meaning while the plan is unproved,
+so `syntax` has no representation for them. The IR is lowered from `syntax`,
+and the only way back out is `folding.lowerPlan`, which takes a plan rather
+than arbitrary IR and refuses one still holding a Skolem term: eliminating them
+is what earns the way back, and there is no general lifting function. Identity
+here is an entry in a
 `Symbols` table and the printed name is a lookup, so variables spelled alike in
 different scopes stay distinct and a generated symbol cannot collide with a
 user one. Generated symbols additionally print with characters no user
@@ -173,3 +183,46 @@ relation spelled alike are never one predicate. The catalog owns the symbol
 table its definitions share with the queries folded against it, and its
 identifiers are the database's: a catalog outliving that database resolves
 nothing.
+
+### Inverse Method
+
+How a fold gets a relation the catalog does not have (`inversion.zig`). A
+view's definition is run backwards: each body goal must have had a fact behind
+it, so each becomes a rule deriving one from the view's stored tuple. A
+variable the head kept is still a value a plan can name, so it stays a
+variable; a variable the head projected away becomes a Skolem term applied to
+the head's values — one function per projected variable, shared by every rule
+that view yields, because the reconstructed facts have to join back up.
+Chapter 6's even-length paths only exist because the node between `X` and `Z`
+is the same `f(X, Z)` in both halves.
+
+Only non-recursive conjunctions of positive base relations are inverted. An
+aggregate is F3's, a list is F5's, and a definition reading what it defines is
+recursion inversion cannot bound; each is reported as the precondition it is.
+Because a catalog holds one rule per view, self-reference is the only recursion
+a definition can express — mutual recursion between views is not representable
+rather than undetected. A relation read under negation or inside an aggregate
+is refused outright rather than reconstructed: a reconstruction holds what the
+views prove existed, which can be less than the relation held, and asking what
+is *not* in it would answer more than the query does. The refusal is
+transitive, because a rule is no more exact than what its body reads: a
+predicate the query derives from a reconstruction is refused under negation
+just as the reconstruction is.
+
+### Skolem elimination
+
+What makes an inverted plan runnable (`inversion.zig`). A Skolem term is not
+substituted — there is no value to put in its place — but it is fully described
+by its function and the arguments it was applied to, so the relation holding it
+is *split*: one relation per assignment of a function to each column, with that
+column spread across those arguments. Rules are instantiated once per
+combination of splits they can read, and the query's answers are the tuples of
+the split whose columns all stayed ordinary, which is exactly the answers a
+Skolem term never reached. The split with no function in it keeps the original
+predicate, so goals over relations that were available all along are unchanged.
+
+The transformation is finite because Skolem terms never nest: one is built only
+in an inverse rule's head, out of values read from a stored extension. A goal
+that is not a positive relation must see ordinary values, and an instance where
+it would not is dropped — which loses answers, keeps containment, and lowers
+the guarantee from maximally contained to contained.

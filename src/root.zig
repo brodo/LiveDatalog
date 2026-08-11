@@ -17,6 +17,7 @@ const evaluator = @import("evaluator.zig");
 const fold_ir = @import("fold_ir.zig");
 const folding = @import("folding.zig");
 const input_compiler = @import("input_compiler.zig");
+const inversion = @import("inversion.zig");
 const maintenance = @import("maintenance.zig");
 const materialization = @import("materialization.zig");
 const parser = @import("parser.zig");
@@ -293,6 +294,7 @@ test {
     _ = fold_ir;
     _ = folding;
     _ = input_compiler;
+    _ = inversion;
     _ = maintenance;
     _ = relation_store;
     _ = scalar;
@@ -4140,75 +4142,463 @@ test "planning and explaining release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(planningAllocationScenario);
 }
 
-/// One goal over a view and one over a base relation, sharing two variables.
-/// The caller owns the result; the partial allocations are released here so
-/// that no cleanup is armed twice.
-fn foldingQueryGoals(
-    allocator: std.mem.Allocator,
-    view: fold_ir.Predicate,
-    base: relation_store.PredicateKey,
-    x: fold_ir.Variable,
-    y: fold_ir.Variable,
-) ![]fold_ir.Goal {
-    const view_terms = try allocator.dupe(fold_ir.Term, &.{ .{ .variable = x }, .{ .variable = y } });
-    errdefer allocator.free(view_terms);
-    const base_terms = try allocator.dupe(fold_ir.Term, &.{ .{ .variable = y }, .{ .variable = x } });
-    errdefer allocator.free(base_terms);
-    return allocator.dupe(fold_ir.Goal, &.{
-        .{ .relation = .{ .predicate = view, .terms = view_terms } },
-        .{ .relation = .{ .predicate = .{ .base = base }, .terms = base_terms } },
-    });
+/// Compiles a rule against `db`.
+///
+/// A fold's input is written in the language the database speaks and lowered
+/// from there, because lowering only goes one way: the IR has no source form,
+/// and a rule written directly in it would be one nothing had admitted.
+fn compiledRule(
+    db: *database.Database,
+    head: input.Relation,
+    body: []const input.Goal,
+) !syntax.Rule {
+    const compiled = try compile.compileRelation(db, head.predicate, head.terms, false);
+    errdefer syntax.freeExpr(db.allocator, compiled);
+    return .{ .head = compiled, .body = try compile.compileGoals(db, body) };
 }
 
-/// Builds a view catalog from a database's own rule and folds two queries
-/// against it: one outside the availability boundary and one inside it.
+/// One rule of the query program, in the folding IR and in a scope of its own.
+fn foldingRule(
+    db: *database.Database,
+    symbols: *fold_ir.Symbols,
+    head: input.Relation,
+    body: []const input.Goal,
+) !fold_ir.Rule {
+    const compiled = try compiledRule(db, head, body);
+    defer syntax.freeRule(db.allocator, compiled);
+    return fold_ir.lowerRule(db.allocator, symbols, try symbols.openScope(.query), compiled);
+}
+
+fn foldingGoals(
+    db: *database.Database,
+    symbols: *fold_ir.Symbols,
+    goals: []const input.Goal,
+) ![]fold_ir.Goal {
+    const compiled = try compile.compileGoals(db, goals);
+    defer {
+        for (compiled) |clause| syntax.freeClauseTree(db.allocator, clause);
+        db.allocator.free(compiled);
+    }
+    return fold_ir.lowerClauses(db.allocator, symbols, try symbols.openScope(.query), compiled);
+}
+
+fn defineView(
+    db: *database.Database,
+    catalog: *view_catalog.Catalog,
+    head: input.Relation,
+    body: []const input.Goal,
+    availability: view_catalog.Availability,
+) !fold_ir.ViewId {
+    const compiled = try compiledRule(db, head, body);
+    defer syntax.freeRule(db.allocator, compiled);
+    return catalog.define(compiled, availability);
+}
+
+/// Installs a lowered plan's rules in `db` and answers its goals there.
 ///
-/// The folding modules render against the database's string and scalar
-/// tables, so nothing here needs the interface — but an allocation-failure
-/// sweep needs `test_support`, which sits above them, so the sweep lives up
-/// here with the other lifecycle sweeps rather than in the module it covers.
-fn foldingAllocationScenario(allocator: std.mem.Allocator) !void {
+/// Installing a rule hands its head and its clauses to the database, which is
+/// what `takeRule` records: releasing the plan afterwards must not release
+/// them a second time.
+fn installPlan(db: *database.Database, executable: *folding.Executable) !void {
+    for (0..executable.rules.len) |index| {
+        const rule = executable.takeRule(index);
+        defer db.allocator.free(rule.body);
+        statement.addRuleClauses(db, rule.head, rule.body) catch |err| {
+            syntax.freeExpr(db.allocator, rule.head);
+            for (rule.body) |clause| syntax.freeClauseTree(db.allocator, clause);
+            return err;
+        };
+    }
+}
+
+fn runPlan(db: *database.Database, executable: *folding.Executable) !results.QueryResult {
+    try installPlan(db, executable);
+    return statement.queryClauses(db, executable.goals);
+}
+
+/// Adds one two-atom fact without staging a copy of the database, which is
+/// what the public interface would do. A sweep over hundreds of small
+/// databases cannot afford a clone per fact.
+fn addAtomPair(
+    db: *database.Database,
+    predicate: []const u8,
+    left: []const u8,
+    right: []const u8,
+) !void {
+    const expression = try compile.compileRelation(
+        db,
+        predicate,
+        &.{ input.atom(left), input.atom(right) },
+        false,
+    );
+    defer syntax.freeExpr(db.allocator, expression);
+    try statement.addFactExpr(db, expression);
+}
+
+/// One line per answer, sorted, holding the values only.
+///
+/// Unlike `answerLines` these carry no variable names, because the two results
+/// being compared are a query's and a plan's: a plan's variables are not the
+/// query's, and printing their names would be printing the difference this is
+/// meant to see past.
+fn answerTuples(result: *const results.QueryResult) ![][]u8 {
+    const allocator = std.testing.allocator;
+    const lines = try allocator.alloc([]u8, result.answers.items.len);
+    var written: usize = 0;
+    errdefer {
+        for (lines[0..written]) |line| allocator.free(line);
+        allocator.free(lines);
+    }
+    for (result.answers.items, lines) |*answer, *line| {
+        var text: std.Io.Writer.Allocating = .init(allocator);
+        defer text.deinit();
+        for (answer.bindings.items, 0..) |binding, index| {
+            if (index != 0) text.writer.writeByte(' ') catch return error.OutOfMemory;
+            binding.value.write(&text.writer) catch return error.OutOfMemory;
+        }
+        line.* = try text.toOwnedSlice();
+        written += 1;
+    }
+    std.mem.sort([]u8, lines, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return lines;
+}
+
+/// Chapter 6's Example 6.2.1, as a program: the transitive closure of a
+/// relation that is gone, over a view holding the pairs two edges apart.
+///
+/// The query rules are recursive and the view definition is not, which is the
+/// case the Inverse Method exists for — the reconstructed relation feeds a
+/// query the views know nothing about.
+fn evenPathProblem(
+    db: *database.Database,
+    catalog: *view_catalog.Catalog,
+    rules: *[2]fold_ir.Rule,
+) ![]fold_ir.Goal {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    _ = try defineView(db, catalog, input.fact("v", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("edge", &.{ y, z }),
+    }, .materialized);
+    rules[0] = try foldingRule(db, &catalog.symbols, input.fact("q", &.{ x, y }), &.{
+        input.relation("edge", &.{ x, y }),
+    });
+    errdefer fold_ir.freeRule(db.allocator, rules[0]);
+    rules[1] = try foldingRule(db, &catalog.symbols, input.fact("q", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("q", &.{ y, z }),
+    });
+    errdefer fold_ir.freeRule(db.allocator, rules[1]);
+    return foldingGoals(db, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
+}
+
+test "an inverted view answers Chapter 6's even-length paths from its extension alone" {
+    const allocator = std.testing.allocator;
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var setup = try db.execute("path(X, Y) :- edge(X, Y).");
-    setup.deinit();
+    // Everything the plan may read: what the view stored. The graph behind it
+    // is gone, which is the situation a fold exists for — a test that folded
+    // and then read the original edges would prove nothing.
+    try db.addFact("v", &.{ input.atom("a"), input.atom("c") });
+    try db.addFact("v", &.{ input.atom("b"), input.atom("d") });
+    try db.addFact("v", &.{ input.atom("c"), input.atom("e") });
 
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
-    const view = try catalog.define(db.state.eval.rules.items[0], .materialized);
-
-    const edge: relation_store.PredicateKey = .{ .name = db.state.strings.get("edge").?, .arity = 2 };
-    const scope = try catalog.symbols.openScope(.query);
-    const x = try catalog.symbols.userVariable(scope, db.state.strings.get("X").?);
-    const y = try catalog.symbols.userVariable(scope, db.state.strings.get("Y").?);
-    const goals = try foldingQueryGoals(allocator, catalog.view(view).predicate(), edge, x, y);
+    var rules: [2]fold_ir.Rule = undefined;
+    const goals = try evenPathProblem(&db.state, &catalog, &rules);
     defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    // A view remembers pairs two edges apart and nothing else, so no plan over
+    // it can answer every path. Maximal containment is the whole claim.
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+
+    // The paths of even length in the dissertation's graph, and only those:
+    // a→c, b→d and c→e are two edges each, and a→e is four.
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 4), tuples.len);
+    for ([_][]const u8{ "a c", "a e", "b d", "c e" }, tuples) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+}
+
+test "a comparison a reconstructed value cannot answer costs answers, not soundness" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try db.addFact("v", &.{ input.atom("a"), input.atom("c") });
+    try db.addFact("v", &.{ input.atom("b"), input.atom("d") });
+    try db.addFact("v", &.{ input.atom("c"), input.atom("e") });
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("edge", &.{ y, z }),
+    }, .materialized);
+
+    // q(X, Z) :- edge(X, Y), edge(Y, Z), X != Z. The middle node is
+    // reconstructed and has no name, so the instances that would compare it
+    // cannot be run; the one that compares the two ends can.
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ x, z }),
+        &.{
+            input.relation("edge", &.{ x, y }),
+            input.relation("edge", &.{ y, z }),
+            input.notEqual(x, z),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, z })});
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    // Dropping an instance answers less, which is sound and is not maximal.
+    try std.testing.expectEqual(folding.Guarantee.contained, outcome.guarantee());
+    const explained = try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    });
+    defer allocator.free(explained);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        explained,
+        1,
+        "instances that would have read a reconstructed value were dropped",
+    ));
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+
+    // What survives is the pairs the view itself stores, which are the ones
+    // whose two ends the plan can name.
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 3), tuples.len);
+    for ([_][]const u8{ "a c", "b d", "c e" }, tuples) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+}
+
+/// A graph on three nodes as one bit per possible edge, and the two relations
+/// over it the containment sweep needs.
+///
+/// The oracle is computed here rather than by the engine on purpose: a sweep
+/// that asked the engine what the answers were and then asked it again through
+/// a plan would agree with itself whatever either one did.
+const Graph = struct {
+    const nodes = 3;
+
+    fn bit(row: usize, column: usize) u9 {
+        return @as(u9, 1) << @intCast(row * nodes + column);
+    }
+
+    fn has(mask: u9, row: usize, column: usize) bool {
+        return mask & bit(row, column) != 0;
+    }
+
+    /// The pairs joined by one edge of `left` followed by one of `right`.
+    fn compose(left: u9, right: u9) u9 {
+        var result: u9 = 0;
+        for (0..nodes) |from| for (0..nodes) |middle| for (0..nodes) |to| {
+            if (has(left, from, middle) and has(right, middle, to)) result |= bit(from, to);
+        };
+        return result;
+    }
+
+    fn closure(mask: u9) u9 {
+        var reached = mask;
+        while (true) {
+            const grown = reached | compose(mask, reached);
+            if (grown == reached) return reached;
+            reached = grown;
+        }
+    }
+};
+
+test "every answer a folded plan returns is one the query would have returned" {
+    // The containment claim, checked by exhaustion rather than by argument:
+    // over every graph on three nodes, work out what the query answers and
+    // what the view stores, then answer the folded plan from the view alone
+    // and confirm it invented nothing.
+    const allocator = std.testing.allocator;
+
+    // A plan does not depend on the data, so it is folded once. Its predicate
+    // and variable names are this database's, which is why the per-graph
+    // databases are clones of it rather than fresh ones.
+    var planned: Jatalog = .init(allocator);
+    defer planned.deinit();
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    var rules: [2]fold_ir.Rule = undefined;
+    const goals = try evenPathProblem(&planned.state, &catalog, &rules);
+    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    var executable = try folding.lowerPlan(
+        allocator,
+        &planned.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    try installPlan(&planned.state, &executable);
+
+    const names = [_][]const u8{ "a", "b", "c" };
+    var answered: usize = 0;
+    for (0..512) |value| {
+        const edges: u9 = @intCast(value);
+        const reachable = Graph.closure(edges);
+        const stored = Graph.compose(edges, edges);
+
+        var folded = try planned.clone();
+        defer folded.deinit();
+        for (0..Graph.nodes) |from| for (0..Graph.nodes) |to| {
+            if (Graph.has(stored, from, to))
+                try addAtomPair(&folded.state, "v", names[from], names[to]);
+        };
+
+        var produced = try statement.queryClauses(&folded.state, executable.goals);
+        defer produced.deinit();
+        for (produced.answers.items) |answer| {
+            const from = (try answer.bindings.items[0].value.getAtom())[0] - 'a';
+            const to = (try answer.bindings.items[1].value.getAtom())[0] - 'a';
+            if (!Graph.has(reachable, from, to)) {
+                std.debug.print("\ngraph {b}: the plan answered {c} to {c}\n", .{
+                    edges,
+                    'a' + from,
+                    'a' + to,
+                });
+                return error.AnswerNotContained;
+            }
+            answered += 1;
+        }
+    }
+    // A plan that answers nothing is contained in anything, so the sweep has
+    // to have seen answers for its agreement to mean anything.
+    try std.testing.expect(answered > 0);
+}
+
+/// Folds and runs one small even-length-path problem: a catalog built from a
+/// definition, a recursive query program, the inverse rules the fold produced,
+/// the split relations that made them runnable, and the answers.
+///
+/// The folding modules need nothing above `relation_store`, but a sweep needs
+/// `test_support` and running a plan needs `statement`, so this lives up here
+/// with the other lifecycle sweeps rather than in the modules it covers.
+fn foldingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try db.addFact("v", &.{ input.atom("a"), input.atom("c") });
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    var rules: [2]fold_ir.Rule = undefined;
+    const goals = try evenPathProblem(&db.state, &catalog, &rules);
+    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
 
     const names: fold_ir.Names = .{
         .symbols = &catalog.symbols,
         .strings = &db.state.strings,
         .scalars = &db.state.eval.scalars,
     };
-    var missing = try folding.foldQuery(allocator, &catalog, goals);
-    defer missing.deinit();
-    allocator.free(try missing.explainAlloc(allocator, names));
-    if (missing.plan() != null) return error.UnexpectedPlan;
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    allocator.free(try outcome.explainAlloc(allocator, names));
+    if (outcome.guarantee() != .maximally_contained) return error.UnexpectedGuarantee;
 
-    try catalog.declareBaseAvailable(edge);
-    var folded = try folding.foldQuery(allocator, &catalog, goals);
-    defer folded.deinit();
-    allocator.free(try folded.explainAlloc(allocator, names));
-    if (folded.guarantee() != .equivalent) return error.UnexpectedGuarantee;
-
-    // Standardizing a definition apart is what combining it with a query will
-    // need, and it allocates a scope, a substitution and a copy.
-    const renamed = try fold_ir.renameRule(allocator, &catalog.symbols, catalog.view(view).definition);
-    defer fold_ir.freeRule(allocator, renamed);
-    var text: std.Io.Writer.Allocating = .init(allocator);
-    defer text.deinit();
-    fold_ir.writeRule(&text.writer, names, renamed) catch return error.OutOfMemory;
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    answers.deinit();
 }
 
-test "folding a query against a view catalog releases every allocation on failure" {
+test "folding, lowering and running a plan release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(foldingAllocationScenario);
+}
+
+test "a predicate the query derives from a reconstruction is no more exact than it is" {
+    // The hole a relation-by-relation check leaves. `reach` is the query's own
+    // predicate, so nothing about it is reconstructed — but it is derived from
+    // `edge`, which is, so the plan knows less of `reach` than the query does
+    // and `not reach(...)` is therefore true of more. With edges a->x, x->b and
+    // a->b the view stores only (a, b), the query answers nothing, and a plan
+    // that let this through would answer (a, b).
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try db.addFact("v", &.{ input.atom("a"), input.atom("b") });
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    const view = try defineView(&db.state, &catalog, input.fact("v", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("edge", &.{ y, z }),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("reach", &.{ x, y }),
+        &.{input.relation("edge", &.{ x, y })},
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("v", &.{ x, y }),
+        input.not("reach", &.{ x, y }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+    // Lowering points every goal at a base relation, because which of them is
+    // a view is the catalog's business rather than the language's. A query
+    // that means the view says so here.
+    goals[0].relation.predicate = catalog.view(view).predicate();
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
+    try std.testing.expectEqual(
+        folding.PreconditionKind.relation_read_non_positively,
+        outcome.unsupported.unmet[0].kind,
+    );
 }

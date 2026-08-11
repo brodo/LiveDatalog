@@ -175,13 +175,28 @@ pub const Term = union(enum) {
 pub const Predicate = union(enum) {
     base: relation_store.PredicateKey,
     view: ViewRef,
+    /// A relation a fold invented by splitting one of the query's off. It is
+    /// not the relation it came from and must never be read as one: it holds
+    /// the tuples whose columns were Skolem terms, spread across the arguments
+    /// those terms were applied to.
+    generated: GeneratedRef,
 
     pub const ViewRef = struct { id: ViewId, name: syntax.Id, arity: usize };
+
+    /// `origin` is what the split came from and is carried for reading only;
+    /// `tag` is what distinguishes one split from another, and it means
+    /// nothing outside the plan that handed it out.
+    pub const GeneratedRef = struct {
+        origin: relation_store.PredicateKey,
+        tag: u32,
+        arity: usize,
+    };
 
     pub fn arity(self: Predicate) usize {
         return switch (self) {
             .base => |key| key.arity,
             .view => |reference| reference.arity,
+            .generated => |reference| reference.arity,
         };
     }
 
@@ -189,11 +204,17 @@ pub const Predicate = union(enum) {
         return switch (self) {
             .base => |key| switch (other) {
                 .base => |other_key| key.name == other_key.name and key.arity == other_key.arity,
-                .view => false,
+                else => false,
             },
             .view => |reference| switch (other) {
                 .view => |other_reference| reference.id == other_reference.id,
-                .base => false,
+                else => false,
+            },
+            .generated => |reference| switch (other) {
+                .generated => |other_reference| reference.tag == other_reference.tag and
+                    reference.origin.name == other_reference.origin.name and
+                    reference.origin.arity == other_reference.origin.arity,
+                else => false,
             },
         };
     }
@@ -747,9 +768,25 @@ pub fn writeVariable(
     names: Names,
     variable: Variable,
 ) std.Io.Writer.Error!void {
-    switch (names.symbols.originOf(variable)) {
+    return writeVariableName(writer, names.symbols, names.strings, variable);
+}
+
+/// A variable's spelling: its printed name and its identity together.
+///
+/// Kept separate from the renderer because a plan proved runnable is lowered
+/// back into the executable language, and the name a variable runs under has
+/// to be the name it reads under. Two variables printing alike would be one
+/// variable to whoever reads the plan, and one variable to whatever runs it;
+/// dropping the identity is exactly how that happens.
+pub fn writeVariableName(
+    writer: *std.Io.Writer,
+    symbols: *const Symbols,
+    strings: *const string_table.StringTable,
+    variable: Variable,
+) std.Io.Writer.Error!void {
+    switch (symbols.originOf(variable)) {
         .user => |name| try writer.print("{s}#{d}", .{
-            names.strings.resolve(name),
+            strings.resolve(name),
             @intFromEnum(variable),
         }),
         .generated => try writer.print("$V{d}", .{@intFromEnum(variable)}),
@@ -802,6 +839,10 @@ pub fn writePredicate(
         .view => |reference| try writer.print("{s}@{d}", .{
             names.strings.resolve(reference.name),
             @intFromEnum(reference.id),
+        }),
+        .generated => |reference| try writer.print("{s}${d}", .{
+            names.strings.resolve(reference.origin.name),
+            reference.tag,
         }),
     }
 }
