@@ -21,6 +21,12 @@ Primary-source notes and the local dissertation are indexed in
 
 ## Current implementation boundary
 
+This describes the *starting* point, not the current engine — every property
+below has since been replaced by Projects S, P, and M. It is kept because it is
+what the phases were written against. For the engine as it stands, read the
+completed decisions of the last finished phase in each project, plus
+[`aggregation-performance.md`](aggregation-performance.md) for what it costs.
+
 The plan assumes the implementation present after aggregation Phase 5:
 
 - `Jatalog.facts` stores base facts and `Jatalog.rules` stores validated rules.
@@ -55,11 +61,13 @@ S1 finite-f64 policy and syntax
       └─> S3 embedding, results, and migration
            └─> P1 indexed relation store
                 ├─> P2 semi-naive evaluation
-                │    └─> M1 persistent materialization
-                │         ├─> M2 insertion deltas
-                │         ├─> M3 deletion and negation maintenance
-                │         │    └─> M7 deletion through seeded structural rules
-                │         └─> M4–M6 aggregate maintenance
+                │    ├─> M1 persistent materialization
+                │    │    ├─> M2 insertion deltas
+                │    │    ├─> M3 deletion and negation maintenance
+                │    │    │    └─> M7 deletion through seeded structural rules
+                │    │    └─> M4–M6 aggregate maintenance
+                │    └─> P3 join planning
+                │         └─> P4 measured constant-factor work
                 └─> F1–F5 query folding
                      └─> F6 planner/materialization integration
 ```
@@ -486,6 +494,102 @@ P3 was completed on 2026-08-07:
     precisely so a lookup happening once does not pay for one; a copy that
     inherited the record would build on its own first ask, which for a
     per-statement copy is every ask.
+
+## P4: measured constant-factor work
+
+### Why this is deferred work
+
+P3 and its follow-up were both diverted by costs that had nothing to do with
+what they were optimizing, and measuring those diversions turned up work with a
+better return than either. None of it changes semantics; all of it is recorded
+here with the measurement that motivates it, so a later session can decide on
+evidence rather than on suspicion.
+
+**Interning is a linear scan.** `ValueTable.intern` walks the whole value table
+comparing tagged unions, and `scalar.Store.internAtom` / `internInteger` /
+`internFloat` walk the whole scalar table — the atom case comparing strings.
+Counted directly:
+
+| Workload | intern calls | table entries scanned |
+| --- | --- | --- |
+| load 2000 facts, 2001 distinct atoms | 4000 scalar, 4000 value | 4.0M, 4.0M |
+| materialize a 120-element structural recursion | 7500 scalar, 22500 value | 0.9M, 5.4M |
+
+Two things that measurement settles. Loading facts spends roughly four times
+as much in interning as in the per-statement cloning that P3's follow-up went
+after — half of it in string comparison. And the structural case scans 5.4M
+times over a table of **242 entries**: the table is small, it is simply walked
+22,500 times. That is the same program `benchmark-structural-deletion` runs.
+
+**A run of assertions is quadratic.** Every statement clones the database, and
+`RelationStore.clone` dupes every fact's terms, so 2000 `addFact` calls copy
+1,999,000 entries between them. `applyChanges` already amortizes this over a
+batch; a source file of 2000 facts does not, because the parser opens a
+transaction per statement.
+
+**The pattern index allocates one `ArrayList` per group.** This forced three
+separate accommodations rather than one fix: index construction is expensive
+enough that P3 made `lookup` defer building to the second request; copying is
+expensive enough that the clone follow-up needed a density gate; and it is why
+a near-unique index costs an allocation per fact either way.
+
+**Planning allocates per body solve.** P3 introduced this. It is most of why
+`benchmark-projected-aggregate` is about 5% slower and the test suite went from
+3.8s to 4.9s, and it buys nothing on the one- and two-goal bodies where it
+shows up.
+
+### Scope
+
+- Give `ValueTable` and `scalar.Store` a hash index beside their ordered
+  tables, in the shape of `RelationStore.membership`: the ordered table stays
+  the source of truth and IDs stay insertion-ordered indices, so identity,
+  ordering, canonicalization, and `setof` are untouched and the map is a pure
+  lookup accelerator. Both tables are cloned, so decide the same
+  copy-versus-rebuild question the store's caches answered.
+- Let a run of consecutive assertions share one statement transaction, without
+  weakening the guarantee that a failure leaves every earlier statement and
+  none of the failing one. This touches the transaction model and is the
+  riskiest item here; it may reasonably be split out or declined.
+- Reconsider the pattern index layout — a flat `[]u32` grouped by key plus a
+  map to ranges is cheap to build and cheap to copy. The obstacle is
+  `noteInserted`, which appends to a group in place; a layout that cannot
+  absorb an insert needs either an overflow list or a rebuild policy, and the
+  candidate slice a caller is iterating must stay valid across nested lookups.
+  Retiring the deferred build and the density gate is the prize.
+- Cache plans per rule and pre-bound variable set, invalidated with the
+  analysis, so a body solved once per delta round is planned once.
+
+### Acceptance tests
+
+- Every existing test passes unchanged, including the allocation-failure
+  sweeps: none of this has observable semantics.
+- Interning through the hash index agrees with a linear scan over the same
+  table for atoms, both integer limits, subnormal and adjacent floats,
+  canonicalized integral floats, `nil`, and nested cons values.
+- A cloned database interns to the same identifiers as the database it came
+  from, which is what the retraction path already depends on.
+- A source file whose statements are assertions, queries, and retractions
+  interleaved commits and rolls back exactly as it does now, statement by
+  statement.
+- Random operation sequences over the pattern index agree with an unordered
+  reference set, as P1 requires, under whatever layout lands.
+
+### Measurement gate
+
+Report the intern scan counts above alongside times, since the counts are
+machine-independent and the times are not. `benchmark-structural-deletion` and
+a fact-loading workload are the two that should move most; if they do not, the
+item that was supposed to move them has not been understood and should be
+recorded as such rather than kept.
+
+### Session boundary
+
+Each item is independently shippable and they are listed in expected-payoff
+order. Stop after any one of them with its measurement recorded. Do not take
+the transaction-batching item and the pattern-index item in the same session:
+both change contracts other phases rest on, and a regression would be hard to
+attribute.
+
 
 # Project M: persistent and incremental view maintenance
 
@@ -1240,28 +1344,31 @@ can produce a plan that is not contained in the original query.
 
 Use one session and one commit per phase unless a phase proves too large:
 
-1. S1 finite-f64 policy, syntax, and formatting
-2. S2 canonical mixed numeric semantics
-3. S3 typed embedding, owned results, and migration
-4. P1 relation store and indexes
-5. P2 semi-naive evaluation
-6. M1 persistent rebuild-equivalent materialization
-7. M2 insertion deltas
-8. M3 deletion and negation maintenance
-9. M4 aggregate group maintenance
-10. M5 projected views and CReaM counts
-11. M6 downstream propagation and public API
-12. M7 deletion through seeded structural rules
-13. P3 join planning and aggregate lookup
-14. F1 folding IR and view catalog
+1. S1 finite-f64 policy, syntax, and formatting — **done 2026-08-06**
+2. S2 canonical mixed numeric semantics — **done 2026-08-06**
+3. S3 typed embedding, owned results, and migration — **done 2026-08-06**
+4. P1 relation store and indexes — **done 2026-08-06**
+5. P2 semi-naive evaluation — **done 2026-08-06**
+6. M1 persistent rebuild-equivalent materialization — **done 2026-08-06**
+7. M2 insertion deltas — **done 2026-08-06**
+8. M3 deletion and negation maintenance — **done 2026-08-06**
+9. M4 aggregate group maintenance — **done 2026-08-06**
+10. M5 projected views and CReaM counts — **done 2026-08-06**
+11. M6 downstream propagation and public API — **done 2026-08-06**
+12. M7 deletion through seeded structural rules — **done 2026-08-07**
+13. P3 join planning and aggregate lookup — **done 2026-08-07**
+14. F1 folding IR and view catalog — **next**
 15. F2 ordinary Inverse Method
 16. F3 conjunctive aggregate inversion
 17. F4 soundness restrictions
 18. F5 list functions and dependency chase
 19. F6 execution and view selection
 
-P3 may move earlier if profiling shows join scans dominate M-project test runs.
-F1–F5 may run in parallel with M2–M6 in separate branches because they share
+P4 is not in this sequence. It is constant-factor work with no semantics, its
+items are independently shippable, and it can be taken whenever the engine's
+speed matters more than its features — including before F1.
+
+F1–F5 may run in parallel with the rest in separate branches because they share
 only the stable P1 storage interface.
 
 ## Cross-session completion checklist
@@ -1279,10 +1386,17 @@ Each phase ends with:
 
 ## Open design questions
 
-- Should persistent materialization be eager at update time or lazy at the next
-  query? Batch atomicity is required either way.
-- Which bound-position indexes justify their memory cost on typical embedded
-  workloads?
+- ~~Should persistent materialization be eager at update time or lazy at the
+  next query?~~ **Answered by M1: lazy**, with `materialize` as the eager
+  trigger. An update marks the affected strata and the next evaluation repairs
+  them; both paths stage and commit atomically.
+- ~~Which bound-position indexes justify their memory cost on typical embedded
+  workloads?~~ **Answered empirically rather than by policy.** An index is
+  built on the *second* request for a pattern, not the first, because a single
+  probe cannot repay a pass over the relation; and it survives a clone only
+  when its groups average more than a handful of entries, because copying costs
+  an allocation per group while rebuilding costs a hash per entry. Both rules
+  are in `relation_store.zig` with the measurements behind them.
 - Should full rebuild remain public, test-only, or available through a debug
   policy after incremental maintenance is stable?
 - Is delete-and-rederive sufficient for the expected recursive workloads, or
