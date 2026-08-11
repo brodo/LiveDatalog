@@ -1224,6 +1224,95 @@ can produce a plan that is not contained in the original query.
   requiring generated syntax to be valid user input.
 - An unsupported fold cannot be mistaken for an empty successful plan.
 
+### Completed decisions
+
+F1 was completed on 2026-08-11:
+
+- Folding does **not** live beside `planner.zig`, and the name was the
+  smaller reason. `planner` reorders the goals of a body that will be run
+  either way: it cannot change which answers come back, so it applies
+  silently, and the stored order is a standing witness that keeps it from
+  failing. A fold changes what is asked and can return a plan whose answers
+  are not the query's, so it must return a result the caller inspects. Two
+  transformations with opposite contracts do not belong in one module. F1 is
+  three: `fold_ir.zig` (the vocabulary), `view_catalog.zig` (what may be
+  read), `folding.zig` (what a fold returns). All three import only
+  `syntax`, `scalar`, `string_table` and `relation_store`, so they sit at
+  `planner`'s level in the DAG and none of them takes a `*Database`.
+- The IR is separate from `syntax` for a reason stronger than tidiness:
+  everything expressible in `syntax` can be evaluated. A Skolem term and a
+  generated equality have no executable meaning until a later phase proves the
+  plan runnable, so giving `syntax` a representation for them is exactly what
+  would let an unproved plan reach the evaluator. Lowering is therefore
+  one-directional — `syntax` to IR, never back — and there is no lifting
+  function to be tempted by. F6 defines the executable form when there is
+  something proved to execute. Lowering does carry the seed argument of a
+  structural rule across rather than dropping it, because a fold that inverted
+  such a rule without knowing what it was would be inverting recursion, which
+  is exactly what F5 has to reject.
+- Identity is not spelling. A variable is an entry in a `Symbols` table and its
+  printed name is a lookup, which makes collision impossible rather than
+  unlikely: two variables spelled `X` in different scopes are different
+  variables, and a generated variable has no user spelling at all. The same
+  holds one level up — a view is identified by its catalog entry, so a view and
+  a base relation spelled alike are never one predicate.
+- Hygiene is enforced twice, because the two failures are different. Identities
+  cannot collide, which is what protects the *reasoning*; and generated symbols
+  print with `$`, `@` or `#`, none of which a user identifier can contain,
+  which is what protects the *reading* — a rendered plan cannot be mistaken for
+  a program somebody wrote. `isUserSpellable` states the second rule and the
+  tests hold the renderer to it.
+- The renderer prints a user variable as `X#3`, spelling *and* identity. A
+  rendering that dropped the identity would print two different variables the
+  same way, which is precisely the confusion the IR exists to prevent, and a
+  plan combining a query with the inverse of a view has two such variables by
+  construction. Generated goals are marked with a `% generated` comment, so a
+  rendering reads as the program it stands for and still says which of its
+  goals nobody wrote.
+- The four-valued guarantee is one enum, but the fourth value is not shaped
+  like the other three. `Outcome` is a union of `folded` and `unsupported`, and
+  only the first carries a `Plan`; `Outcome.plan()` returns null for the
+  second. An unsupported fold therefore cannot be mistaken for an empty
+  successful plan by anybody who forgets to check a tag, because there is no
+  plan there to read. A plan with zero goals stays representable and renders as
+  a plan, guarantee and all.
+- `foldQuery` folds nothing, which is the phase's boundary, but it is not a
+  stub. It answers the availability question folding exists to answer: a plan
+  may read a view's stored extension and whichever base relations the catalog
+  declares, and nothing else. A query already inside that boundary is its own
+  plan and the guarantee is `equivalent`, because nothing was done to it.
+  Outside it the answer is `unsupported`, naming each relation it could not
+  get — and distinguishing a relation nothing defines from one only a view's
+  body mentions, which is the case F2 will reconstruct and this phase cannot.
+  Removing an availability declaration is what turns the first answer into the
+  second, which is the axis F4's tests need.
+- A view carries its definition, its schema and its availability separately
+  because later phases need them separately. The schema is not the head's
+  shape: a column bound by an aggregate's output holds a list whatever the head
+  spells it, which is the column F3 reconstructs member facts from. A withheld
+  view still has a known definition, which is what lets a fold explain what it
+  was missing.
+- The catalog owns the `Symbols` table its definitions share with the queries
+  folded against it and the plans that come back, so one identity means one
+  thing everywhere. Its predicate names and constants are the *database's*
+  identifiers: a catalog outliving the database it was built from resolves
+  nothing. That is the standing rule about database-local value identifiers,
+  and it is why nothing here is serializable.
+- No public surface was added. Folding's own API is the catalog, and there is
+  no way for an embedder to declare a view yet — that is F6's "fold against
+  explicitly selected view extensions". Exporting a fold entry point now would
+  document a feature that can only answer questions about an empty catalog.
+- The allocation-failure sweep lives in `root.zig` rather than in the modules
+  it covers, which is ADR 0002's rule rather than an exception to it:
+  `test_support` sits above these modules, so a test needing it moves up. The
+  scenario builds a catalog from a database's own rule, folds one query outside
+  the availability boundary and one inside it, renders both, and standardizes a
+  definition apart. The semantic tests stay in their own modules, where nothing
+  above `string_table` is needed to write them.
+- Not performance relevant: nothing in this phase runs during evaluation, and
+  no benchmark changed. The suite goes from 142 tests to 152 in about the same
+  wall clock.
+
 ## F2: ordinary conjunctive Inverse Method
 
 ### Scope
@@ -1357,8 +1446,8 @@ Use one session and one commit per phase unless a phase proves too large:
 11. M6 downstream propagation and public API — **done 2026-08-06**
 12. M7 deletion through seeded structural rules — **done 2026-08-07**
 13. P3 join planning and aggregate lookup — **done 2026-08-07**
-14. F1 folding IR and view catalog — **next**
-15. F2 ordinary Inverse Method
+14. F1 folding IR and view catalog — **done 2026-08-11**
+15. F2 ordinary Inverse Method — **next**
 16. F3 conjunctive aggregate inversion
 17. F4 soundness restrictions
 18. F5 list functions and dependency chase
@@ -1402,6 +1491,10 @@ Each phase ends with:
 - Is delete-and-rederive sufficient for the expected recursive workloads, or
   should a later design adopt a differential-dataflow-style timestamp model?
 - Should folded plans be returned only as an internal executable IR, or also as
-  printable Datalog extended with internal function terms?
+  printable Datalog extended with internal function terms? **F1 answered half
+  of it**: a plan renders as Datalog extended with generated function terms,
+  deliberately spelled so that it is not valid user input, because while no
+  executable form exists the rendering is the only way to read a plan at all.
+  Whether callers are also handed the executable form is F6's question.
 - Is `maximally_contained` useful to embedders without an accompanying
   explanation of which source relations could not be reconstructed?

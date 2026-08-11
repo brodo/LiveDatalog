@@ -133,3 +133,43 @@ on a `Database` and does not name the interface above it.
 `Jatalog` is what an embedder holds: it owns one `Database` and exposes the
 operations that change it. The split is what makes the engine's imports
 acyclic; see [ADR 0002](docs/adr/0002-acyclic-module-layering.md).
+
+### Query fold
+
+A rewrite of a query so that it runs against what is *available* — stored view
+extensions, plus whichever base relations a policy declares — together with a
+statement of what its answers are worth: `equivalent`, `maximally_contained`,
+`contained`, or `unsupported` (`folding.zig`). Folding is not the join planner.
+`planner.zig` reorders goals that will be run either way and cannot change
+which answers come back, so it applies silently and cannot fail; a fold changes
+what is asked, and Chapter 6 shows the unrestricted case producing a plan whose
+answers are not the query's. A fold therefore returns a result the caller
+inspects rather than a substitution it performs, and `unsupported` carries no
+plan at all rather than an empty one, so a fold that found nothing cannot be
+read as one that succeeded with nothing in it.
+
+### Folding IR
+
+The terms, goals and rules a fold reasons about (`fold_ir.zig`), deliberately
+separate from `syntax`, which is what the evaluator runs. Inversion introduces
+terms naming a value some fact must have had — Skolem terms — and equalities
+nobody wrote, and neither has an executable meaning until a later phase proves
+the plan runnable, so `syntax` has no representation for them: the IR is
+lowered from `syntax` and never lifted back. Identity here is an entry in a
+`Symbols` table and the printed name is a lookup, so variables spelled alike in
+different scopes stay distinct and a generated symbol cannot collide with a
+user one. Generated symbols additionally print with characters no user
+identifier can contain, so a rendered plan cannot be mistaken for a program
+somebody wrote.
+
+### View catalog
+
+What a fold is allowed to read (`view_catalog.zig`): each view's definition in
+the folding IR, the schema its stored extension holds — an aggregate output is
+a list column whatever the head spells it — and its availability, which is
+policy and can be withdrawn without the definition becoming unknown. A view is
+identified by its catalog entry rather than its name, so a view and a base
+relation spelled alike are never one predicate. The catalog owns the symbol
+table its definitions share with the queries folded against it, and its
+identifiers are the database's: a catalog outliving that database resolves
+nothing.

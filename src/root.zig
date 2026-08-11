@@ -14,6 +14,8 @@ const cost_model = @import("cost_model.zig");
 const database = @import("database.zig");
 const errors = @import("errors.zig");
 const evaluator = @import("evaluator.zig");
+const fold_ir = @import("fold_ir.zig");
+const folding = @import("folding.zig");
 const input_compiler = @import("input_compiler.zig");
 const maintenance = @import("maintenance.zig");
 const materialization = @import("materialization.zig");
@@ -28,6 +30,7 @@ const string_table = @import("string_table.zig");
 const syntax = @import("syntax.zig");
 const test_support = @import("test_support.zig");
 const validation = @import("validation.zig");
+const view_catalog = @import("view_catalog.zig");
 
 /// Descriptors a caller builds facts, rules, and goals out of.
 pub const input = @import("input.zig");
@@ -287,6 +290,8 @@ test {
     _ = cost_model;
     _ = database;
     _ = evaluator;
+    _ = fold_ir;
+    _ = folding;
     _ = input_compiler;
     _ = maintenance;
     _ = relation_store;
@@ -295,6 +300,7 @@ test {
     _ = syntax;
     _ = test_support;
     _ = validation;
+    _ = view_catalog;
 }
 
 /// Runs one source query and asserts how many answers it produces. This one
@@ -4132,4 +4138,77 @@ fn planningAllocationScenario(allocator: std.mem.Allocator) !void {
 
 test "planning and explaining release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(planningAllocationScenario);
+}
+
+/// One goal over a view and one over a base relation, sharing two variables.
+/// The caller owns the result; the partial allocations are released here so
+/// that no cleanup is armed twice.
+fn foldingQueryGoals(
+    allocator: std.mem.Allocator,
+    view: fold_ir.Predicate,
+    base: relation_store.PredicateKey,
+    x: fold_ir.Variable,
+    y: fold_ir.Variable,
+) ![]fold_ir.Goal {
+    const view_terms = try allocator.dupe(fold_ir.Term, &.{ .{ .variable = x }, .{ .variable = y } });
+    errdefer allocator.free(view_terms);
+    const base_terms = try allocator.dupe(fold_ir.Term, &.{ .{ .variable = y }, .{ .variable = x } });
+    errdefer allocator.free(base_terms);
+    return allocator.dupe(fold_ir.Goal, &.{
+        .{ .relation = .{ .predicate = view, .terms = view_terms } },
+        .{ .relation = .{ .predicate = .{ .base = base }, .terms = base_terms } },
+    });
+}
+
+/// Builds a view catalog from a database's own rule and folds two queries
+/// against it: one outside the availability boundary and one inside it.
+///
+/// The folding modules render against the database's string and scalar
+/// tables, so nothing here needs the interface — but an allocation-failure
+/// sweep needs `test_support`, which sits above them, so the sweep lives up
+/// here with the other lifecycle sweeps rather than in the module it covers.
+fn foldingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute("path(X, Y) :- edge(X, Y).");
+    setup.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const view = try catalog.define(db.state.eval.rules.items[0], .materialized);
+
+    const edge: relation_store.PredicateKey = .{ .name = db.state.strings.get("edge").?, .arity = 2 };
+    const scope = try catalog.symbols.openScope(.query);
+    const x = try catalog.symbols.userVariable(scope, db.state.strings.get("X").?);
+    const y = try catalog.symbols.userVariable(scope, db.state.strings.get("Y").?);
+    const goals = try foldingQueryGoals(allocator, catalog.view(view).predicate(), edge, x, y);
+    defer fold_ir.freeGoals(allocator, goals);
+
+    const names: fold_ir.Names = .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    };
+    var missing = try folding.foldQuery(allocator, &catalog, goals);
+    defer missing.deinit();
+    allocator.free(try missing.explainAlloc(allocator, names));
+    if (missing.plan() != null) return error.UnexpectedPlan;
+
+    try catalog.declareBaseAvailable(edge);
+    var folded = try folding.foldQuery(allocator, &catalog, goals);
+    defer folded.deinit();
+    allocator.free(try folded.explainAlloc(allocator, names));
+    if (folded.guarantee() != .equivalent) return error.UnexpectedGuarantee;
+
+    // Standardizing a definition apart is what combining it with a query will
+    // need, and it allocates a scope, a substitution and a copy.
+    const renamed = try fold_ir.renameRule(allocator, &catalog.symbols, catalog.view(view).definition);
+    defer fold_ir.freeRule(allocator, renamed);
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    fold_ir.writeRule(&text.writer, names, renamed) catch return error.OutOfMemory;
+}
+
+test "folding a query against a view catalog releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(foldingAllocationScenario);
 }
