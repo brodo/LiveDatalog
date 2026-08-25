@@ -51,6 +51,16 @@ pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
 pub const Statement = statement.Statement;
 
+/// A view this database's catalog holds, as `defineView` handed it back.
+pub const ViewId = fold_ir.ViewId;
+/// Whether a folded plan may read a view's stored extension. A withheld view
+/// still says what it would have contained, which is what lets a fold report
+/// what it was missing.
+pub const Availability = view_catalog.Availability;
+/// What a folded plan's answers are worth, relative to the query's. Read the
+/// documentation on `foldQuery` before deciding that one of them is enough.
+pub const Guarantee = folding.Guarantee;
+
 /// An embeddable Datalog database.
 ///
 /// The engine's state is `state`, and every operation here is expressed in
@@ -59,20 +69,49 @@ pub const Statement = statement.Statement;
 /// statement front end additionally through `Statement`.
 pub const Jatalog = struct {
     state: database.Database,
+    /// What a fold of a query against this database is allowed to read.
+    ///
+    /// The catalog is owned here rather than held beside a database because it
+    /// cannot outlive one: its predicate names and its constants are this
+    /// database's identifiers, so a catalog paired with the wrong database
+    /// resolves to nothing and a catalog paired with none resolves to nothing
+    /// at all. Owning it is what makes that pairing impossible to get wrong,
+    /// and it is also the only way a view can be declared from the borrowed
+    /// descriptors this interface speaks, since compiling them needs the
+    /// database that will hold them.
+    views: view_catalog.Catalog,
+    /// Plans already folded against those views.
+    plans: PlanCache,
 
     pub fn init(allocator: std.mem.Allocator) Jatalog {
-        return .{ .state = .init(allocator) };
+        return .{
+            .state = .init(allocator),
+            .views = .init(allocator),
+            .plans = .{ .allocator = allocator },
+        };
     }
 
     pub fn deinit(self: *Jatalog) void {
+        self.plans.deinit();
+        self.views.deinit();
         self.state.deinit();
         self.* = undefined;
     }
 
     /// A copy sharing nothing with this one, so the two can be updated
     /// independently.
+    ///
+    /// The views come with it, because a catalog belongs to a database and the
+    /// copy is a database. The folded plans do not: a cache is not state, and
+    /// the copy folds what it is asked for.
     pub fn clone(self: *const Jatalog) !Jatalog {
-        return .{ .state = try self.state.clone() };
+        var copied_state = try self.state.clone();
+        errdefer copied_state.deinit();
+        return .{
+            .state = copied_state,
+            .views = try self.views.clone(),
+            .plans = .{ .allocator = self.state.allocator },
+        };
     }
 
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const input.Term) !void {
@@ -241,6 +280,406 @@ pub const Jatalog = struct {
         return statement.explainClauses(&staging, compiled);
     }
 
+    /// Declares a view a fold may reason about: what it is defined by, and
+    /// whether its stored extension may be read.
+    ///
+    /// A view is *not* a rule. Nothing here is added to the program, nothing
+    /// is derived, and no fact changes. What is recorded is a definition — the
+    /// relations the view's tuples were computed from — so that a fold can run
+    /// it backwards when those relations are no longer there. The extension
+    /// itself is whatever this database happens to hold under the view's name
+    /// and arity; declaring a view says the definition is true of it.
+    ///
+    /// The definition is checked for safety exactly as a rule would be, and
+    /// rejected with `InvalidRule` if it fails. Descriptors are borrowed for
+    /// the call.
+    pub fn defineView(
+        self: *Jatalog,
+        head: input.Relation,
+        body: []const input.Goal,
+        availability: Availability,
+    ) !ViewId {
+        var staging = try self.state.clone();
+        defer staging.deinit();
+        const compiled = try compileProgramRule(&staging, head, body);
+        defer syntax.freeRule(staging.allocator, compiled);
+        const id = try self.views.define(compiled, availability);
+        self.state.commit(&staging);
+        return id;
+    }
+
+    /// Declares a predicate this database maintains as a view, taking the
+    /// definition from the rule that derives it.
+    ///
+    /// This is the bridge from the maintenance project to the folding one: a
+    /// materialized predicate already has a stored extension and the engine
+    /// already keeps it up to date, so the only thing missing was a statement
+    /// of what it remembers. A predicate no single rule defines is refused
+    /// with `UndefinedView` — a view has one definition, and a predicate with
+    /// several has no one rule to invert.
+    ///
+    /// A published definition is the rule's, so it stops being true if the
+    /// rules change. The rule generation is recorded and a later fold reports
+    /// `StaleViewDefinition` rather than reasoning from a definition the
+    /// database has moved on from.
+    pub fn publishView(
+        self: *Jatalog,
+        predicate: []const u8,
+        arity: usize,
+        availability: Availability,
+    ) !ViewId {
+        const name = self.state.strings.get(predicate) orelse return error.UndefinedView;
+        var found: ?syntax.Rule = null;
+        for (self.state.eval.rules.items) |rule| {
+            if (rule.head.predicate != name or rule.head.terms.len != arity) continue;
+            if (found != null) return error.UndefinedView;
+            found = rule;
+        }
+        const definition = found orelse return error.UndefinedView;
+        return self.views.defineFrom(
+            definition,
+            availability,
+            .{ .materialized_rule = self.state.eval.next_rule_id },
+        );
+    }
+
+    /// Withdraws or restores a view's stored extension. The definition stays
+    /// known either way, which is what lets a fold say that the view it needed
+    /// was withheld rather than that the relation was unreachable.
+    pub fn setViewAvailability(self: *Jatalog, id: ViewId, availability: Availability) void {
+        self.views.setAvailability(id, availability);
+    }
+
+    /// Declares that a folded plan may read this base relation directly.
+    ///
+    /// The honest default is that it may not: a fold exists because the
+    /// original relations are gone, and a plan that helped itself to them
+    /// would prove nothing. Declaring one is how a caller that still has some
+    /// of its data asks for a hybrid plan — folding where it must, reading
+    /// where it can. It never costs answers, because a relation read directly
+    /// is the relation, and a reconstruction is at best that.
+    pub fn declareBaseAvailable(self: *Jatalog, predicate: []const u8, arity: usize) !void {
+        const name = try self.state.strings.intern(predicate);
+        try self.views.declareBaseAvailable(.{ .name = name, .arity = arity });
+    }
+
+    /// Rewrites a query to run against the declared views, and says what the
+    /// rewrite is worth. **This answers nothing.**
+    ///
+    /// That is the distinction this whole interface turns on. `query` returns
+    /// the answers to what was asked. A fold returns a *plan* — a different
+    /// program, over different relations — together with a statement of how
+    /// its answers relate to the query's, and it is the caller who decides
+    /// whether that statement is good enough to act on. Chapter 6 of the
+    /// dissertation this follows shows the unrestricted case producing plans
+    /// whose answers are not the query's, which is why a fold cannot be
+    /// applied silently the way join planning is.
+    ///
+    /// The guarantee is one of four:
+    ///
+    /// - `equivalent`: the same answers as the query over any database. Only
+    ///   returned when nothing had to be reconstructed, because everything the
+    ///   query reads was available already.
+    /// - `maximally_contained`: every answer it returns is one the query
+    ///   returns, and no plan over these views returns more. A view remembers
+    ///   less than the relations behind it, so this is the best a fold that
+    ///   reconstructed anything can promise — unless a canonical aggregate
+    ///   view made the reconstruction exact, which `foldReconstructions`
+    ///   reports per relation.
+    /// - `contained`: every answer it returns is one the query returns, with
+    ///   nothing claimed about how many. Eliminating the terms a
+    ///   reconstruction could not name dropped rule instances.
+    /// - `unsupported`: there is no plan. Not an empty one — none. Ask
+    ///   `explainFold` for the preconditions that were not met.
+    ///
+    /// `rules` are the rules the query defines its own predicates by, and are
+    /// part of the question rather than of the program: a folded plan is the
+    /// query's rules together with the inverse rules of the views, and a
+    /// recursive query over a relation only a non-recursive view remembers is
+    /// the case the method exists for.
+    ///
+    /// Folding twice with the same views and the same question returns the
+    /// same plan without folding again.
+    pub fn foldQuery(
+        self: *Jatalog,
+        goals: []const input.Goal,
+        rules: []const input.Rule,
+    ) !Fold {
+        if (self.views.ambiguity() != null) return error.AmbiguousViewName;
+        if (self.views.staleAt(self.state.eval.next_rule_id) != null)
+            return error.StaleViewDefinition;
+        self.plans.refresh(self.views.generation, self.state.eval.next_rule_id);
+        // Sizes are read off the stored extensions, and a maintained view's
+        // are derived, so this materializes exactly as `explainQuery` does.
+        // It changes no answer either way: what is being decided is which of
+        // two interchangeable views to read.
+        try materialization.ensureMaterialized(&self.state);
+
+        const allocator = self.state.allocator;
+        var staging = try self.state.clone();
+        defer staging.deinit();
+        const compiled_goals = try compile.compileGoals(&staging, goals);
+        defer {
+            for (compiled_goals) |clause| syntax.freeClauseTree(staging.allocator, clause);
+            staging.allocator.free(compiled_goals);
+        }
+        const compiled_rules = try compileProgramRules(&staging, rules);
+        defer freeProgramRules(staging.allocator, compiled_rules);
+
+        const key = try folding.normalizeQuery(allocator, compiled_goals, compiled_rules);
+        var key_owned = true;
+        defer if (key_owned) allocator.free(key);
+        // A hit needs nothing the staged copy interned, so the copy is
+        // dropped: asking the same question twice must not grow the database.
+        if (self.plans.find(key)) |index| {
+            self.plans.hits += 1;
+            return self.handle(index, true);
+        }
+        self.plans.misses += 1;
+
+        const goal_scope = try self.views.symbols.openScope(.query);
+        const lowered_goals = try fold_ir.lowerClauses(
+            allocator,
+            &self.views.symbols,
+            goal_scope,
+            compiled_goals,
+        );
+        defer fold_ir.freeGoals(allocator, lowered_goals);
+        const lowered_rules = try lowerProgramRules(allocator, &self.views.symbols, compiled_rules);
+        defer {
+            for (lowered_rules) |rule| fold_ir.freeRule(allocator, rule);
+            allocator.free(lowered_rules);
+        }
+
+        // Sizes, for the one decision cost is allowed to make: which of
+        // several views that reconstruct one relation exactly to read. Pointed
+        // at the staged copy for the length of the fold and taken away after,
+        // so the catalog never holds a store that has gone.
+        self.views.extensions = staging.closureStore();
+        defer self.views.extensions = null;
+        var outcome = try folding.foldQuery(allocator, &self.views, .{
+            .goals = lowered_goals,
+            .rules = lowered_rules,
+        });
+        var outcome_owned = true;
+        defer if (outcome_owned) outcome.deinit();
+
+        var executable: ?folding.Executable = null;
+        if (outcome.plan()) |plan| {
+            executable = folding.lowerPlan(
+                allocator,
+                &staging.strings,
+                &self.views.symbols,
+                plan,
+            ) catch |err| switch (err) {
+                // A plan still holding a term the evaluator has no meaning for
+                // is not lowered and not discarded: it can still be read, and
+                // saying so is more use than refusing the fold.
+                error.PlanNotExecutable => null,
+                else => |other| return other,
+            };
+        }
+        errdefer if (executable) |*value| value.deinit();
+
+        const index = try self.plans.insert(key, outcome, executable);
+        key_owned = false;
+        outcome_owned = false;
+        self.state.commit(&staging);
+        return self.handle(index, false);
+    }
+
+    /// Runs a folded plan and returns its answers.
+    ///
+    /// The plan runs against a copy of this database holding exactly what the
+    /// catalog said was available — every readable view's stored extension,
+    /// plus the base relations the policy declared — with everything else
+    /// removed: the other facts, the database's own rules, and the derived
+    /// closure. That is not a precaution, it is the contract. A plan is built
+    /// to answer from what remains once the original relations are gone, and
+    /// running it somewhere that still holds them would let it read exactly
+    /// what it was built to do without.
+    ///
+    /// The copy is discarded afterwards, so a plan's reconstructed relations
+    /// never join this database. Nothing here changes it.
+    pub fn answerFolded(self: *Jatalog, fold: Fold) !results.QueryResult {
+        const entry = try self.planAt(fold);
+        const executable = if (entry.executable) |*value| value else return error.PlanNotExecutable;
+        // A view whose extension the engine derives has to have derived it
+        // before the copy is taken, or the copy keeps a name with nothing
+        // under it.
+        try materialization.ensureMaterialized(&self.state);
+        var staging = try self.viewOnlyCopy();
+        defer staging.deinit();
+        for (executable.rules) |rule| {
+            const copy = try syntax.cloneRule(staging.allocator, rule);
+            statement.addRuleClauses(&staging, copy.head, copy.body) catch |err| {
+                syntax.freeRule(staging.allocator, copy);
+                return err;
+            };
+            staging.allocator.free(copy.body);
+        }
+        return statement.queryClauses(&staging, executable.goals);
+    }
+
+    /// Renders a fold: its guarantee, then either the plan and every
+    /// transformation that produced it, or the preconditions it could not
+    /// meet. The caller owns the returned text.
+    ///
+    /// A plan's goals are not the caller's goals, so this is the only way to
+    /// read one. Generated names are spelled so that they cannot be mistaken
+    /// for a program somebody wrote, and a variable prints its identity as
+    /// well as its spelling, because a plan combining a query with the inverse
+    /// of a view has two variables of one name by construction.
+    pub fn explainFold(self: *Jatalog, fold: Fold) ![]u8 {
+        const entry = try self.planAt(fold);
+        return entry.outcome.explainAlloc(self.state.allocator, .{
+            .symbols = &self.views.symbols,
+            .strings = &self.state.strings,
+            .scalars = &self.state.eval.scalars,
+        });
+    }
+
+    /// Which relations the plan derives instead of reading, and how much of
+    /// each it gets.
+    ///
+    /// This is what makes `maximally_contained` mean something. On its own the
+    /// guarantee says the plan answers no more than the query and no less than
+    /// any other plan over these views; it does not say *where* the loss is.
+    /// Each relation here is a place a query's answers could have gone
+    /// missing — unless it is `exact`, in which case a canonical aggregate
+    /// view of it was read and Lemma 6.4.2 makes the reconstruction the
+    /// relation itself. A plan whose reconstructions are all exact is
+    /// maximally contained and loses nothing.
+    pub fn foldReconstructions(self: *Jatalog, fold: Fold) !Reconstructions {
+        const entry = try self.planAt(fold);
+        var result: Reconstructions = .{ .allocator = self.state.allocator, .items = &.{} };
+        errdefer result.deinit();
+        const plan = entry.outcome.plan() orelse return result;
+        var found: std.ArrayList(Reconstruction) = .empty;
+        errdefer {
+            for (found.items) |item| self.state.allocator.free(item.predicate);
+            found.deinit(self.state.allocator);
+        }
+        for (plan.transformations) |transformation| {
+            const exact = switch (transformation.kind) {
+                .relation_reconstructed => false,
+                .relation_reconstructed_exactly => true,
+                else => continue,
+            };
+            const subject = transformation.subject orelse continue;
+            const key = switch (subject) {
+                .base => |value| value,
+                else => continue,
+            };
+            const name = try self.state.allocator.dupe(u8, self.state.strings.resolve(key.name));
+            found.append(self.state.allocator, .{
+                .predicate = name,
+                .arity = key.arity,
+                .exact = exact,
+            }) catch |err| {
+                self.state.allocator.free(name);
+                return err;
+            };
+        }
+        result.items = try found.toOwnedSlice(self.state.allocator);
+        return result;
+    }
+
+    /// How many views are declared and how the plan cache has been doing.
+    pub fn foldStats(self: *const Jatalog) FoldStats {
+        return .{
+            .views = self.views.views.items.len,
+            .cached_plans = self.plans.entries.items.len,
+            .plan_hits = self.plans.hits,
+            .plan_misses = self.plans.misses,
+            .plan_invalidations = self.plans.invalidations,
+        };
+    }
+
+    /// Discards every folded plan. Folding again reproduces them; this is for
+    /// a caller that would rather have the memory.
+    pub fn clearPlanCache(self: *Jatalog) void {
+        self.plans.clear();
+    }
+
+    /// The cached plan a handle names, or `StalePlan` when the views or the
+    /// rules have moved on since it was folded.
+    ///
+    /// Checked against the catalog and the program as they stand now rather
+    /// than against the cache's own stamp, because a caller can change either
+    /// without folding anything, and a handle that survived such a change
+    /// would name whichever plan later took its place.
+    fn planAt(self: *Jatalog, fold: Fold) !*const CachedPlan {
+        if (fold.catalog_generation != self.views.generation) return error.StalePlan;
+        if (fold.rule_generation != self.state.eval.next_rule_id) return error.StalePlan;
+        if (fold.catalog_generation != self.plans.catalog_generation) return error.StalePlan;
+        if (fold.rule_generation != self.plans.rule_generation) return error.StalePlan;
+        if (fold.entry >= self.plans.entries.items.len) return error.StalePlan;
+        return &self.plans.entries.items[fold.entry];
+    }
+
+    fn handle(self: *const Jatalog, index: usize, reused: bool) Fold {
+        return .{
+            .guarantee = self.plans.entries.items[index].outcome.guarantee(),
+            .reused = reused,
+            .entry = index,
+            .catalog_generation = self.plans.catalog_generation,
+            .rule_generation = self.plans.rule_generation,
+        };
+    }
+
+    /// A copy of this database holding only what a plan is allowed to read.
+    ///
+    /// The extensions are taken from the closure rather than from the base
+    /// facts, because a view the engine maintains stores its tuples there and
+    /// nowhere else; they arrive in the copy as base facts, which is what they
+    /// are to a plan. Everything else goes: the other facts, the derived
+    /// closure, the auxiliary views, and the database's own rules — one of
+    /// those deriving a withheld relation would put it straight back, and the
+    /// plan brings every rule it needs.
+    fn viewOnlyCopy(self: *Jatalog) !database.Database {
+        var copy = try self.state.clone();
+        errdefer copy.deinit();
+
+        var kept: std.ArrayList(relation_store.Fact) = .empty;
+        defer {
+            for (kept.items) |fact| copy.allocator.free(fact.terms);
+            kept.deinit(copy.allocator);
+        }
+        const stored = copy.closureStore();
+        for (0..stored.len()) |index| {
+            const fact = stored.factAt(index);
+            if (!self.readableByPlans(.{ .name = fact.predicate, .arity = fact.terms.len }))
+                continue;
+            try relation_store.appendFactCopy(copy.allocator, &kept, fact);
+        }
+
+        if (copy.closure) |*closure| {
+            closure.deinit();
+            copy.closure = null;
+        }
+        copy.materialization = .uninitialized;
+        materialization.dropAuxiliaryViews(&copy);
+        for (copy.eval.rules.items) |rule| syntax.freeRule(copy.allocator, rule);
+        copy.eval.rules.clearRetainingCapacity();
+        copy.eval.invalidateAnalysis();
+        copy.facts.clear();
+        for (kept.items) |fact|
+            try relation_store.copyFactInto(copy.allocator, &copy.facts, fact, false);
+        return copy;
+    }
+
+    /// Whether a plan may read facts stored under this name and arity: a base
+    /// relation the policy declared, or a readable view's extension.
+    fn readableByPlans(self: *const Jatalog, key: relation_store.PredicateKey) bool {
+        if (self.views.baseAvailable(key)) return true;
+        for (self.views.views.items) |defined| {
+            if (!defined.readable()) continue;
+            if (defined.name == key.name and defined.schema.arity() == key.arity) return true;
+        }
+        return false;
+    }
+
     /// Records how the maintained views are classified and how much work
     /// incremental maintenance has done. A view whose head retains every
     /// outer variable is self-maintainable in the sense of Chapter 5: its
@@ -257,6 +696,218 @@ pub const Jatalog = struct {
         return statement_parser.executeAll();
     }
 };
+
+/// A plan a fold produced, and what it was folded against.
+///
+/// It is a handle rather than the plan itself, because the plan belongs to the
+/// database's cache and the same question asked twice is the same plan. Every
+/// operation taking one checks that the views and the rules it was folded
+/// against are still the ones the database has, and reports `StalePlan` if
+/// they are not — a plan folded under other definitions is a different
+/// program, and quietly running it would be the one mistake this whole
+/// interface exists to prevent.
+pub const Fold = struct {
+    /// What this plan's answers are worth, relative to the query's. See
+    /// `foldQuery`. `unsupported` means there is no plan at all — not an empty
+    /// one — and only `explainFold` has anything to say about it.
+    guarantee: Guarantee,
+    /// Whether an already-folded plan answered this rather than a fresh fold.
+    reused: bool,
+    entry: usize,
+    catalog_generation: u64,
+    rule_generation: u32,
+};
+
+/// A relation a plan derives instead of reading, and how much of it.
+pub const Reconstruction = struct {
+    predicate: []const u8,
+    arity: usize,
+    /// Whether the plan derives the whole relation rather than as much of it
+    /// as the views prove.
+    exact: bool,
+};
+
+/// The relations one plan reconstructs. Owned by the caller.
+pub const Reconstructions = struct {
+    allocator: std.mem.Allocator,
+    items: []Reconstruction,
+
+    pub fn deinit(self: *Reconstructions) void {
+        for (self.items) |item| self.allocator.free(item.predicate);
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const FoldStats = struct {
+    views: usize,
+    cached_plans: usize,
+    plan_hits: usize,
+    plan_misses: usize,
+    /// Times every cached plan was discarded at once because the views or the
+    /// rules changed.
+    plan_invalidations: usize,
+};
+
+/// One folded plan, kept so that asking the same question again does not fold
+/// it again.
+const CachedPlan = struct {
+    /// The normalized question. Two callers asking it differently — other
+    /// variable names, the same relations — key to the same bytes.
+    key: []u8,
+    outcome: folding.Outcome,
+    /// The plan in the executable language, or null when there is nothing to
+    /// run: an unsupported fold, or a plan still holding a term the evaluator
+    /// has no meaning for. The rendering is available either way.
+    executable: ?folding.Executable,
+
+    fn deinit(self: *CachedPlan, allocator: std.mem.Allocator) void {
+        if (self.executable) |*value| value.deinit();
+        self.outcome.deinit();
+        allocator.free(self.key);
+        self.* = undefined;
+    }
+};
+
+/// The plans folded so far, and what they were folded against.
+///
+/// A plan is a function of two things and no others: the question, and the
+/// catalog — its definitions together with its availability policy. So the key
+/// is the normalized question, and the *cache as a whole* carries the
+/// catalog's generation, because a definition added or an availability
+/// withdrawn changes every plan folded under it rather than one of them.
+/// Publishing a view from a database rule brings the rule generation into that
+/// stamp for the same reason: such a definition is the rule's, and a rule
+/// addition can change what the predicate means.
+///
+/// Cardinalities are deliberately not in the key, and that is what costing
+/// only provably interchangeable plans buys. Sizes move with every fact
+/// inserted, and index availability moves with every query run — P1 builds a
+/// pattern index on the *second* request for it — so a plan keyed on either
+/// would be a plan whose identity depended on when it was asked for. Since
+/// cost here only ever chooses between plans already proved to answer the
+/// same, a stale choice is a slower plan and never a different answer, which
+/// is the same licence the join planner runs on.
+const PlanCache = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(CachedPlan) = .empty,
+    catalog_generation: u64 = 0,
+    rule_generation: u32 = 0,
+    hits: usize = 0,
+    misses: usize = 0,
+    invalidations: usize = 0,
+
+    fn deinit(self: *PlanCache) void {
+        self.clear();
+        self.entries.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn clear(self: *PlanCache) void {
+        for (self.entries.items) |*entry| entry.deinit(self.allocator);
+        self.entries.clearRetainingCapacity();
+    }
+
+    /// Discards every plan when what they were folded against has changed.
+    /// Both stamps are counters over the whole catalog and the whole program,
+    /// so there is no such thing as invalidating one entry: either every plan
+    /// here was folded against what the database now holds, or none was.
+    fn refresh(self: *PlanCache, catalog_generation: u64, rule_generation: u32) void {
+        if (self.catalog_generation == catalog_generation and
+            self.rule_generation == rule_generation) return;
+        if (self.entries.items.len != 0) {
+            self.clear();
+            self.invalidations += 1;
+        }
+        self.catalog_generation = catalog_generation;
+        self.rule_generation = rule_generation;
+    }
+
+    fn find(self: *const PlanCache, key: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.key, key)) return index;
+        }
+        return null;
+    }
+
+    /// Takes ownership of `key`, `outcome` and `executable`.
+    fn insert(
+        self: *PlanCache,
+        key: []u8,
+        outcome: folding.Outcome,
+        executable: ?folding.Executable,
+    ) !usize {
+        try self.entries.append(self.allocator, .{
+            .key = key,
+            .outcome = outcome,
+            .executable = executable,
+        });
+        return self.entries.items.len - 1;
+    }
+};
+
+/// Compiles and admits one rule of a program a fold is given: a view's
+/// definition, or a rule the query defines a predicate of its own by.
+///
+/// Admission is the same check `addRule` runs, and it is run here for the same
+/// reason — an unsafe rule has no meaning to invert — but the clauses keep the
+/// order they were written in rather than the order admission would store. A
+/// definition is read structurally by the catalog, and a reordered body is a
+/// different shape to read.
+fn compileProgramRule(
+    db: *database.Database,
+    head: input.Relation,
+    body: []const input.Goal,
+) !syntax.Rule {
+    const compiled_head = try compile.compileRelation(db, head.predicate, head.terms, false);
+    errdefer syntax.freeExpr(db.allocator, compiled_head);
+    const compiled_body = try compile.compileGoals(db, body);
+    errdefer {
+        for (compiled_body) |clause| syntax.freeClauseTree(db.allocator, clause);
+        db.allocator.free(compiled_body);
+    }
+    const seed_argument = try validation.validateRule(db, compiled_head, compiled_body);
+    return .{ .head = compiled_head, .body = compiled_body, .seed_argument = seed_argument };
+}
+
+fn compileProgramRules(db: *database.Database, rules: []const input.Rule) ![]syntax.Rule {
+    const compiled = try db.allocator.alloc(syntax.Rule, rules.len);
+    var built: usize = 0;
+    errdefer {
+        for (compiled[0..built]) |rule| syntax.freeRule(db.allocator, rule);
+        db.allocator.free(compiled);
+    }
+    for (rules, compiled) |rule, *slot| {
+        slot.* = try compileProgramRule(db, rule.head, rule.body);
+        built += 1;
+    }
+    return compiled;
+}
+
+fn freeProgramRules(allocator: std.mem.Allocator, rules: []syntax.Rule) void {
+    for (rules) |rule| syntax.freeRule(allocator, rule);
+    allocator.free(rules);
+}
+
+/// Lowers the query's own rules into the folding IR, each in a scope of its
+/// own: two rules spelling a variable alike mean two variables.
+fn lowerProgramRules(
+    allocator: std.mem.Allocator,
+    symbols: *fold_ir.Symbols,
+    rules: []const syntax.Rule,
+) ![]fold_ir.Rule {
+    const lowered = try allocator.alloc(fold_ir.Rule, rules.len);
+    var built: usize = 0;
+    errdefer {
+        for (lowered[0..built]) |rule| fold_ir.freeRule(allocator, rule);
+        allocator.free(lowered);
+    }
+    for (rules, lowered) |rule, *slot| {
+        slot.* = try fold_ir.lowerRule(allocator, symbols, try symbols.openScope(.query), rule);
+        built += 1;
+    }
+    return lowered;
+}
 
 /// Compiles a batch's relation descriptors into expressions the update path
 /// applies. Compilation belongs here rather than below because it is what
@@ -6649,4 +7300,452 @@ test "an auxiliary view whose group a plan cannot name derives nothing rather th
     defer freeLines(actual);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |one, other| try std.testing.expectEqualStrings(one, other);
+}
+
+/// The even-length-path problem of Chapter 6, stated through the public
+/// interface: three stored pairs, a view saying what they are pairs of, and a
+/// recursive query over a relation nothing holds any more.
+fn declareEvenPathViews(db: *Jatalog) !ViewId {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    try db.addFact("v", &.{ input.atom("a"), input.atom("c") });
+    try db.addFact("v", &.{ input.atom("b"), input.atom("d") });
+    try db.addFact("v", &.{ input.atom("c"), input.atom("e") });
+    return db.defineView(input.fact("v", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("edge", &.{ y, z }),
+    }, .materialized);
+}
+
+/// The query those views are folded against: `q` is the transitive closure of
+/// a relation only the view remembers.
+fn evenPathQuery(db: *Jatalog) !Fold {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    return db.foldQuery(&.{input.relation("q", &.{ x, y })}, &.{
+        input.rule(input.fact("q", &.{ x, y }), &.{input.relation("edge", &.{ x, y })}),
+        input.rule(input.fact("q", &.{ x, z }), &.{
+            input.relation("edge", &.{ x, y }),
+            input.relation("q", &.{ y, z }),
+        }),
+    });
+}
+
+test "a declared view answers a query about relations the database no longer has" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    _ = try declareEvenPathViews(&db);
+
+    const fold = try evenPathQuery(&db);
+    // A view remembers pairs two edges apart and nothing else, so no plan over
+    // it answers every path. Maximal containment is the whole claim, and it is
+    // the caller's to accept.
+    try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
+    try std.testing.expect(!fold.reused);
+
+    var answers = try db.answerFolded(fold);
+    defer answers.deinit();
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 4), tuples.len);
+    for ([_][]const u8{ "a c", "a e", "b d", "c e" }, tuples) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    // What the guarantee does not say on its own: where the loss is. One
+    // relation is derived rather than read, and no canonical aggregate view of
+    // it was available, so that is the place an answer could have gone.
+    var reconstructed = try db.foldReconstructions(fold);
+    defer reconstructed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reconstructed.items.len);
+    try std.testing.expectEqualStrings("edge", reconstructed.items[0].predicate);
+    try std.testing.expectEqual(@as(usize, 2), reconstructed.items[0].arity);
+    try std.testing.expect(!reconstructed.items[0].exact);
+
+    const explanation = try db.explainFold(fold);
+    defer allocator.free(explanation);
+    try std.testing.expect(std.mem.startsWith(u8, explanation, "guarantee: maximally contained"));
+
+    // The views belong to the database, so a copy of it has them: the same
+    // question folds to the same guarantee and the same answers without being
+    // declared again. The folded plans do not come with it — a cache is not
+    // state — so the copy folds afresh.
+    var copy = try db.clone();
+    defer copy.deinit();
+    const copied = try evenPathQuery(&copy);
+    try std.testing.expectEqual(Guarantee.maximally_contained, copied.guarantee);
+    try std.testing.expect(!copied.reused);
+    var copied_answers = try copy.answerFolded(copied);
+    defer copied_answers.deinit();
+    try std.testing.expectEqual(@as(usize, 4), copied_answers.answers.items.len);
+
+    // Running a plan changes nothing here. It ran on a copy, so none of the
+    // relations it reconstructed joined this database.
+    var direct = try db.query(&.{input.relation("v", &.{
+        input.variable("X"),
+        input.variable("Y"),
+    })});
+    defer direct.deinit();
+    try std.testing.expectEqual(@as(usize, 3), direct.answers.items.len);
+}
+
+test "a query inside the availability boundary is its own plan, and a hybrid one is not" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const c = input.variable("C");
+
+    // The caller still has `label` and says so. `r` is gone, and a canonical
+    // aggregate view of it — the relation copied — is what remains.
+    try db.addFact("label", &.{ input.atom("a"), input.atom("red") });
+    try db.addFact("label", &.{ input.atom("b"), input.atom("blue") });
+    try db.addFact("copy", &.{ input.atom("a"), input.atom("one") });
+    try db.addFact("copy", &.{ input.atom("b"), input.atom("two") });
+    try db.declareBaseAvailable("label", 2);
+    _ = try db.defineView(
+        input.fact("copy", &.{ x, y }),
+        &.{input.relation("r", &.{ x, y })},
+        .materialized,
+    );
+
+    // Two things the plan is not allowed to see, left here on purpose. A
+    // canonical view reconstructs `r` under its own name, so anything this
+    // database happens to hold or derive under that name would join the plan's
+    // reconstruction and answer more than the views can account for. One is a
+    // leftover fact and the other a rule that manufactures more of them out of
+    // a relation the plan *is* allowed to read, so neither is stopped by the
+    // other's absence.
+    try db.addFact("r", &.{ input.atom("a"), input.atom("three") });
+    try db.addRule(
+        input.relation("r", &.{ x, x }),
+        &.{input.relation("copy", &.{ x, y })},
+    );
+
+    // Nothing was reconstructed, because nothing had to be: the query reads
+    // what the policy declared. That is the only way to earn `equivalent`.
+    const plain = try db.foldQuery(&.{input.relation("label", &.{ x, c })}, &.{});
+    try std.testing.expectEqual(Guarantee.equivalent, plain.guarantee);
+    var plain_answers = try db.answerFolded(plain);
+    defer plain_answers.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plain_answers.answers.items.len);
+
+    // Half read and half reconstructed. The guarantee falls to maximal
+    // containment because a reconstruction is in general a subset — and here
+    // it happens not to be, which is what the per-relation account says and
+    // the guarantee alone cannot.
+    const hybrid = try db.foldQuery(&.{
+        input.relation("r", &.{ x, y }),
+        input.relation("label", &.{ x, c }),
+    }, &.{});
+    try std.testing.expectEqual(Guarantee.maximally_contained, hybrid.guarantee);
+    var reconstructed = try db.foldReconstructions(hybrid);
+    defer reconstructed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reconstructed.items.len);
+    try std.testing.expectEqualStrings("r", reconstructed.items[0].predicate);
+    try std.testing.expect(reconstructed.items[0].exact);
+
+    var joined = try db.answerFolded(hybrid);
+    defer joined.deinit();
+    const tuples = try answerTuples(&joined);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 2), tuples.len);
+    try std.testing.expectEqualStrings("a one red", tuples[0]);
+    try std.testing.expectEqualStrings("b two blue", tuples[1]);
+
+    // The leftover fact and the rule's two derivations are all still here, and
+    // all three would have joined the plan's reconstruction of `r` had the
+    // plan run against this database rather than against a copy of what the
+    // catalog admits.
+    var here = try db.query(&.{input.relation("r", &.{ x, y })});
+    defer here.deinit();
+    try std.testing.expectEqual(@as(usize, 3), here.answers.items.len);
+}
+
+/// Two canonical aggregate views of one relation: `wide` is the relation
+/// copied and `narrow` is it grouped by its first column. Both remember all of
+/// `r` — Lemma 6.4.2 — so a plan may read either and get `r` itself back,
+/// which is exactly what makes choosing between them a cost question and only
+/// a cost question. `wide` is declared first, so preferring `narrow` can only
+/// be cost and never declaration order.
+fn declareInterchangeableViews(db: *Jatalog) !void {
+    const x1 = input.variable("X1");
+    const x2 = input.variable("X2");
+    const y2 = input.variable("Y2");
+    const s = input.variable("S");
+    _ = try db.defineView(
+        input.fact("wide", &.{ x1, x2 }),
+        &.{input.relation("r", &.{ x1, x2 })},
+        .materialized,
+    );
+    _ = try db.defineView(input.fact("narrow", &.{ x1, s }), &.{
+        input.relation("r", &.{ x1, x2 }),
+        input.setof(y2, &.{input.relation("r", &.{ x1, y2 })}, s),
+    }, .materialized);
+}
+
+test "cost picks between views that reconstruct one relation exactly, and picks the same way twice" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try declareInterchangeableViews(&db);
+
+    // `r` holds two values for one key, so the grouped view stores one tuple
+    // where the copy stores two. Both give `r` back whole.
+    try db.addFact("wide", &.{ input.atom("a"), input.atom("one") });
+    try db.addFact("wide", &.{ input.atom("a"), input.atom("two") });
+    try db.addFact("narrow", &.{
+        input.atom("a"),
+        input.list(&.{ input.atom("one"), input.atom("two") }),
+    });
+
+    const goals = [_]input.Goal{input.relation("r", &.{
+        input.atom("a"),
+        input.variable("V"),
+    })};
+    const fold = try db.foldQuery(&goals, &.{});
+    try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
+
+    const explanation = try db.explainFold(fold);
+    defer allocator.free(explanation);
+    // The smaller extension is read and the larger is left out of the plan.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        explanation,
+        "being the smallest of them: narrow@1/2",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "wide@0/2") == null);
+
+    // Cost chose, and it did not choose a weaker plan to do it: the relation
+    // is still reconstructed exactly, and the answers are the ones `r` has.
+    var reconstructed = try db.foldReconstructions(fold);
+    defer reconstructed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reconstructed.items.len);
+    try std.testing.expect(reconstructed.items[0].exact);
+
+    var answers = try db.answerFolded(fold);
+    defer answers.deinit();
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 2), tuples.len);
+    try std.testing.expectEqualStrings("one", tuples[0]);
+    try std.testing.expectEqualStrings("two", tuples[1]);
+
+    // Folded again from nothing — no cached plan to hand back — the same
+    // catalog over the same data reaches the same decisions in the same order.
+    // A cost decision that did not would be a plan cache holding one of two
+    // programs depending on when it was asked. What is compared is the record
+    // of what the fold did rather than the whole rendering, because a plan's
+    // variables carry their identities and a second fold opens a scope of its
+    // own: the same plan twice prints different numbers by construction.
+    db.clearPlanCache();
+    const again = try db.foldQuery(&goals, &.{});
+    const repeated = try db.explainFold(again);
+    defer allocator.free(repeated);
+    const marker = "transformations:\n";
+    const decisions = explanation[std.mem.indexOf(u8, explanation, marker).?..];
+    const decisions_again = repeated[std.mem.indexOf(u8, repeated, marker).?..];
+    try std.testing.expectEqualStrings(decisions, decisions_again);
+}
+
+test "views that reconstruct one relation equally well are chosen between by declaration order" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try declareInterchangeableViews(&db);
+
+    // One value for the one key, so the copy and the grouping store one tuple
+    // each and cost has nothing to say. Something still has to decide, and it
+    // has to decide the same way every time, so it is the first declaration.
+    try db.addFact("wide", &.{ input.atom("a"), input.atom("one") });
+    try db.addFact("narrow", &.{ input.atom("a"), input.list(&.{input.atom("one")}) });
+
+    const fold = try db.foldQuery(&.{input.relation("r", &.{
+        input.atom("a"),
+        input.variable("V"),
+    })}, &.{});
+    const explanation = try db.explainFold(fold);
+    defer allocator.free(explanation);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        explanation,
+        "being the smallest of them: wide@0/2",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation, "narrow@1/2") == null);
+
+    var answers = try db.answerFolded(fold);
+    defer answers.deinit();
+    try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
+}
+
+test "a folded plan is reused until the views or the rules it was folded against move on" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    const view = try declareEvenPathViews(&db);
+
+    const first = try evenPathQuery(&db);
+    try std.testing.expect(!first.reused);
+    const second = try evenPathQuery(&db);
+    try std.testing.expect(second.reused);
+    var stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.cached_plans);
+    try std.testing.expectEqual(@as(usize, 1), stats.plan_hits);
+    try std.testing.expectEqual(@as(usize, 1), stats.plan_misses);
+    try std.testing.expectEqual(@as(usize, 0), stats.plan_invalidations);
+
+    // Withdrawing the extension changes what every plan folded against this
+    // catalog was allowed to read, so both handles stop naming anything. A
+    // handle that survived would name whichever plan later took its place.
+    db.setViewAvailability(view, .withheld);
+    try std.testing.expectError(error.StalePlan, db.explainFold(first));
+    try std.testing.expectError(error.StalePlan, db.answerFolded(second));
+
+    const withheld = try evenPathQuery(&db);
+    try std.testing.expectEqual(Guarantee.unsupported, withheld.guarantee);
+    // No plan at all rather than an empty one, which is the distinction the
+    // whole interface is shaped around: there is nothing to run.
+    try std.testing.expectError(error.PlanNotExecutable, db.answerFolded(withheld));
+    const refusal = try db.explainFold(withheld);
+    defer allocator.free(refusal);
+    try std.testing.expect(std.mem.indexOf(u8, refusal, "unmet preconditions") != null);
+    stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.plan_invalidations);
+
+    // Restoring it does not restore the discarded plan: the question is folded
+    // again, and it comes back with the guarantee it had.
+    db.setViewAvailability(view, .materialized);
+    const restored = try evenPathQuery(&db);
+    try std.testing.expect(!restored.reused);
+    try std.testing.expectEqual(Guarantee.maximally_contained, restored.guarantee);
+
+    // A rule addition invalidates for a different reason — a published
+    // definition is a rule's, and this cache cannot tell which plans read one
+    // — so it discards them all.
+    try db.addRule(
+        input.relation("reachable", &.{input.variable("X")}),
+        &.{input.relation("v", &.{ input.variable("X"), input.variable("Y") })},
+    );
+    try std.testing.expectError(error.StalePlan, db.explainFold(restored));
+    _ = try evenPathQuery(&db);
+    // Three discards: the withdrawal, the restoration, and the rule. Restoring
+    // an availability is a change like any other — the cache cannot tell that
+    // it undid the previous one, and a stamp that could would be a stamp that
+    // had to understand what it was counting.
+    try std.testing.expectEqual(@as(usize, 3), db.foldStats().plan_invalidations);
+}
+
+test "a maintained predicate published as a view answers without its own base facts" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+
+    try db.addFact("edge", &.{ input.atom("a"), input.atom("b") });
+    try db.addFact("edge", &.{ input.atom("b"), input.atom("c") });
+    try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
+    try db.addRule(input.relation("two", &.{ x, z }), &.{
+        input.relation("edge", &.{ x, y }),
+        input.relation("edge", &.{ y, z }),
+    });
+    try db.materialize();
+
+    // The definition comes from the rule; the extension is what maintenance
+    // already keeps under `two/2`. Nothing is copied and nothing is declared
+    // twice.
+    _ = try db.publishView("two", 2, .materialized);
+    const fold = try evenPathQuery(&db);
+    try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
+
+    var answers = try db.answerFolded(fold);
+    defer answers.deinit();
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    // `edge` is still in this database and the rule deriving `two` still runs
+    // in it, and neither is in the copy the plan ran on. Had either been, the
+    // answers would have been the real transitive closure — six pairs — rather
+    // than the paths of even length the view remembers.
+    try std.testing.expectEqual(@as(usize, 2), tuples.len);
+    try std.testing.expectEqualStrings("a c", tuples[0]);
+    try std.testing.expectEqualStrings("b d", tuples[1]);
+
+    var real = try db.query(&.{input.relation("two", &.{ x, y })});
+    defer real.deinit();
+    try std.testing.expectEqual(@as(usize, 2), real.answers.items.len);
+
+    // The definition was the rule's, and the rules have moved on. Folding
+    // against it now would reason from something the database no longer says.
+    try db.addRule(
+        input.relation("two", &.{ x, y }),
+        &.{input.relation("edge", &.{ x, y })},
+    );
+    try std.testing.expectError(error.StaleViewDefinition, evenPathQuery(&db));
+}
+
+test "two readable extensions of one name are refused at selection, not after a fold" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+
+    try db.addFact("v", &.{ input.atom("a"), input.atom("b") });
+    _ = try db.defineView(
+        input.fact("v", &.{ x, y }),
+        &.{input.relation("edge", &.{ x, y })},
+        .materialized,
+    );
+    const rival = try db.defineView(
+        input.fact("v", &.{ x, y }),
+        &.{input.relation("link", &.{ x, y })},
+        .materialized,
+    );
+
+    // A lowered plan names what it reads by the name the extension is stored
+    // under, so a selection holding two of them under `v/2` cannot be executed
+    // whatever is asked of it. That makes it the selection's fault rather than
+    // the query's, and it is reported without folding anything — including for
+    // a query that would never have touched either view.
+    const goals = [_]input.Goal{input.relation("edge", &.{ x, y })};
+    try std.testing.expectError(error.AmbiguousViewName, db.foldQuery(&goals, &.{}));
+    try std.testing.expectError(
+        error.AmbiguousViewName,
+        db.foldQuery(&.{input.relation("unrelated", &.{x})}, &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 0), db.foldStats().plan_misses);
+
+    // Withholding one leaves one readable extension of that name.
+    db.setViewAvailability(rival, .withheld);
+    const fold = try db.foldQuery(&goals, &.{});
+    try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
+}
+
+/// The public folding path end to end on the smallest database that exercises
+/// it: one view, one stored tuple, one fold, and the three things a caller can
+/// do with what comes back.
+fn publicFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    try db.addFact("v", &.{ input.atom("a"), input.atom("b") });
+    _ = try db.defineView(
+        input.fact("v", &.{ x, y }),
+        &.{input.relation("edge", &.{ x, y })},
+        .materialized,
+    );
+
+    const fold = try db.foldQuery(&.{input.relation("edge", &.{ x, y })}, &.{});
+    if (fold.guarantee != .maximally_contained) return error.UnexpectedGuarantee;
+    allocator.free(try db.explainFold(fold));
+    var reconstructed = try db.foldReconstructions(fold);
+    reconstructed.deinit();
+    var answers = try db.answerFolded(fold);
+    answers.deinit();
+}
+
+test "declaring a view, folding and running the plan release every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(publicFoldingAllocationScenario);
 }

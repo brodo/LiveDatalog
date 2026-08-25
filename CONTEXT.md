@@ -162,6 +162,67 @@ which makes the reconstruction equivalent rather than contained, or a
 *monotonic query*, whose answers can only shrink when its relations do. Both
 are below, and both are checked rather than assumed.
 
+### View selection
+
+What a caller says a fold may read, and what a plan handed back is
+(`root.zig`, over `view_catalog.zig`). A `Jatalog` owns its catalog rather than
+sitting beside one, because a catalog's predicate names and constants are that
+database's identifiers and a catalog paired with any other database resolves
+nothing; owning it is what makes the pairing impossible to get wrong, and it is
+also the only way a view can be declared from the borrowed descriptors the
+public interface speaks. `defineView` records a definition — nothing is added
+to the program and no fact changes — `publishView` takes one from a rule the
+database already maintains, `setViewAvailability` withdraws or restores an
+extension, and `declareBaseAvailable` says a base relation is still there and
+may be read as it stands, which is what a hybrid plan is.
+
+`foldQuery` answers nothing. It returns a `Fold`: a guarantee, and a handle to
+a plan the database holds. `answerFolded` runs the plan against a copy holding
+exactly what the catalog admits — the other facts, the database's own rules and
+the derived closure all removed — so the contract that a plan reads views
+rather than the relations behind them is enforced rather than described.
+`explainFold` renders it and `foldReconstructions` names every relation the
+plan derives instead of reads, saying of each whether the plan gets all of it.
+That per-relation account is what makes `maximally_contained` actionable: the
+guarantee says the plan answers no more than the query, and only the account
+says where an answer could have gone.
+
+Two failures belong to the *selection* rather than to a fold, and are reported
+when it is made. Two readable extensions storing under one name and arity are
+`AmbiguousViewName`: a lowered plan names what it reads by that name, so such a
+selection is unusable whatever is asked of it, and no query makes it better. A
+view published from a rule the program has since added to is
+`StaleViewDefinition`, because that definition was the rule's.
+
+Cost decides one thing and only one: when several views reconstruct a relation
+*exactly*, Lemma 6.4.2 makes them interchangeable, and the plan reads the
+smallest stored extension, ties going to the first declared. Everything else is
+settled by the guarantee — a relation available directly is read directly
+because that is exact, and where nothing is exact every view mentioning the
+relation is inverted because maximality demands it — so cost never has a
+weaker plan to prefer. Index availability is deliberately not consulted: P1
+builds a pattern index on the *second* request for it, so a plan costed on one
+would depend on when it was asked for, and the plan cache would be keyed on
+something invisible.
+
+### Plan cache
+
+Folded plans, kept per database (`root.zig`). The key is the *normalized*
+question — the compiled query with variables renumbered by first occurrence, so
+that the same question written with other names is one entry — and the cache as
+a whole is stamped with the catalog's generation and the program's rule count.
+Both stamps are counters over everything they cover, so there is no such thing
+as invalidating one entry: either every plan was folded against what the
+database now holds, or none was. A `Fold` carries the stamp it was made under
+and every use rechecks it against the database as it stands, so a handle that
+outlived a change reports `StalePlan` rather than naming whichever plan took
+its place.
+
+Cardinalities are not in the key. They move with every fact inserted, and cost
+here only ever chooses between plans already proved to answer the same, so a
+stale choice is a slower plan and never a different answer — the same licence
+`planner.zig` runs on.
+
 ### Folding IR
 
 The terms, goals and rules a fold reasons about (`fold_ir.zig`), deliberately

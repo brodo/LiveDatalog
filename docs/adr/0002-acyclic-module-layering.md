@@ -46,6 +46,23 @@ were moved down: `StringTable` into `string_table.zig`, `AuxiliaryView` into
 Building an auxiliary view is part of materializing, so that code lives in
 `materialization.zig`, below the aggregate maintenance that consumes it.
 
+### A layer that needs the database's numbers takes the numbers
+
+Added 2026-08-25, when query folding first had to cost something. The six
+folding modules sit at `planner.zig`'s level and none of them takes a
+`*Database`, which is what let them be written and tested without the engine in
+view. Choosing between two views on the size of their stored extensions is the
+first thing folding does that needs a fact the database holds.
+
+It does not take a database to get it. `view_catalog.Catalog` borrows a
+`*RelationStore` — a type it already imported — and the interface above points
+it at one for the length of a fold. The rule this states is the general one: a
+layer that needs a number from below takes *that number*, or the smallest thing
+that carries it, rather than the state it lives in. Taking the database would
+have given folding access to the rules, the closure and the maintenance
+machinery in order to read a length, and every later phase would have found a
+use for one of them.
+
 ### Tests obey the layering too
 
 A test lives in the module it covers whenever it can be written with imports at

@@ -522,3 +522,57 @@ the figure by the same amount. It is code layout. A benchmark whose inner loop
 is a 2001-entry clone is sensitive to it at roughly this magnitude, in both
 plan policies at once, which is also why both columns of that row move
 together.
+
+## 2026-08-25 after F6 (folded planning and execution)
+
+The first folding measurement, because F6 is the first phase with a public
+entry point to measure. `zig build benchmark-folding -Doptimize=ReleaseFast`,
+best of three runs, ns, arm64, macOS 26.5.0, Zig 0.16.0.
+
+Both sides answer `r(K, v0)` and are checked to return the same rows before
+either timing is believed. The folded side reads a *canonical aggregate view*
+of `r` — the relation copied, or the relation grouped by its first column — so
+Lemma 6.4.2 makes the reconstruction the relation itself and the comparison is
+between two ways of computing one answer rather than between two answers. A
+view that remembered less would make the folded side quicker by returning less,
+which is not a speedup and is why the workload asserts exactness rather than
+assuming it.
+
+| Workload | Plan | Cached plan | Folded run | Direct run |
+| --- | --- | --- | --- | --- |
+| relation copied, 200 keys × 5 values | 55541 | 19208 | 572629 | 92637 |
+| relation grouped, 200 keys × 5 values | 36000 | 8792 | 434837 | 93620 |
+| relation grouped, 50 keys × 40 values | 27667 | 3708 | 7494756 | 140585 |
+
+Planning and execution are reported apart because they happen at different
+rates. Planning is one `foldQuery`: inverting the view, eliminating the terms
+the inversion invents, lowering the result. Cached planning is the same call
+once the plan exists — compiling the question and normalizing it to a cache
+key, three to five times cheaper than folding it again, and the reason the
+cache exists. Execution is one `answerFolded`.
+
+**Folded execution is five to fifty times slower than direct execution here,
+and the reason is where the plan is kept rather than what the method does.** A
+direct query reuses the materialized closure and only solves goals. A folded
+plan's rules are in the plan and not in the database, so every call builds a
+copy holding what the catalog admits, installs them there, and derives the
+reconstruction from nothing. Nothing about a fold requires that; it is what
+`answerFolded` costs today, and it is the obvious thing to fix if folded
+execution ever needs to be fast.
+
+The 50×40 row is a different effect and a real one. Reading values back out of
+a stored list goes through `$member`, which is defined by seeded structural
+rules over the lists the database holds — so a 40-element list contributes on
+the order of 40² membership facts through its tails, and forty times fewer,
+longer lists cost sixteen times more than the same 1000 pairs in short ones.
+The copied shape has no lists at all and pays none of it. Grouping is the
+cheaper *plan* and the more expensive *execution* at this list length, which is
+worth knowing before reading much into the view-selection cost model: it counts
+stored tuples, and a stored tuple holding a long list is not the same unit of
+work as one holding a pair.
+
+No list functions appear in these workloads, so neither side needed the source
+database seeded with lists for structural rules to derive over. That asymmetry
+is real where it applies — F5's tests need it and the folded side does not —
+and reporting it as a speedup would be reporting a difference in what each side
+can answer.

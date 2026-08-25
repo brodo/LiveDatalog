@@ -107,6 +107,14 @@ pub const TransformationKind = enum {
     /// functional dependency, decided while the plan was built rather than
     /// carried in it.
     collected_sets_identified,
+    /// Several views reconstructed one relation and one of them reconstructed
+    /// it exactly, so the plan reads that one and leaves the rest out. Lemma
+    /// 6.4.2 is what makes them interchangeable — an exact reconstruction is
+    /// the relation, and nothing contained in it can add to it — and among
+    /// interchangeable views the smallest extension is read. This is the only
+    /// place cost decides anything about a fold, and it decides between plans
+    /// already proved to answer the same.
+    equivalent_view_preferred,
 
     pub fn text(self: TransformationKind) []const u8 {
         return switch (self) {
@@ -125,6 +133,8 @@ pub const TransformationKind = enum {
                 "functions reading it",
             .collected_sets_identified => "views proved to have collected one set, so the set " ++
                 "each only named is the one the plan derives",
+            .equivalent_view_preferred => "read in place of views it reconstructs the same " ++
+                "relation as, being the smallest of them",
         };
     }
 };
@@ -375,6 +385,120 @@ fn writeSubject(
 pub const Query = struct {
     goals: []const fold_ir.Goal,
     rules: []const fold_ir.Rule = &.{},
+};
+
+/// A query's identity as text: the same bytes for two questions that differ
+/// only in the variable names they were written with.
+///
+/// A plan cache needs this and nothing else needs it. It is taken of the
+/// *compiled* query rather than of the folding IR, and deliberately: lowering
+/// opens a scope of its own every time, so keying on the IR would mean
+/// lowering — and growing the catalog's symbol table — before a cache could
+/// tell it had seen the question before. Compiled identifiers are the
+/// database's and do not move, so the only thing left to normalize is variable
+/// spelling, renumbered by first occurrence.
+///
+/// It is not the renderer. A rendering is for a person and prints spellings;
+/// this prints identifiers, is never shown to anybody, and has only to be
+/// equal exactly when two queries are the same question. Two questions it
+/// spells differently are a cache miss, which costs a fold and no correctness.
+pub fn normalizeQuery(
+    allocator: std.mem.Allocator,
+    goals: []const syntax.Clause,
+    rules: []const syntax.Rule,
+) ![]u8 {
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    var normalizer: Normalizer = .{ .allocator = allocator, .writer = &text.writer };
+    defer normalizer.deinit();
+    normalizer.program(goals, rules) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => |other| return other,
+    };
+    return text.toOwnedSlice();
+}
+
+const Normalizer = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    variables: std.array_hash_map.Auto(syntax.Id, u32) = .empty,
+
+    fn deinit(self: *Normalizer) void {
+        self.variables.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn program(
+        self: *Normalizer,
+        goals: []const syntax.Clause,
+        rules: []const syntax.Rule,
+    ) !void {
+        for (rules) |rule| {
+            if (rule.seed_argument) |position| try self.writer.print("seed{d}", .{position});
+            try self.expr(rule.head);
+            try self.writer.writeAll(":-");
+            try self.clauses(rule.body);
+            try self.writer.writeByte('.');
+        }
+        try self.clauses(goals);
+        try self.writer.writeByte('?');
+    }
+
+    fn clauses(self: *Normalizer, values: []const syntax.Clause) anyerror!void {
+        for (values) |clause| {
+            switch (clause) {
+                .relational, .builtin => |value| try self.expr(value),
+                .negated => |value| {
+                    try self.writer.writeByte('!');
+                    try self.expr(value);
+                },
+                .aggregate => |value| {
+                    try self.writer.writeAll("setof(");
+                    try self.term(value.template);
+                    try self.writer.writeByte(';');
+                    try self.clauses(value.body);
+                    try self.writer.writeByte(';');
+                    try self.term(value.output);
+                    try self.writer.writeByte(')');
+                },
+            }
+            try self.writer.writeByte(',');
+        }
+    }
+
+    fn expr(self: *Normalizer, value: syntax.Expr) !void {
+        if (value.negated) try self.writer.writeByte('!');
+        try self.writer.print("{s}{d}/{d}", .{
+            @tagName(value.kind),
+            value.predicate,
+            value.terms.len,
+        });
+        try self.writer.writeByte('(');
+        for (value.terms) |term_value| {
+            try self.term(term_value);
+            try self.writer.writeByte(',');
+        }
+        try self.writer.writeByte(')');
+    }
+
+    fn term(self: *Normalizer, value: syntax.Term) anyerror!void {
+        switch (value) {
+            .scalar => |constant| try self.writer.print("c{d}", .{constant}),
+            .variable => |name| {
+                const entry = try self.variables.getOrPut(self.allocator, name);
+                if (!entry.found_existing) entry.value_ptr.* = @intCast(self.variables.count() - 1);
+                try self.writer.print("x{d}", .{entry.value_ptr.*});
+            },
+            .nil => try self.writer.writeAll("[]"),
+            .cons => |pair| {
+                try self.writer.writeByte('[');
+                try self.term(pair.head);
+                try self.writer.writeByte('|');
+                try self.term(pair.tail);
+                try self.writer.writeByte(']');
+            },
+        }
+    }
 };
 
 /// Folds `query` against `catalog`.
@@ -1139,8 +1263,13 @@ const Examination = struct {
     exact: std.ArrayList(relation_store.PredicateKey) = .empty,
     /// Whether some read stood only because the query is monotonic.
     monotonic_admitted: bool = false,
+    /// Views chosen over rivals that would have reconstructed the same
+    /// relation. Recorded so a plan can say that a choice was made and which
+    /// way it went, since nothing else in the rendering would show it.
+    preferred: std.ArrayList(fold_ir.ViewId) = .empty,
 
     fn deinit(self: *Examination) void {
+        self.preferred.deinit(self.allocator);
         self.exact.deinit(self.allocator);
         self.wanted.deinit(self.allocator);
         self.unmet.deinit(self.allocator);
@@ -1183,14 +1312,22 @@ fn examine(
         });
     }
 
+    // The views that could reconstruct one relation, collected before any of
+    // them is chosen: which ones the plan wants is a question about the whole
+    // set, not about each in turn.
+    var usable: std.ArrayList(fold_ir.ViewId) = .empty;
+    defer usable.deinit(allocator);
+    var canonical: std.ArrayList(fold_ir.ViewId) = .empty;
+    defer canonical.deinit(allocator);
+
     for (reads.relations.keys()) |key| {
         if (reads.defined.contains(key)) continue;
         if (catalog.baseAvailable(key)) continue;
         const subject: fold_ir.Predicate = .{ .base = key };
 
-        var reconstructible = false;
+        usable.clearRetainingCapacity();
+        canonical.clearRetainingCapacity();
         var mentioned = false;
-        var exactly = false;
         for (catalog.views.items) |*candidate| {
             if (!viewReads(candidate, key)) continue;
             mentioned = true;
@@ -1213,8 +1350,7 @@ fn examine(
                 });
                 continue;
             }
-            reconstructible = true;
-            try noteView(allocator, wanted, candidate.id);
+            try usable.append(allocator, candidate.id);
             // Lemma 6.4.2: reading the lists of a canonical aggregate view of
             // this relation back out returns the relation itself, so the plan
             // knows it exactly and there is nothing incomplete left to ask
@@ -1222,16 +1358,28 @@ fn examine(
             // canonical *for this relation*, its extension has to be readable,
             // and the plan has to be inverting it — and this branch is where
             // the other two are already settled.
-            if (candidate.isCanonicalFor(key)) exactly = true;
+            if (candidate.isCanonicalFor(key)) try canonical.append(allocator, candidate.id);
         }
 
         if (!mentioned) {
             try note(allocator, unmet, .{ .kind = .relation_unavailable, .subject = subject });
-        } else if (!reconstructible) {
+        } else if (usable.items.len == 0) {
             try note(allocator, unmet, .{ .kind = .relation_not_reconstructible, .subject = subject });
-        } else if (exactly) {
+        } else if (canonical.items.len != 0) {
+            // One canonical view returns the whole relation, so the rest add
+            // nothing to it and the plan is the same plan without them. Which
+            // one to keep is therefore a cost question and not a semantic one,
+            // which is the only shape a cost question is allowed to take here.
+            const chosen = try smallestExtension(catalog, canonical.items);
+            try noteView(allocator, wanted, chosen);
+            if (usable.items.len > 1) try examination.preferred.append(allocator, chosen);
             try examination.exact.append(allocator, key);
         } else {
+            // Nothing here reconstructs the relation whole, so every view that
+            // reconstructs part of it is worth inverting: each proves tuples
+            // the others do not, and leaving one out is what would cost
+            // maximality.
+            for (usable.items) |id| try noteView(allocator, wanted, id);
             try inexact.put(allocator, key, {});
         }
     }
@@ -1331,6 +1479,29 @@ fn goalsRead(goals: []const fold_ir.Goal, key: relation_store.PredicateKey) bool
     return false;
 }
 
+/// The smallest of several views that each reconstruct one relation exactly,
+/// and the lowest identity among those that tie.
+///
+/// The tie-break is not decoration. A plan chosen on cost still has to be the
+/// same plan whenever the same catalog is asked the same question, or a cached
+/// plan and a freshly folded one would be two different programs; and a
+/// catalog told nothing about where its extensions are reports every view as
+/// empty, in which case this is exactly "the first one declared".
+fn smallestExtension(
+    catalog: *const view_catalog.Catalog,
+    candidates: []const fold_ir.ViewId,
+) !fold_ir.ViewId {
+    var chosen = candidates[0];
+    var smallest = try catalog.extent(chosen);
+    for (candidates[1..]) |id| {
+        const size = try catalog.extent(id);
+        if (size >= smallest) continue;
+        chosen = id;
+        smallest = size;
+    }
+    return chosen;
+}
+
 fn noteView(
     allocator: std.mem.Allocator,
     wanted: *std.ArrayList(fold_ir.ViewId),
@@ -1383,6 +1554,10 @@ fn describe(
             .subject = catalog.view(id).predicate(),
         });
     }
+    for (examination.preferred.items) |id| try notes.append(allocator, .{
+        .kind = .equivalent_view_preferred,
+        .subject = catalog.view(id).predicate(),
+    });
     for (reads.relations.keys()) |key| {
         if (reads.defined.contains(key) or catalog.baseAvailable(key)) continue;
         try notes.append(allocator, .{
@@ -2101,4 +2276,69 @@ test "a canonical view of the relation answers the objection to negating it" {
     var withheld = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
     defer withheld.deinit();
     try testing.expectEqual(Guarantee.unsupported, withheld.guarantee());
+}
+
+test "a question keys on what it asks, not on what it spells its variables" {
+    const allocator = testing.allocator;
+    var strings: string_table.StringTable = .init(allocator);
+    defer strings.deinit();
+
+    const edge = try strings.intern("edge");
+    const path = try strings.intern("path");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    const a = try strings.intern("A");
+    const b = try strings.intern("B");
+
+    var xy = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var ab = [_]syntax.Term{ .{ .variable = a }, .{ .variable = b } };
+    var yx = [_]syntax.Term{ .{ .variable = y }, .{ .variable = x } };
+    var asked = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = edge, .terms = &xy } },
+        .{ .relational = .{ .predicate = path, .terms = &xy } },
+    };
+    var renamed = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = edge, .terms = &ab } },
+        .{ .relational = .{ .predicate = path, .terms = &ab } },
+    };
+    var reversed = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = edge, .terms = &xy } },
+        .{ .relational = .{ .predicate = path, .terms = &yx } },
+    };
+    var elsewhere = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = path, .terms = &xy } },
+        .{ .relational = .{ .predicate = path, .terms = &xy } },
+    };
+
+    const key = try normalizeQuery(allocator, &asked, &.{});
+    defer allocator.free(key);
+    // The same question written with other variable names is the same
+    // question, and a cache that could not see that would fold it again every
+    // time — lowering opens a fresh scope, so no two askings share a variable.
+    const same = try normalizeQuery(allocator, &renamed, &.{});
+    defer allocator.free(same);
+    try testing.expectEqualStrings(key, same);
+
+    // Renaming is not rearranging. Reading the second relation the other way
+    // round is a different join, and a key that could not tell the two apart
+    // would answer one question with the other's plan.
+    const swapped = try normalizeQuery(allocator, &reversed, &.{});
+    defer allocator.free(swapped);
+    try testing.expect(!std.mem.eql(u8, key, swapped));
+
+    // So is the relation read.
+    const other = try normalizeQuery(allocator, &elsewhere, &.{});
+    defer allocator.free(other);
+    try testing.expect(!std.mem.eql(u8, key, other));
+
+    // A query's rules are part of the question, so the same goals under a
+    // different program key apart.
+    var edge_only = [_]syntax.Clause{.{ .relational = .{ .predicate = edge, .terms = &xy } }};
+    const rules = [_]syntax.Rule{.{
+        .head = .{ .predicate = path, .terms = &xy },
+        .body = &edge_only,
+    }};
+    const with_rules = try normalizeQuery(allocator, &asked, &rules);
+    defer allocator.free(with_rules);
+    try testing.expect(!std.mem.eql(u8, key, with_rules));
 }

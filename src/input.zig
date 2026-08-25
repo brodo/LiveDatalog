@@ -27,6 +27,19 @@ pub const Binary = struct {
     right: Term,
 };
 
+/// One rule of a query program handed to a fold.
+///
+/// A fold's input is the goals to answer *and* the rules the query defines its
+/// own predicates by, because a folded plan is the query's program together
+/// with the inverse rules of the views it needs. This is that half of the
+/// input, in the same borrowed descriptors everything else here uses. It is
+/// not how a rule is added to the database — `addRule` is — because a query's
+/// rules are part of one question rather than part of the program.
+pub const Rule = struct {
+    head: Relation,
+    body: []const Goal,
+};
+
 pub const Goal = union(enum) {
     relation: Relation,
     negation: Relation,
@@ -68,6 +81,11 @@ pub fn relation(predicate: []const u8, terms: []const Term) Goal {
 /// Describes one ground fact for the batch-update interface.
 pub fn fact(predicate: []const u8, terms: []const Term) Relation {
     return .{ .predicate = predicate, .terms = terms };
+}
+
+/// Describes one rule of a query program for the folding interface.
+pub fn rule(head: Relation, body: []const Goal) Rule {
+    return .{ .head = head, .body = body };
 }
 
 pub fn not(predicate: []const u8, terms: []const Term) Goal {

@@ -29,6 +29,26 @@ const syntax = @import("syntax.zig");
 /// is what lets a fold explain what it was missing.
 pub const Availability = enum { materialized, withheld };
 
+/// Where a view's definition came from.
+///
+/// A definition the caller wrote down says what it says for as long as the
+/// catalog lives. One taken from a rule the database maintains says what that
+/// rule says, and a later rule addition can change what the predicate means —
+/// so the rule generation it was read at is kept, and a fold against a catalog
+/// that has fallen behind is refused rather than answered from a definition
+/// the database no longer holds.
+pub const Source = union(enum) {
+    declared,
+    materialized_rule: u32,
+};
+
+/// Two readable extensions a plan could not tell apart, because they store
+/// under one name and arity.
+pub const Ambiguity = struct {
+    view: fold_ir.ViewId,
+    rival: union(enum) { view: fold_ir.ViewId, base },
+};
+
 /// What one stored column holds. A column is a list when the definition puts a
 /// list there — literally, or as the output of an aggregate — because that is
 /// the column a later phase reconstructs member facts from rather than reads a
@@ -56,6 +76,7 @@ pub const View = struct {
     definition: fold_ir.Rule,
     schema: Schema,
     availability: Availability,
+    source: Source,
 
     /// A relational goal reading this view's stored extension.
     pub fn predicate(self: *const View) fold_ir.Predicate {
@@ -198,9 +219,59 @@ pub const Catalog = struct {
     /// default for folding: a fold exists because the original relations are
     /// not there, and one that helped itself to them would prove nothing.
     available_base: std.array_hash_map.Auto(relation_store.PredicateKey, void) = .empty,
+    /// Counts every change to what a fold is allowed to read: a definition
+    /// added, an availability withdrawn or restored, a base relation declared.
+    ///
+    /// The counter lives here because the thing it counts does. Nothing else
+    /// can change a fold's input except the query itself, so one number is the
+    /// whole of "these definitions under this policy" — which is what a plan
+    /// cache above has to key on and what tells it, in one comparison, that
+    /// every plan it holds was folded against something else.
+    generation: u64 = 0,
+    /// Where the views' stored extensions actually are, borrowed for as long
+    /// as this catalog lives, or null when nobody said.
+    ///
+    /// A fold uses this for one thing: choosing between plans already proved
+    /// to answer the same. Cost never decides *what* a plan may read — that is
+    /// availability, above — so a catalog without a store folds to the same
+    /// answers, only without preferring the smaller of two interchangeable
+    /// views. It is a fact store rather than a `*Database` because sizes are
+    /// all a fold has any business with, which is what keeps the folding
+    /// modules where ADR 0002 put them.
+    extensions: ?*relation_store.RelationStore = null,
 
     pub fn init(allocator: std.mem.Allocator) Catalog {
         return .{ .allocator = allocator, .symbols = .init(allocator) };
+    }
+
+    /// A copy sharing nothing with this one, for a database cloned out from
+    /// under it. Identities survive because both tables hand out the same
+    /// ones; the borrowed extension store does not, because it belonged to the
+    /// original database and the copy's caller has to point this at its own.
+    pub fn clone(self: *const Catalog) !Catalog {
+        var result: Catalog = .{
+            .allocator = self.allocator,
+            .symbols = try self.symbols.clone(),
+            .generation = self.generation,
+        };
+        errdefer result.deinit();
+        try result.views.ensureTotalCapacityPrecise(self.allocator, self.views.items.len);
+        for (self.views.items) |defined| {
+            const definition = try fold_ir.cloneRule(self.allocator, defined.definition);
+            errdefer fold_ir.freeRule(self.allocator, definition);
+            const columns = try self.allocator.dupe(Column, defined.schema.columns);
+            result.views.appendAssumeCapacity(.{
+                .id = defined.id,
+                .name = defined.name,
+                .definition = definition,
+                .schema = .{ .columns = columns },
+                .availability = defined.availability,
+                .source = defined.source,
+            });
+        }
+        try result.available_base.ensureTotalCapacity(self.allocator, self.available_base.count());
+        for (self.available_base.keys()) |key| result.available_base.putAssumeCapacity(key, {});
+        return result;
     }
 
     pub fn deinit(self: *Catalog) void {
@@ -219,6 +290,18 @@ pub const Catalog = struct {
     /// definition can never be confused with the base relation it is spelled
     /// like.
     pub fn define(self: *Catalog, rule: syntax.Rule, availability: Availability) !fold_ir.ViewId {
+        return self.defineFrom(rule, availability, .declared);
+    }
+
+    /// Records a view and where its definition came from. `define` is this
+    /// with `.declared`; a definition read out of a database rule says so, so
+    /// that a later rule addition can be noticed rather than folded against.
+    pub fn defineFrom(
+        self: *Catalog,
+        rule: syntax.Rule,
+        availability: Availability,
+        source: Source,
+    ) !fold_ir.ViewId {
         const id: fold_ir.ViewId = @enumFromInt(self.views.items.len);
         const scope = try self.symbols.openScope(.view_definition);
         var definition = try fold_ir.lowerRule(self.allocator, &self.symbols, scope, rule);
@@ -241,7 +324,9 @@ pub const Catalog = struct {
             .definition = definition,
             .schema = .{ .columns = columns },
             .availability = availability,
+            .source = source,
         });
+        self.generation += 1;
         return id;
     }
 
@@ -249,11 +334,76 @@ pub const Catalog = struct {
         return &self.views.items[@intFromEnum(id)];
     }
 
+    /// Withdraws or restores a view's extension. The definition is untouched:
+    /// a withheld view still says what it would have contained, which is what
+    /// lets a fold report what it was missing.
+    pub fn setAvailability(self: *Catalog, id: fold_ir.ViewId, availability: Availability) void {
+        const defined = &self.views.items[@intFromEnum(id)];
+        if (defined.availability == availability) return;
+        defined.availability = availability;
+        self.generation += 1;
+    }
+
+    /// The first view whose definition was read out of a database rule that
+    /// has since been added to, or null when every published definition is
+    /// still the one the database holds.
+    ///
+    /// A rule addition can change what a predicate means, and a catalog cannot
+    /// see it happen — so this is asked at the point a fold would otherwise
+    /// reason from a definition the database has moved on from.
+    pub fn staleAt(self: *const Catalog, rule_generation: u32) ?fold_ir.ViewId {
+        for (self.views.items) |defined| switch (defined.source) {
+            .declared => {},
+            .materialized_rule => |generation| if (generation != rule_generation) return defined.id,
+        };
+        return null;
+    }
+
+    /// Two readable extensions storing under one name and arity, or null.
+    ///
+    /// A lowered plan names what it reads by the name the extension is stored
+    /// under, so a selection holding two of them under one name cannot be
+    /// executed whatever is asked of it. That makes it a property of the
+    /// selection rather than of a fold, which is why it is answered here and
+    /// before anything is folded.
+    pub fn ambiguity(self: *const Catalog) ?Ambiguity {
+        for (self.views.items, 0..) |defined, index| {
+            if (!defined.readable()) continue;
+            const key: relation_store.PredicateKey = .{
+                .name = defined.name,
+                .arity = defined.schema.arity(),
+            };
+            if (self.available_base.contains(key))
+                return .{ .view = defined.id, .rival = .base };
+            for (self.views.items[index + 1 ..]) |rival| {
+                if (!rival.readable()) continue;
+                if (rival.name != defined.name) continue;
+                if (rival.schema.arity() != key.arity) continue;
+                return .{ .view = defined.id, .rival = .{ .view = rival.id } };
+            }
+        }
+        return null;
+    }
+
+    /// How many facts the store holds under this name and arity, or zero when
+    /// no store was supplied. Only ever compared against another such number.
+    pub fn cardinality(self: *const Catalog, key: relation_store.PredicateKey) !usize {
+        const store = self.extensions orelse return 0;
+        return (try store.predicateEntries(key)).len;
+    }
+
+    /// How many facts a view's stored extension holds.
+    pub fn extent(self: *const Catalog, id: fold_ir.ViewId) !usize {
+        const defined = self.view(id);
+        return self.cardinality(.{ .name = defined.name, .arity = defined.schema.arity() });
+    }
+
     /// Declares that a plan may read this base relation directly. A caller
     /// that has the original data and only wants folding where it helps says
     /// so here; F6's hybrid plans are this permission taken further.
     pub fn declareBaseAvailable(self: *Catalog, key: relation_store.PredicateKey) !void {
-        try self.available_base.put(self.allocator, key, {});
+        const entry = try self.available_base.getOrPut(self.allocator, key);
+        if (!entry.found_existing) self.generation += 1;
     }
 
     pub fn baseAvailable(self: *const Catalog, key: relation_store.PredicateKey) bool {
@@ -554,4 +704,142 @@ test "a view that collects less than the whole relation is not canonical for it"
         .body = &outer_goal,
     }, .materialized);
     try testing.expect(!catalog.view(copied).isCanonicalFor(key));
+}
+
+test "a catalog counts every change to what a fold may read" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const path = try strings.intern("path");
+    const edge = try strings.intern("edge");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    var head_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var body_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var body = [_]syntax.Clause{.{ .relational = .{ .predicate = edge, .terms = &body_terms } }};
+
+    try testing.expectEqual(@as(u64, 0), catalog.generation);
+    const id = try catalog.define(.{
+        .head = .{ .predicate = path, .terms = &head_terms },
+        .body = &body,
+    }, .materialized);
+    try testing.expectEqual(@as(u64, 1), catalog.generation);
+
+    // Withdrawing an extension changes every plan folded under the policy, so
+    // it counts; setting it to what it already was changes none, so it does
+    // not, and a cache above is not asked to discard anything.
+    catalog.setAvailability(id, .materialized);
+    try testing.expectEqual(@as(u64, 1), catalog.generation);
+    catalog.setAvailability(id, .withheld);
+    try testing.expectEqual(@as(u64, 2), catalog.generation);
+    try testing.expect(!catalog.view(id).readable());
+    // The definition survives the withdrawal, which is what lets a fold report
+    // the view it was missing rather than the relation.
+    try testing.expect(catalog.definedByView(.{ .name = edge, .arity = 2 }));
+
+    try catalog.declareBaseAvailable(.{ .name = edge, .arity = 2 });
+    try testing.expectEqual(@as(u64, 3), catalog.generation);
+    try catalog.declareBaseAvailable(.{ .name = edge, .arity = 2 });
+    try testing.expectEqual(@as(u64, 3), catalog.generation);
+}
+
+test "two readable extensions under one name are found before anything is folded" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const v = try strings.intern("v");
+    const edge = try strings.intern("edge");
+    const other = try strings.intern("other");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    var terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var from_edge = [_]syntax.Clause{.{ .relational = .{ .predicate = edge, .terms = &terms } }};
+    var from_other = [_]syntax.Clause{.{ .relational = .{ .predicate = other, .terms = &terms } }};
+
+    const first = try catalog.define(.{
+        .head = .{ .predicate = v, .terms = &terms },
+        .body = &from_edge,
+    }, .materialized);
+    try testing.expect(catalog.ambiguity() == null);
+    const second = try catalog.define(.{
+        .head = .{ .predicate = v, .terms = &terms },
+        .body = &from_other,
+    }, .materialized);
+
+    // Two stored extensions under `v/2`: a plan naming one of them names both.
+    const clash = catalog.ambiguity().?;
+    try testing.expectEqual(first, clash.view);
+    try testing.expectEqual(second, clash.rival.view);
+
+    // Withholding one leaves one readable extension of that name, and the
+    // question a plan could not have answered no longer arises.
+    catalog.setAvailability(second, .withheld);
+    try testing.expect(catalog.ambiguity() == null);
+
+    // A declared base relation of the same name and arity is the same clash
+    // from the other side.
+    try catalog.declareBaseAvailable(.{ .name = v, .arity = 2 });
+    try testing.expectEqual(Ambiguity{ .view = first, .rival = .base }, catalog.ambiguity().?);
+}
+
+test "a published definition is only as current as the rule it was read from" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const two = try strings.intern("two");
+    const edge = try strings.intern("edge");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    var terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var body = [_]syntax.Clause{.{ .relational = .{ .predicate = edge, .terms = &terms } }};
+    const rule: syntax.Rule = .{
+        .head = .{ .predicate = two, .terms = &terms },
+        .body = &body,
+    };
+
+    const declared = try catalog.define(rule, .materialized);
+    // A definition the caller wrote down says what it says forever, whatever
+    // the database's rules do afterwards.
+    try testing.expect(catalog.staleAt(7) == null);
+
+    const published = try catalog.defineFrom(rule, .materialized, .{ .materialized_rule = 3 });
+    try testing.expect(catalog.staleAt(3) == null);
+    try testing.expectEqual(published, catalog.staleAt(4).?);
+    try testing.expect(catalog.view(declared).source == .declared);
+}
+
+test "a cloned catalog resolves the identities the original handed out" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const path = try strings.intern("path");
+    const edge = try strings.intern("edge");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    var terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var body = [_]syntax.Clause{.{ .relational = .{ .predicate = edge, .terms = &terms } }};
+    const id = try catalog.define(.{
+        .head = .{ .predicate = path, .terms = &terms },
+        .body = &body,
+    }, .materialized);
+    try catalog.declareBaseAvailable(.{ .name = edge, .arity = 2 });
+
+    var copy = try catalog.clone();
+    defer copy.deinit();
+    try testing.expectEqual(catalog.generation, copy.generation);
+    try testing.expect(copy.view(id).predicate().equals(catalog.view(id).predicate()));
+    try testing.expect(copy.baseAvailable(.{ .name = edge, .arity = 2 }));
+    try testing.expect(copy.definedByView(.{ .name = edge, .arity = 2 }));
+    // The two share nothing: a change to one is invisible in the other.
+    copy.setAvailability(id, .withheld);
+    try testing.expect(catalog.view(id).readable());
+    try testing.expect(!copy.view(id).readable());
 }

@@ -209,6 +209,21 @@ pub fn build(b: *std.Build) void {
     );
     planning_benchmark_step.dependOn(&b.addRunArtifact(planning_benchmark_exe).step);
 
+    const folding_benchmark_exe = b.addExecutable(.{
+        .name = "folding-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/folding.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const folding_benchmark_step = b.step(
+        "benchmark-folding",
+        "Report folded planning and execution against direct execution of the same query",
+    );
+    folding_benchmark_step.dependOn(&b.addRunArtifact(folding_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

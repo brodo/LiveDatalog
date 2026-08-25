@@ -1908,6 +1908,174 @@ F5 was completed on 2026-08-25:
 - Benchmarks report planning time separately from execution time and compare
   folded execution with direct execution where equivalence is guaranteed.
 
+### Completed decisions
+
+F6 was completed on 2026-08-25:
+
+- **The catalog is owned by the `Jatalog`, and that decision settled every
+  other one in the phase.** F1 recorded that a catalog's predicate names and
+  constants are the *database's* identifiers, so a catalog outliving its
+  database resolves nothing and none of it is serializable. A thing that can
+  only be correct when paired with one particular database should not be
+  something a caller can hold separately and pair wrongly; owning it makes the
+  pairing the only one there is. It is also the only arrangement in which an
+  embedder can declare a view at all, because `Catalog.define` takes a compiled
+  `syntax.Rule` and compiling the borrowed `input` descriptors needs the
+  database that will hold the interned names. So `defineView` compiles on a
+  staged copy, defines into the catalog, and commits — the ids the catalog now
+  holds are the committed database's, and a failure part-way leaves neither
+  changed. `Jatalog.clone` carries the catalog, which needed
+  `Symbols.clone` and `Catalog.clone`; it does not carry the plan cache,
+  because a cache is not state.
+- **The public surface hands back a result to inspect, never answers.**
+  `foldQuery` returns a `Fold` — a guarantee and a handle — and `answerFolded`
+  is a separate call. An API returning answers would erase exactly the
+  distinction F1 built `Outcome` to protect, and Chapter 6 exists because the
+  unrestricted case produces plans whose answers are not the query's. The two
+  open design questions are closed together by this shape: **callers get
+  both** forms, the rendering through `explainFold` and the executable form
+  only ever indirectly, by asking the database to run it. Handing out
+  `folding.Executable` itself was rejected — its `syntax.Rule`s are only
+  meaningful against the database they were interned in, and a caller holding
+  one could install it into a database where the plan's assumptions do not
+  hold. Lowering happens eagerly at fold time, so a plan that cannot be
+  lowered is still readable and reports `PlanNotExecutable` when run.
+- **`answerFolded` enforces the availability boundary rather than trusting
+  it**, and this is the decision most likely to look like belt-and-braces and
+  is not. Every F-phase test so far constructed a database that happened to
+  hold only view extensions. Through a public API that is not a property
+  anybody can be relied on to arrange — the natural embedding has the views
+  *beside* the data they were computed from, which is exactly the case
+  `publishView` serves. So the plan runs against a copy holding what the
+  catalog admits and nothing else: the other facts removed, the derived closure
+  dropped, and **the database's own rules dropped too**, since a rule deriving
+  a withheld relation would put it straight back. Extensions are taken from the
+  closure rather than the base facts, because a maintained view's tuples live
+  there. Both halves are load-bearing and the tests fail when either is
+  removed — five answers instead of two without the fact filter, four instead
+  of two without dropping the rules.
+- **A finding from breaking that guard, recorded because it corrected a test
+  comment that would have been wrong.** The first attempt to prove the boundary
+  put a stray `edge` fact beside the even-length-path views and asserted it did
+  not reach the answers. It never could have: `edge` there is reconstructed
+  only with Skolem terms, so elimination gives the plan `edge$0` and `edge$1`
+  and no rule reads the unsplit relation at all. The probe only bites where the
+  plan names the relation under its own name, which is the *canonical* view
+  case — `r(X1, Y2) :- narrow(X1, S), $member(Y2, S)` — so the probes live in
+  the hybrid test, where a leftover fact and a rule manufacturing more of them
+  are each blocked by a different half of the copy.
+- **`predicate_name_ambiguous` becomes an argument error at selection time, and
+  the precondition stays.** F2 checked it over the views a plan touches and
+  refused after folding. Two readable extensions under one name and arity make
+  a *selection* unusable, whatever is later asked of it — a lowered plan names
+  what it reads by the name the extension is stored under, and no query makes
+  that better — so the public path reports `AmbiguousViewName` before anything
+  is folded, including for a query that would never have touched either view.
+  The narrower per-fold precondition is kept because `folding.zig` does not get
+  to assume its caller validated anything, and it stays tested there; the
+  public path can no longer reach it.
+- **"Equivalent plans" had to be defined before anything could be costed, and
+  the honest answer is that folding has exactly one cost decision.** Reading a
+  relation directly versus reconstructing it is not a cost choice: reading is
+  exact and reconstructing is at best exact, so the guarantee settles it. Using
+  some views rather than all of them is not one either: where nothing is exact,
+  maximality requires inverting every view that mentions the relation. What
+  *is* a cost choice is which of several **canonical** aggregate views of one
+  relation to read. Lemma 6.4.2 makes each of them return the relation itself,
+  so they are interchangeable by proof rather than by heuristic, and the others
+  are then dropped — a view kept for no other relation contributes nothing to a
+  relation already known whole. The plan reads the smallest stored extension,
+  ties going to the lowest view id. `equivalent_view_preferred` records that a
+  choice was made and which way, since nothing else in the rendering would show
+  it.
+- **Index availability is deliberately not costed, and the completion gate is
+  what decides it.** The scope asks for cardinalities *and* index availability;
+  P1 builds a pattern index on the second request for a pattern, so index
+  availability is a function of query history. A plan costed on it would differ
+  depending on when it was folded, which contradicts the gate's "deterministic
+  plan choice" directly. Determinism wins. Cardinalities are used and are also
+  not in the cache key, which is the same argument from the other side: cost
+  only ever chooses between plans already proved to answer the same, so a stale
+  choice is a slower plan and never a different answer — the licence
+  `planner.zig` already runs on.
+- **The four cache keys are two counters, and saying why is the point.** The
+  scope asks for a cache keyed by normalized query, view definitions,
+  availability policy, and rule/catalog generation. Definitions and
+  availability are exactly what a catalog generation counts, so one counter
+  covers both; `Catalog.generation` bumps on a definition, an availability
+  change that changes something, and a base declaration. The rule generation
+  already existed and was not recognized as one: `Evaluator.next_rule_id` is a
+  monotone counter of rules added, cloned and committed with the database, and
+  no new field was needed. It is in the key because `publishView` makes a
+  catalog definition *be* a rule. Because both stamps are global, there is no
+  such thing as invalidating one entry — either every plan was folded against
+  what the database now holds or none was — so the cache is discarded whole,
+  and a `Fold` carries the stamp it was made under so a handle that outlived a
+  change reports `StalePlan` instead of naming its successor. The normalized
+  query is taken of the *compiled* form rather than the IR, so that a cache hit
+  costs no scopes: lowering opens one every time, and keying on the IR would
+  mean growing the catalog's symbol table before the cache could say it had
+  seen the question.
+- **Folding did not cross the DAG line, and ADR 0002 gained the rule that kept
+  it from having to.** Cardinalities live in the database and none of the six
+  folding modules may take one. What `view_catalog.Catalog` borrows instead is
+  a `*relation_store.RelationStore` — a type it already imported — pointed at
+  the staged store for the length of a fold and cleared afterwards, so the
+  catalog never holds a store that has gone. The general rule is now in the
+  ADR: a layer that needs a number from below takes that number, not the state
+  it lives in. Taking a `*Database` to read a length would have handed folding
+  the rules, the closure and the maintenance machinery, and some later phase
+  would have used one of them.
+- **`maximally_contained` is not enough on its own, and the material F4 and F5
+  recorded is what fixes it.** `foldReconstructions` reports every relation the
+  plan derives instead of reads and whether it derives all of it, built from
+  the `relation_reconstructed` and `relation_reconstructed_exactly`
+  transformations those phases already produced. The guarantee says the plan
+  answers no more than the query and no less than any other plan over these
+  views; only the per-relation account says *where* an answer could have gone,
+  and a plan whose reconstructions are all exact loses nothing. So the answer
+  to the open question is yes, it belongs in the public surface, and it was
+  already being computed.
+- **Publishing a maintained predicate is one rule or none.** A catalog holds
+  one rule per view, so a predicate several rules define has no definition to
+  invert and `publishView` refuses it with `UndefinedView` rather than picking
+  one. The definition is the rule's, which is the whole reason the rule
+  generation is recorded and `StaleViewDefinition` exists — a definition that
+  was true of the database when it was read is not a definition that stays
+  true.
+- **The benchmark says folded execution is five to fifty times slower than
+  direct execution, and the reason is where the plan is kept.** A direct query
+  reuses the materialized closure; a folded plan's rules are in the plan and
+  not in the database, so `answerFolded` rebuilds a restricted copy and derives
+  from nothing every call. That is a property of this implementation rather
+  than of the method, and it is the obvious thing to fix if folded execution
+  ever needs to be fast. Planning is reported apart and is cheap — 28–56µs to
+  fold, 4–19µs to find the plan again. The workloads use canonical views so
+  that both sides provably answer the same, and assert exactness rather than
+  assuming it, because a view remembering less would make the folded side
+  quicker by returning less. No list functions appear, so F5's seeding wrinkle
+  does not apply to any of these numbers and none of them is a difference in
+  what each side can answer. One measurement worth carrying forward: reading a
+  40-element list back through `$member` costs sixteen times what the same 1000
+  pairs cost in five-element lists, because membership is seeded structurally
+  and a list contributes work in its tails — so the selection cost model counts
+  stored tuples, and a tuple holding a long list is not the same unit of work
+  as one holding a pair.
+- Every guarantee introduced here was checked by breaking it and watching a
+  test fail: keeping the withheld facts answers five where two are right;
+  keeping the database's rules answers four; reading the first canonical view
+  rather than the smallest fails the cost test; inverting every view of an
+  exactly reconstructed relation fails both selection tests; never noticing two
+  extensions of one name fails the ambiguity test and crashes its unit test;
+  never noticing a stale published definition fails the publish test; and a
+  cache that is not discarded answers a withheld-view question with the plan
+  from before it was withheld.
+- The suite goes from 197 tests to 212 in about twelve seconds. No existing
+  test changed, and the exhaustive and bounded sweeps of F2, F4 and F5 are
+  untouched: this phase adds no sweep of its own, because what it adds is an
+  interface over machinery those sweeps already cover, and the containment
+  claims are theirs.
+
 ## Suggested session sequence
 
 Use one session and one commit per phase unless a phase proves too large:
@@ -1930,7 +2098,7 @@ Use one session and one commit per phase unless a phase proves too large:
 16. F3 conjunctive aggregate inversion — **done 2026-08-11**
 17. F4 soundness restrictions — **done 2026-08-25**
 18. F5 list functions and dependency chase — **done 2026-08-25**
-19. F6 execution and view selection — **next**
+19. F6 execution and view selection — **done 2026-08-25**
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
@@ -1975,8 +2143,16 @@ Each phase ends with:
   deliberately spelled so that it is not valid user input, because while no
   executable form exists the rendering is the only way to read a plan at all.
   **F2 answered the other half**: an executable form exists, produced by
-  `lowerPlan` and only for a plan proved free of Skolem terms. It is not public
-  — folding has no public surface yet — so whether callers are handed it, and
-  alongside what, is still F6's question.
-- Is `maximally_contained` useful to embedders without an accompanying
-  explanation of which source relations could not be reconstructed?
+  `lowerPlan` and only for a plan proved free of Skolem terms. **F6 closed
+  it: both, and neither is handed over.** A caller gets the rendering through
+  `explainFold` and reaches the executable form only by asking the database to
+  run the plan, because a lowered plan's rules are interned against one
+  database and a caller holding them could install them somewhere the plan's
+  assumptions do not hold.
+- ~~Is `maximally_contained` useful to embedders without an accompanying
+  explanation of which source relations could not be reconstructed?~~
+  **Answered by F6: no, and the explanation was already being computed.**
+  `foldReconstructions` reports every relation the plan derives instead of
+  reads and whether it derives all of it, from the transformations F4 and F5
+  record. The guarantee bounds the answers; only the per-relation account says
+  where one could have gone.

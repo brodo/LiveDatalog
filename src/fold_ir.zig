@@ -89,6 +89,23 @@ pub const Symbols = struct {
         self.* = undefined;
     }
 
+    /// A copy handing out the same identities as this one, for a catalog
+    /// cloned alongside the database it resolves against. Identities are
+    /// positions in these lists, so copying the lists is what preserves them:
+    /// a fragment lowered against the original means the same thing read
+    /// against the copy.
+    pub fn clone(self: *const Symbols) !Symbols {
+        var result: Symbols = .init(self.allocator);
+        errdefer result.deinit();
+        try result.scopes.appendSlice(self.allocator, self.scopes.items);
+        try result.variables.appendSlice(self.allocator, self.variables.items);
+        try result.functions.appendSlice(self.allocator, self.functions.items);
+        try result.interned.ensureTotalCapacity(self.allocator, self.interned.count());
+        for (self.interned.keys(), self.interned.values()) |key, variable|
+            result.interned.putAssumeCapacity(key, variable);
+        return result;
+    }
+
     pub fn openScope(self: *Symbols, purpose: Purpose) !Scope {
         try self.scopes.append(self.allocator, .{ .purpose = purpose });
         return @enumFromInt(self.scopes.items.len - 1);
