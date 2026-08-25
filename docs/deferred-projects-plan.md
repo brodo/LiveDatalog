@@ -1575,6 +1575,125 @@ F3 was completed on 2026-08-11:
 - Bounded exhaustive model tests search for counterexamples to every claimed
   containment guarantee.
 
+### Completed decisions
+
+F4 was completed on 2026-08-25:
+
+- The `σs` identities are **not** implemented as rewrites, and the reason is
+  that F2's Skolem elimination already does the work of the one that had
+  anything to do. `σs2` says that collecting the members of a set gives the set
+  back. Elimination splits a relation by which function each column carries and
+  spreads that column across the function's arguments, so `$member(Y, f(X̄))`
+  becomes a relation meaning "Y is in the set `f(X̄)`" — the Skolem set reified,
+  with no separate list value left over for the identity to relate it to. It
+  holds by construction. `σs1` drops a conjunct from inside a `setof` when the
+  goals around it already established it, and it fires only on an *expansion* —
+  a plan unfolded by substituting rule bodies into goals, which Chapter 6 builds
+  to reason about containment and this engine never builds, because a plan here
+  is a program rather than a formula. F3 deferred both for want of input; the
+  honest finding is that one has permanent want of input and the other has been
+  discharged by machinery that already existed. No rewrite system was written.
+- Case 2 inversion is therefore a small change with a clearly bounded payoff,
+  and stating the payoff exactly is the point. `v(X̄) :- Φ(X̄, Z̄), setof(Ȳ, Ψ, S)`
+  with `S` projected away is now inverted: the collected list becomes a Skolem
+  term applied to the head's values, the same term wherever the definition
+  mentioned that set, so `p(X, f(X)) :- v(X)` and `member(Y, f(X))` agree about
+  which set it was. What comes back is the `Φ` half, exactly as any projection
+  comes back. The `Ψ` half comes back as nothing at all: after elimination the
+  membership goal reads a split relation no rule derives, because nothing ever
+  stored what was inside the set. That is the truthful reading of Section 6.3.2
+  under bottom-up evaluation, and it is worth having — before this phase such a
+  view was refused outright and took down every relation only it mentioned.
+  `Obstacle.aggregate_output_projected` and its precondition are gone.
+- Nothing is dropped by that reconstruction, which is worth recording because
+  it looks as though something should be. The `$member` goal carrying a Skolem
+  set never matches a split, so the rule is never instantiated; an instance that
+  is never enumerated is not an instance that was refused, and the guarantee
+  stays `maximally_contained` rather than falling to `contained`. That is the
+  right answer: no plan over that view could have had those answers.
+- The refusal F2 recorded stays the default and the two discharges are
+  obligations that get checked, not a precondition that got deleted. A relation
+  is exact only when a view that is canonical **for that relation** is readable
+  and is one of the views the plan actually inverts — all three conditions
+  settled in the same branch, so none of them can drift apart from the others.
+  Breaking the recognizer into "some view mentions it" makes five tests fail,
+  including the two acceptance tests and F2's own negation test.
+- Canonical recognition is `view_catalog.View.isCanonicalFor`, and it lives
+  there rather than in `inversion` because it is a question about what a view
+  *stores*, which is the catalog's subject — the same reason the catalog
+  already owns the schema. Definition 6.4.3 is read structurally: the relation
+  copied, or the relation grouped by `k < n` of its columns with a variable of
+  the aggregate's own in each of the others, collected in column order —
+  bare when there is one and consed when there are several, which is how
+  Example 6.4.2 writes the pair case. Narrower reads are refused: a repeated
+  column, a constant, an outer goal over a different relation, a head whose
+  kept columns are not the ones the aggregate held fixed.
+- Monotonicity is its own module, `monotonicity.zig`, sitting beside the other
+  four at `planner.zig`'s level and importing only `fold_ir`. It is a property
+  of a query rather than of a fold, it allocates nothing, and it is the piece
+  most likely to be wrong in a way that is invisible from `folding.zig`, so it
+  is worth being able to test on its own. The class it admits is Definition
+  6.4.1 with Lemma 6.4.1 folded in: a collected output is monotone when it is a
+  variable nothing else in the rule reads, or `H!T` with both halves likewise
+  unread. Everything else pins the set down, and the second condition of
+  Definition 6.4.1 — a goal reading the set must be `⊆`-monotone — is a
+  property of a stored relation nothing here can check, so requiring the set to
+  go unread is the conservative reading of it.
+- A query's *goal list* has no head, and that is not the same as a rule whose
+  head keeps nothing. Its variables are the bindings handed back, so a set
+  collected there is reported, and an aggregate at the top level is never
+  monotonic. Modelling it as "a rule that reports everything" is what stops the
+  top-level case from being read as the freest one.
+- **F4 proves the aggregate half and only the aggregate half by monotonicity,
+  and this is a decision rather than an omission.** Chapter 6 assumes negation
+  has been rewritten into `setof` by Lemma 4.1.1; that rewriting produces an
+  empty collected output, which is exactly the shape the monotonic class
+  rejects. So a negated read of an inexact relation can never be discharged by
+  monotonicity — not because this engine keeps the two separate, but because
+  they agree. The checker states it directly by refusing a negated goal, and
+  negation is discharged only by a canonical view, which is Theorem 6.4.2's
+  reading of it. The engine still does not rewrite negation into aggregation
+  and does not need to.
+- Nested aggregates are checked even when the enclosing output is free. An
+  output nothing reads makes that aggregate's own result irrelevant, but not
+  what its body binds for the goals around it: an inner `setof` asking for an
+  empty set decides which values the outer one collects at all, so shrinking a
+  relation can *add* answers through it. The test that holds this down fails if
+  the recursion into the body is made conditional on the output.
+- Both discharges are recorded in the plan's transformations —
+  `relation_reconstructed_exactly` naming the relation, and
+  `monotonic_reads_admitted` once, and only when a read actually needed it — so
+  a plan says which proof let it exist rather than merely that it does.
+- Every containment claim was checked by breaking the fix and watching the test
+  fail. Admitting `[]` as a monotone output fails four tests including the
+  counterexample; treating "a view mentions the relation" as canonical fails
+  five; dropping one of the three membership rules fails the bounded sweep.
+- The counterexample test does more than assert a refusal, because Example
+  6.4.1 is refused by F2's blanket rule and would pass this phase untouched.
+  The inverse rules a plan is built from do not depend on which query is folded,
+  so the test folds the *monotonic* query, installs that plan, and then asks it
+  Example 6.4.1's question directly — the plan answers `q(a)`, which the query
+  does not. The refusal is shown to be load-bearing rather than asserted to be.
+- The bounded sweep is 64 databases for the monotonic discharge and 16 for the
+  canonical one: two keys and two values, exhaustively. The bound is chosen for
+  what it contains — a key whose collected set is empty and one whose is not, a
+  key the outer goal admits and one it withholds, a value reachable only
+  through a withheld key — and everything outside it is one of those with more
+  names. Three of each would be sixty-four times the work, and the existing
+  three-node graph sweep already costs more than half the suite's running time.
+  The canonical half is held to *equality* rather than containment, because
+  Lemma 6.4.2 claims equivalence and a containment check would pass a plan that
+  had simply gone quiet.
+- The README's "Query folding" section was removed at `dc20056` before this
+  phase started, and it has not been restored. Folding still has no public
+  entry point, so there is no public API or ownership documentation for F4 to
+  update; the refusals and the two discharges are recorded in `CONTEXT.md`,
+  which is where the folding vocabulary lives. F6 is when an embedder can
+  declare a view, and that is when the README has a feature to describe.
+- Not performance relevant to the engine: nothing in this phase runs during
+  evaluation and no benchmark changed. The suite goes from 168 tests to 180 in
+  the same eleven seconds.
+
 ## F5: list functions and functional-dependency chase
 
 ### Scope
@@ -1642,8 +1761,8 @@ Use one session and one commit per phase unless a phase proves too large:
 14. F1 folding IR and view catalog — **done 2026-08-11**
 15. F2 ordinary Inverse Method — **done 2026-08-11**
 16. F3 conjunctive aggregate inversion — **done 2026-08-11**
-17. F4 soundness restrictions — **next**
-18. F5 list functions and dependency chase
+17. F4 soundness restrictions — **done 2026-08-25**
+18. F5 list functions and dependency chase — **next**
 19. F6 execution and view selection
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its

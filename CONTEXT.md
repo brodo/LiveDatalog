@@ -155,6 +155,13 @@ inside the availability boundary is its own plan and the fold is `equivalent`;
 one that needed a reconstruction is `maximally_contained`, or `contained` when
 eliminating Skolem terms had to drop rule instances.
 
+Chapter 6's unsound case is a query that reads a reconstruction under negation
+or inside an aggregate, and it is refused by default. Two proofs discharge that
+refusal and nothing else does: a *canonical aggregate view* of the relation,
+which makes the reconstruction equivalent rather than contained, or a
+*monotonic query*, whose answers can only shrink when its relations do. Both
+are below, and both are checked rather than assumed.
+
 ### Folding IR
 
 The terms, goals and rules a fold reasons about (`fold_ir.zig`), deliberately
@@ -212,19 +219,29 @@ value rather than one per stored tuple, so its Skolem term is applied to the
 collected value too. A value the definition binds outside its aggregates keeps
 the per-tuple naming, which is what preserves the join between the two halves.
 
+A head that projects its collected list away leaves a set with no stored value,
+and the plan names it with a Skolem term applied to the head's values — the
+same term wherever the definition mentioned that set. The goals *outside* the
+aggregate are then reconstructed as any projection is, while the membership
+goal that reads the set stands and reaches nothing, because nothing ever stored
+what was inside it. Such a view remembers that its outer goals held, which is
+worth having and is less than a view that kept the list.
+
 Only non-recursive conjunctions of positive base relations and such aggregates
-are inverted. A list outside an aggregate is F5's, a collected list the head
-does not keep is F4's, and a definition reading what it defines is recursion
-inversion cannot bound; each is reported as the precondition it is.
-Because a catalog holds one rule per view, self-reference is the only recursion
-a definition can express — mutual recursion between views is not representable
-rather than undetected. A relation read under negation or inside an aggregate
-is refused outright rather than reconstructed: a reconstruction holds what the
-views prove existed, which can be less than the relation held, and asking what
-is *not* in it would answer more than the query does. The refusal is
-transitive, because a rule is no more exact than what its body reads: a
+are inverted. A list outside an aggregate is F5's, and a definition reading
+what it defines is recursion inversion cannot bound; each is reported as the
+precondition it is. Because a catalog holds one rule per view, self-reference
+is the only recursion a definition can express — mutual recursion between views
+is not representable rather than undetected.
+
+A relation read under negation or inside an aggregate is refused unless one of
+two things is proved of it, because a reconstruction holds what the views prove
+existed, which can be less than the relation held: asking what is *not* in it,
+or counting what is, would answer more than the query does. The refusal is
+transitive, because a rule is no more exact than what its body reads — a
 predicate the query derives from a reconstruction is refused under negation
-just as the reconstruction is.
+just as the reconstruction is — and what lifts it is a canonical aggregate view
+or a monotonic query, both below.
 
 ### Skolem elimination
 
@@ -243,3 +260,49 @@ in an inverse rule's head, out of values read from a stored extension. A goal
 that is not a positive relation must see ordinary values, and an instance where
 it would not is dropped — which loses answers, keeps containment, and lowers
 the guarantee from maximally contained to contained.
+
+Splitting is also what a Skolem *set* becomes. `$member(Y, f(X))` splits into a
+two-column relation meaning "Y is in the set f(X)", which is the set reified —
+so Chapter 6's `σs2`, the identity saying that collecting the members of a set
+gives the set back, holds by construction rather than by rewriting. Nothing
+derives that relation, because nothing stored what was in the set, so the goal
+is a name the plan can join on and never read.
+
+### Monotonic query
+
+A query whose answers can only grow as the relations it reads grow
+(`monotonicity.zig`): Section 6.4.1's restricted class. It matters because a
+reconstruction is a *subset*, so a plan runs the query over less than it asked
+about. A monotonic query then returns a subset of its answers, which is
+containment. One that is not can return an answer the query does not have,
+which is Example 6.4.1: `q(a) :- setof(Y, r(a, Y), [])` asks for a collected
+set to be empty, and a plan that cannot see what is in the set answers yes.
+
+The check is conservative and admits two collected outputs. A variable nothing
+else in the rule reads asks for *whatever set there is*, and every set is one.
+`H!T` with both halves likewise unread asks for *some non-empty set*, which is
+Section 6.4.1's own contrast, and a set that grows stays non-empty. Anything
+else pins the set down — a written-out list to its elements, a variable the
+rule reports or reads again to one particular set. A negated goal is refused
+first of all: Chapter 6 assumes negation has been rewritten into a `setof` with
+an empty output, which is precisely the shape this rejects, so the monotonic
+class never discharges a negated read.
+
+### Canonical aggregate view
+
+A view that remembers a whole relation (`view_catalog.zig`), in the sense of
+Definition 6.4.3: either the relation copied, `v(X̄) :- r(X̄)`, or the relation
+grouped by some of its columns with every other column collected —
+`v(Xi1, …, Xik, S) :- r(X1, …, Xn), setof(Ȳ, r(Z̄), S)`, of which there are
+`2^n` for an n-ary relation. Inverting one returns the relation itself rather
+than a subset of it (Lemma 6.4.2), so a relation such a view reconstructs is
+*exact*: it never enters the set of relations the plan knows incompletely, and
+there is nothing left for negation or an aggregate to ask about.
+
+The condition is the whole condition. A view that merely mentions the relation
+is not one that remembers it; a canonical view of a *different* relation says
+nothing about this one; and a canonical view whose extension the policy
+withholds discharges nothing, because the plan cannot read it. A fold records
+which of the two proofs applied — the relation was reconstructed exactly, or
+the query was monotonic — among the transformations it lists, so a plan says
+why it was allowed to exist.

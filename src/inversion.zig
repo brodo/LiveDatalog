@@ -13,14 +13,23 @@
 //! `X` and `Z` is the same `f(X, Z)` in both halves.
 //!
 //! A definition may also *collect* — `setof` gathers every value satisfying
-//! its body into one list, and the head keeps that list. Inverting such a
-//! definition is the same idea read the other way: the list is the evidence,
-//! so each value in it is a fact the aggregate's body must have had, and the
-//! inverse rules reach it with `$member`. That relation is not a builtin and
-//! does not need to be — a list the database holds already holds each of its
-//! own tails, so three rules over the values it has are enough. Aggregates
-//! nest by chaining: collecting `Y!T` pairs means binding one of them binds
-//! `T`, which is the next list to read out of.
+//! its body into one list. Inverting such a definition is the same idea read
+//! the other way: the list is the evidence, so each value in it is a fact the
+//! aggregate's body must have had, and the inverse rules reach it with
+//! `$member`. That relation is not a builtin and does not need to be — a list
+//! the database holds already holds each of its own tails, so three rules over
+//! the values it has are enough. Aggregates nest by chaining: collecting `Y!T`
+//! pairs means binding one of them binds `T`, which is the next list to read
+//! out of.
+//!
+//! A head that projects the collected list away leaves a set with no name, and
+//! Section 6.3.2 gives it one: a Skolem term applied to the head's values, the
+//! same term wherever the definition mentioned that set. It is a name and not
+//! a reading — the values inside it were never stored — so the membership goal
+//! stands in the inverse rule and reaches nothing, while the goals *outside*
+//! the aggregate are reconstructed exactly as they would have been. What such
+//! a view remembers is that its outer goals held, which is worth having and is
+//! less than a view that kept the list.
 //!
 //! Two things about collecting change what a witness is, and both are easy to
 //! get wrong. A value projected out of an aggregate's *own* body has one
@@ -55,30 +64,26 @@ const view_catalog = @import("view_catalog.zig");
 
 /// Why a definition is outside the class the Inverse Method inverts.
 ///
-/// Each of these is a later phase's problem rather than a defect: a view whose
-/// aggregate output the head does not keep is F4's, one carrying a list is
-/// F5's, and one reading what it defines is recursion, which inversion cannot
-/// bound.
+/// Each of these is a later phase's problem rather than a defect: a view
+/// carrying a list outside its aggregates is F5's, and one reading what it
+/// defines is recursion, which inversion cannot bound.
 /// How each of these reads is `folding.PreconditionKind`'s to say, so that one
 /// place words what a fold could not do.
 pub const Obstacle = enum {
     recursive,
     not_conjunctive,
     lists,
-    aggregate_output_projected,
     aggregate_template_correlated,
 };
 
 /// What stops this view from being inverted, or null when nothing does.
 ///
-/// The class is a conjunction of positive base relations and aggregates —
-/// however many, however deeply nested — each of whose collected lists is
-/// fixed by what already surrounds it. That last condition is the one that
-/// matters: inverting an aggregate's body means reading the values back out of
-/// the list it collected, so the plan has to be able to name that list. The
-/// head can fix it, by keeping it or by writing it down, and so can an
-/// enclosing aggregate, by collecting it. A definition that projects it away
-/// leaves a set with no name, which is F4's.
+/// The class is a non-recursive conjunction of positive base relations and
+/// aggregates, however many and however deeply nested. A collected list the
+/// head keeps is a list the plan can name and read members out of; one the
+/// head projects away is a *set* the plan can name and not read, because
+/// Section 6.3.2 gives it a Skolem term of its own. Either way the definition
+/// inverts — what differs is how much comes back.
 ///
 /// A definition is one rule, so the only recursion it can express is reading
 /// its own name; a recursive view would need several rules and the catalog has
@@ -88,29 +93,16 @@ pub fn obstacle(view: *const view_catalog.View) ?Obstacle {
     const definition = view.definition;
     if (definition.seed_argument != null) return .recursive;
     for (definition.head.terms) |term| if (term == .cons or term == .nil) return .lists;
-    const outermost: Level = .{
-        .fixed = definition.head.terms,
-        .goals = definition.body,
-        .enclosing = null,
-    };
+    const outermost: Level = .{ .goals = definition.body, .enclosing = null };
     return levelObstacle(view, definition.body, &outermost);
 }
 
-/// What one nesting level fixes and what it binds: the head's terms and the
-/// definition's own goals at the outermost level, an aggregate's template and
-/// its goals within one. Threaded rather than collected so that the check
-/// allocates nothing however deeply the aggregates nest.
+/// What one nesting level binds: the definition's own goals at the outermost
+/// level, an aggregate's goals within one. Threaded rather than collected so
+/// that the check allocates nothing however deeply the aggregates nest.
 const Level = struct {
-    fixed: []const fold_ir.Term,
     goals: []const fold_ir.Goal,
     enclosing: ?*const Level,
-
-    /// Whether this level or one above it writes the value down, so that a
-    /// plan reading the stored tuple knows what it was.
-    fn fixes(self: *const Level, variable: fold_ir.Variable) bool {
-        if (mentions(self.fixed, variable)) return true;
-        return if (self.enclosing) |above| above.fixes(variable) else false;
-    }
 
     /// Whether this level or one above it binds the value with a goal of its
     /// own, which is what makes a value the definition already had rather than
@@ -133,17 +125,9 @@ fn levelObstacle(
         .builtin => return .not_conjunctive,
         .relation => |relation| if (readObstacle(view, relation)) |blocker| return blocker,
         .aggregate => |aggregate| {
-            if (!keptBy(level, aggregate.output)) return .aggregate_output_projected;
             if (escapes(level, view.definition.head.terms, aggregate.template))
                 return .aggregate_template_correlated;
-            // The collected value is what an inner aggregate's output may be
-            // fixed by, which is what lets `member` chain into the nesting.
-            const collected = [_]fold_ir.Term{aggregate.template};
-            const inner: Level = .{
-                .fixed = &collected,
-                .goals = aggregate.body,
-                .enclosing = level,
-            };
+            const inner: Level = .{ .goals = aggregate.body, .enclosing = level };
             if (levelObstacle(view, aggregate.body, &inner)) |blocker| return blocker;
         },
     };
@@ -160,17 +144,6 @@ fn readObstacle(view: *const view_catalog.View, relation: fold_ir.Relation) ?Obs
     if (key.name == view.name and key.arity == view.definition.head.terms.len) return .recursive;
     for (relation.terms) |term| if (term == .cons or term == .nil) return .lists;
     return null;
-}
-
-/// Whether every value in `term` is fixed by this level or one above it. A
-/// constant and the empty list are fixed by being written down; a variable is
-/// fixed by the head keeping it, or by an enclosing aggregate collecting it.
-fn keptBy(level: *const Level, term: fold_ir.Term) bool {
-    return switch (term) {
-        .variable => |variable| level.fixes(variable),
-        .cons => |pair| keptBy(level, pair.head) and keptBy(level, pair.tail),
-        else => true,
-    };
 }
 
 /// Whether the aggregate collects a value the definition already binds at this
@@ -528,8 +501,14 @@ const Builder = struct {
         };
     }
 
-    /// The goal that reads one collected value out of the stored list. The
-    /// list is whatever the head kept, which is what makes it nameable at all.
+    /// The goal that reads one collected value out of the list the aggregate
+    /// collected.
+    ///
+    /// The list is whatever the definition fixed — a variable the head kept, a
+    /// list it wrote down — and, when the head projected it away, a Skolem
+    /// *set*: the set some tuple must have collected for the view's tuple to
+    /// be there. That is Section 6.3.2's `f(X̄)`, and it is nameable without
+    /// being readable, so the goal stands and reaches nothing.
     fn membership(self: *Builder, aggregate: fold_ir.Aggregate) !fold_ir.Goal {
         const collected = try fold_ir.substituteTerm(
             self.allocator,
@@ -537,7 +516,7 @@ const Builder = struct {
             &self.renaming,
         );
         errdefer fold_ir.freeTerm(self.allocator, collected);
-        const list = try fold_ir.substituteTerm(self.allocator, aggregate.output, &self.renaming);
+        const list = try self.reconstruct(aggregate.output);
         errdefer fold_ir.freeTerm(self.allocator, list);
         const terms = try self.allocator.alloc(fold_ir.Term, 2);
         terms[0] = collected;
@@ -600,11 +579,24 @@ const Builder = struct {
         };
     }
 
-    /// What a body term becomes in the reconstructed fact: itself when the
-    /// head kept it, and a Skolem term when the head projected it away.
-    fn reconstruct(self: *Builder, term: fold_ir.Term) !fold_ir.Term {
+    /// What a term becomes in the reconstructed fact: itself when the
+    /// definition fixed it, and a Skolem term when the head projected it away.
+    ///
+    /// A written-down list is fixed only as far as its own terms are, so it is
+    /// rebuilt one half at a time. A collected list the head kept partly —
+    /// `[a!T]` with `T` projected — therefore comes back as a list holding a
+    /// Skolem term, which elimination refuses to spread and drops.
+    fn reconstruct(self: *Builder, term: fold_ir.Term) std.mem.Allocator.Error!fold_ir.Term {
         const variable = switch (term) {
             .variable => |value| value,
+            .cons => |pair| {
+                const copy = try self.allocator.create(fold_ir.Term.Cons);
+                errdefer self.allocator.destroy(copy);
+                copy.head = try self.reconstruct(pair.head);
+                errdefer fold_ir.freeTerm(self.allocator, copy.head);
+                copy.tail = try self.reconstruct(pair.tail);
+                return .{ .cons = copy };
+            },
             else => return term,
         };
         if (self.renaming.get(variable)) |replacement| return replacement;
@@ -1303,8 +1295,9 @@ test "a definition outside the conjunctive class names what stops it" {
     try testing.expectEqual(@as(?Obstacle, null), obstacle(catalog.view(aggregated)));
 
     // counted(X) :- edge(X, S), setof(Y, edge(X, Y), S). The same aggregate
-    // with the head no longer keeping what it collected: the plan would have a
-    // set it cannot name, which is F4's.
+    // with the head no longer keeping what it collected. The plan names that
+    // set with a Skolem term rather than refusing the definition, so nothing
+    // stops this one either.
     var counted_terms = [_]syntax.Term{.{ .variable = x }};
     var outer_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = s } };
     var counted_body = [_]syntax.Clause{
@@ -1319,10 +1312,7 @@ test "a definition outside the conjunctive class names what stops it" {
         .head = .{ .predicate = try strings.intern("counted"), .terms = &counted_terms },
         .body = &counted_body,
     }, .materialized);
-    try testing.expectEqual(
-        Obstacle.aggregate_output_projected,
-        obstacle(catalog.view(counted)).?,
-    );
+    try testing.expectEqual(@as(?Obstacle, null), obstacle(catalog.view(counted)));
 
     // pair(X, [Y]) :- edge(X, Y). A list is F5's problem.
     var pair: syntax.Term.Cons = .{ .head = .{ .variable = y }, .tail = .nil };
@@ -1524,5 +1514,102 @@ test "the list a plan reads members out of is whatever the definition fixed" {
             },
             else => unreachable,
         }
+    }
+}
+
+test "a collected list the head projected away becomes a set the plan can name" {
+    // Section 6.3.2's case: v(X) :- p(X, S), setof(Y, r(X, Y), S). The head
+    // keeps neither `S` nor anything the aggregate collected, so the set has
+    // no stored value — but it has a name, and the definition mentions it
+    // twice, so both mentions have to be the same name or the inverse rules
+    // would say the outer goal read one set and the aggregate collected
+    // another.
+    const allocator = testing.allocator;
+    var strings: string_table.StringTable = .init(allocator);
+    defer strings.deinit();
+    var scalars: scalar.Store = .init(allocator);
+    defer scalars.deinit();
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+
+    const v = try strings.intern("v");
+    const p = try strings.intern("p");
+    const r = try strings.intern("r");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    const s = try strings.intern("S");
+
+    var head_terms = [_]syntax.Term{.{ .variable = x }};
+    var outer_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = s } };
+    var inner_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var inner = [_]syntax.Clause{.{ .relational = .{ .predicate = r, .terms = &inner_terms } }};
+    var body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = p, .terms = &outer_terms } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y },
+            .body = &inner,
+            .output = .{ .variable = s },
+        } },
+    };
+    const id = try catalog.define(.{
+        .head = .{ .predicate = v, .terms = &head_terms },
+        .body = &body,
+    }, .materialized);
+
+    const view = catalog.view(id);
+    try testing.expectEqual(@as(?Obstacle, null), obstacle(view));
+    var inverted = try invert(allocator, &catalog.symbols, view);
+    defer inverted.deinit();
+
+    const names: fold_ir.Names = .{
+        .symbols = &catalog.symbols,
+        .strings = &strings,
+        .scalars = &scalars,
+    };
+    const rendered = try renderRules(allocator, names, inverted.rules);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings(
+        \\p(X#3, $f0(X#3)) :- v@0(X#3) % generated.
+        \\r(X#3, Y#4) :- v@0(X#3) % generated, $member(Y#4, $f0(X#3)) % generated.
+        \\
+    , rendered);
+
+    // The same function in both, stated as an identity rather than read off
+    // the text: the value `p` held is the set the members were collected into.
+    const stored = inverted.rules[0].head.terms[1];
+    const collected = inverted.rules[1].body[1].relation.terms[1];
+    try testing.expect(stored == .skolem and collected == .skolem);
+    try testing.expectEqual(stored.skolem.function, collected.skolem.function);
+
+    // And it is a name and not a reading. Nothing derives membership in a set
+    // that was never stored, so eliminating the Skolem terms splits `$member`
+    // into a relation no rule fills: the outer goal comes back and the
+    // aggregate's body does not.
+    var rules: std.ArrayList(fold_ir.Rule) = .empty;
+    defer {
+        for (rules.items) |rule| fold_ir.freeRule(allocator, rule);
+        rules.deinit(allocator);
+    }
+    for (inverted.rules) |rule| {
+        const copy = try fold_ir.cloneRule(allocator, rule);
+        errdefer fold_ir.freeRule(allocator, copy);
+        try rules.append(allocator, copy);
+    }
+    try appendMemberRules(allocator, &catalog.symbols, &rules);
+    var eliminated = try eliminateSkolems(allocator, &catalog.symbols, &catalog, rules.items);
+    defer eliminated.deinit();
+    try testing.expect(eliminated.split);
+    // Nothing was dropped: the rule reconstructing `r` was never instantiated
+    // at all, which costs the same answers and does not lower the guarantee,
+    // because no plan over this view could have had them.
+    try testing.expect(!eliminated.dropped);
+
+    // What survives says it: `p` comes back as a split whose second column is
+    // the argument the set was named by, and no rule derives `r` at all.
+    const survivors = try renderRules(allocator, names, eliminated.rules);
+    defer allocator.free(survivors);
+    try testing.expect(std.mem.containsAtLeast(u8, survivors, 1, "p$0(X#3, X#3) :- v@0(X#3)"));
+    for (eliminated.rules) |rule| {
+        try testing.expect(!rule.head.predicate.equals(.{ .base = .{ .name = r, .arity = 2 } }));
     }
 }

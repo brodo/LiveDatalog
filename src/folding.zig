@@ -32,6 +32,7 @@
 const std = @import("std");
 const fold_ir = @import("fold_ir.zig");
 const inversion = @import("inversion.zig");
+const monotonicity = @import("monotonicity.zig");
 const relation_store = @import("relation_store.zig");
 const string_table = @import("string_table.zig");
 const syntax = @import("syntax.zig");
@@ -70,6 +71,16 @@ pub const TransformationKind = enum {
     view_inverted,
     /// A relation the query reads is no longer read: the plan derives it.
     relation_reconstructed,
+    /// A relation the plan derives, and derives all of: a canonical aggregate
+    /// view of that relation was available, and Lemma 6.4.2 makes the
+    /// reconstruction equivalent to it rather than merely contained in it.
+    relation_reconstructed_exactly,
+    /// The query reads a relation it will know incompletely under negation or
+    /// inside an aggregate, and that read stands because the query is
+    /// monotonic: its answers can only grow with the relations it reads, so
+    /// answering it over a reconstruction returns fewer answers, not other
+    /// ones.
+    monotonic_reads_admitted,
     /// The plan defines what it means to be in a list, because some view
     /// stored a collected one and the values inside it had to be read back.
     membership_defined,
@@ -86,6 +97,10 @@ pub const TransformationKind = enum {
             .query_left_unchanged => "query reads only available relations",
             .view_inverted => "inverted into rules reconstructing what its body read",
             .relation_reconstructed => "reconstructed by the plan instead of read",
+            .relation_reconstructed_exactly => "reconstructed exactly, from a canonical " ++
+                "aggregate view of it",
+            .monotonic_reads_admitted => "the query is monotonic, so reading a reconstruction " ++
+                "where it negates or counts cannot answer more",
             .membership_defined => "membership in a stored list is defined by the plan",
             .skolem_terms_eliminated => "relations split so that no reconstructed value stays unnameable",
             .instances_dropped => "instances that would have read a reconstructed value were dropped",
@@ -118,10 +133,6 @@ pub const PreconditionKind = enum {
     /// A view mentioning a relation the query needs builds or reads a list,
     /// which is F5's.
     view_definition_uses_lists,
-    /// A view mentioning a relation the query needs projects away the list its
-    /// aggregate collected, leaving nothing for the plan to read members out
-    /// of. That is F4's Skolem set.
-    view_definition_projects_aggregate_output,
     /// A view mentioning a relation the query needs collects a value its own
     /// outer goals bind and its head does not keep.
     view_definition_correlates_template,
@@ -130,6 +141,12 @@ pub const PreconditionKind = enum {
     /// relation, or one the query derives from one. Such a relation holds what
     /// the views prove existed, which can be less than it held; reading what is
     /// *not* in it, or counting what is, would then answer more than the query.
+    ///
+    /// Two proofs discharge this and nothing else does. Either a canonical
+    /// aggregate view of that relation was available and used, so the plan
+    /// knows the relation exactly and there is nothing incomplete to read; or
+    /// the query is monotonic, so a smaller relation can only mean fewer
+    /// answers. Example 6.4.1 has neither, and is the case this refuses.
     relation_read_non_positively,
     /// Two relations a plan may read store under one name and arity, so a
     /// lowered plan could not tell them apart.
@@ -144,8 +161,6 @@ pub const PreconditionKind = enum {
             .view_definition_not_conjunctive => "its definition is not a conjunction of " ++
                 "relations and aggregates",
             .view_definition_uses_lists => "its definition mentions a list outside its aggregate",
-            .view_definition_projects_aggregate_output => "its head does not keep what its " ++
-                "aggregate collected",
             .view_definition_correlates_template => "its aggregate collects a value its own " ++
                 "outer goals bind",
             .relation_read_non_positively => "known only as far as the views prove it, " ++
@@ -340,17 +355,15 @@ pub fn foldQuery(
         try reads.walkGoals(rule.body, true);
     }
 
-    var unmet: std.ArrayList(Precondition) = .empty;
-    defer unmet.deinit(allocator);
-    var wanted: std.ArrayList(fold_ir.ViewId) = .empty;
-    defer wanted.deinit(allocator);
-    try examine(allocator, catalog, query.rules, &reads, &unmet, &wanted);
-    if (unmet.items.len != 0) return .{ .unsupported = .{
+    var examination: Examination = .{ .allocator = allocator };
+    defer examination.deinit();
+    try examine(&examination, catalog, query, &reads);
+    if (examination.unmet.items.len != 0) return .{ .unsupported = .{
         .allocator = allocator,
-        .unmet = try unmet.toOwnedSlice(allocator),
+        .unmet = try examination.unmet.toOwnedSlice(allocator),
     } };
 
-    if (wanted.items.len == 0) {
+    if (examination.wanted.items.len == 0) {
         const copied = try fold_ir.cloneGoals(allocator, query.goals);
         errdefer fold_ir.freeGoals(allocator, copied);
         const rules = try cloneRules(allocator, query.rules);
@@ -372,7 +385,7 @@ pub fn foldQuery(
         combined.deinit(allocator);
     }
     var members = false;
-    for (wanted.items) |id| {
+    for (examination.wanted.items) |id| {
         var inverted = try inversion.invert(allocator, &catalog.symbols, catalog.view(id));
         errdefer inverted.deinit();
         try combined.ensureUnusedCapacity(allocator, inverted.rules.len);
@@ -404,7 +417,7 @@ pub fn foldQuery(
         allocator,
         catalog,
         &reads,
-        wanted.items,
+        &examination,
         members,
         eliminated,
     );
@@ -472,18 +485,49 @@ fn headKey(rule: fold_ir.Rule) relation_store.PredicateKey {
     };
 }
 
+/// What a fold worked out about the query before building anything: which
+/// views it has to invert, which of the relations it reconstructs it will know
+/// exactly rather than only as far as the views prove, whether the monotonic
+/// class had to be appealed to, and what it could not get at all.
+const Examination = struct {
+    allocator: std.mem.Allocator,
+    unmet: std.ArrayList(Precondition) = .empty,
+    wanted: std.ArrayList(fold_ir.ViewId) = .empty,
+    /// Relations a canonical aggregate view of themselves reconstructs, which
+    /// Lemma 6.4.2 makes equivalent rather than merely contained.
+    exact: std.ArrayList(relation_store.PredicateKey) = .empty,
+    /// Whether some read stood only because the query is monotonic.
+    monotonic_admitted: bool = false,
+
+    fn deinit(self: *Examination) void {
+        self.exact.deinit(self.allocator);
+        self.wanted.deinit(self.allocator);
+        self.unmet.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn isExact(self: *const Examination, key: relation_store.PredicateKey) bool {
+        for (self.exact.items) |known| {
+            if (known.name == key.name and known.arity == key.arity) return true;
+        }
+        return false;
+    }
+};
+
 /// Decides, relation by relation, whether the plan can get what the query
 /// reads: it is available, the query defines it, or some invertible view reads
 /// it. Records the views to invert, and the preconditions of every relation
 /// none of that covers.
 fn examine(
-    allocator: std.mem.Allocator,
+    examination: *Examination,
     catalog: *const view_catalog.Catalog,
-    rules: []const fold_ir.Rule,
+    query: Query,
     reads: *const Reads,
-    unmet: *std.ArrayList(Precondition),
-    wanted: *std.ArrayList(fold_ir.ViewId),
 ) !void {
+    const allocator = examination.allocator;
+    const rules = query.rules;
+    const unmet = &examination.unmet;
+    const wanted = &examination.wanted;
     // What the plan will know only as far as the views prove it. A relation
     // reconstructed from a view starts here, and a predicate the query derives
     // joins it, because a rule is no more exact than what its body reads.
@@ -505,6 +549,7 @@ fn examine(
 
         var reconstructible = false;
         var mentioned = false;
+        var exactly = false;
         for (catalog.views.items) |*candidate| {
             if (!viewReads(candidate, key)) continue;
             mentioned = true;
@@ -521,7 +566,6 @@ fn examine(
                         .recursive => .view_definition_recursive,
                         .not_conjunctive => .view_definition_not_conjunctive,
                         .lists => .view_definition_uses_lists,
-                        .aggregate_output_projected => .view_definition_projects_aggregate_output,
                         .aggregate_template_correlated => .view_definition_correlates_template,
                     },
                     .subject = candidate.predicate(),
@@ -530,12 +574,22 @@ fn examine(
             }
             reconstructible = true;
             try noteView(allocator, wanted, candidate.id);
+            // Lemma 6.4.2: reading the lists of a canonical aggregate view of
+            // this relation back out returns the relation itself, so the plan
+            // knows it exactly and there is nothing incomplete left to ask
+            // about. The three conditions are one condition — it has to be
+            // canonical *for this relation*, its extension has to be readable,
+            // and the plan has to be inverting it — and this branch is where
+            // the other two are already settled.
+            if (candidate.isCanonicalFor(key)) exactly = true;
         }
 
         if (!mentioned) {
             try note(allocator, unmet, .{ .kind = .relation_unavailable, .subject = subject });
         } else if (!reconstructible) {
             try note(allocator, unmet, .{ .kind = .relation_not_reconstructible, .subject = subject });
+        } else if (exactly) {
+            try examination.exact.append(allocator, key);
         } else {
             try inexact.put(allocator, key, {});
         }
@@ -557,8 +611,20 @@ fn examine(
         }
     }
 
+    // The refusal F2 recorded stands as the default, and two proofs discharge
+    // it. One is per relation and has been settled above: a relation a
+    // canonical aggregate view reconstructs exactly never reached `inexact` in
+    // the first place. The other is a property of the whole query, and it
+    // permits the read rather than removing the doubt — if the query's answers
+    // can only grow with the relations it reads, then reading a reconstruction
+    // returns fewer of them, never others.
+    const monotonic = monotonicity.ofQuery(query.goals, query.rules);
     for (reads.relations.keys(), reads.relations.values()) |key, non_positive| {
         if (!non_positive or !inexact.contains(key)) continue;
+        if (monotonic) {
+            examination.monotonic_admitted = true;
+            continue;
+        }
         try note(allocator, unmet, .{
             .kind = .relation_read_non_positively,
             .subject = .{ .base = key },
@@ -654,23 +720,28 @@ fn describe(
     allocator: std.mem.Allocator,
     catalog: *const view_catalog.Catalog,
     reads: *const Reads,
-    wanted: []const fold_ir.ViewId,
+    examination: *const Examination,
     members: bool,
     eliminated: inversion.Elimination,
 ) ![]Transformation {
     var notes: std.ArrayList(Transformation) = .empty;
     errdefer notes.deinit(allocator);
-    for (wanted) |id| try notes.append(allocator, .{
+    for (examination.wanted.items) |id| try notes.append(allocator, .{
         .kind = .view_inverted,
         .subject = catalog.view(id).predicate(),
     });
     for (reads.relations.keys()) |key| {
         if (reads.defined.contains(key) or catalog.baseAvailable(key)) continue;
         try notes.append(allocator, .{
-            .kind = .relation_reconstructed,
+            .kind = if (examination.isExact(key))
+                .relation_reconstructed_exactly
+            else
+                .relation_reconstructed,
             .subject = .{ .base = key },
         });
     }
+    if (examination.monotonic_admitted)
+        try notes.append(allocator, .{ .kind = .monotonic_reads_admitted });
     if (members) try notes.append(allocator, .{ .kind = .membership_defined });
     if (eliminated.split) try notes.append(allocator, .{ .kind = .skolem_terms_eliminated });
     if (eliminated.dropped) try notes.append(allocator, .{ .kind = .instances_dropped });
@@ -892,8 +963,15 @@ const Lowering = struct {
 const testing = std.testing;
 const scalar = @import("scalar.zig");
 
-/// A catalog holding `path(X, Y) :- edge(X, Y).` as a materialized view, and
-/// the tables its names resolve against.
+/// A catalog holding one view over `edge`, and the tables its names resolve
+/// against.
+///
+/// Which view it is decides how much of `edge` a plan gets back, which is the
+/// axis F4's discharges turn on. `path(X, Y) :- edge(X, Y)` is Definition
+/// 6.4.3's copy — a canonical aggregate view of `edge`, so inverting it
+/// returns `edge` itself. `path(X, Z) :- edge(X, Y), edge(Y, Z)` remembers
+/// only the pairs two edges apart, so inverting it returns some of `edge` and
+/// says nothing about the rest.
 const Fixture = struct {
     strings: string_table.StringTable,
     scalars: scalar.Store,
@@ -904,7 +982,17 @@ const Fixture = struct {
     y: syntax.Id,
     view: fold_ir.ViewId,
 
+    const Shape = enum { copy, hop };
+
     fn init(allocator: std.mem.Allocator, availability: view_catalog.Availability) !Fixture {
+        return build(allocator, availability, .copy);
+    }
+
+    fn build(
+        allocator: std.mem.Allocator,
+        availability: view_catalog.Availability,
+        shape: Shape,
+    ) !Fixture {
         var fixture: Fixture = .{
             .strings = .init(allocator),
             .scalars = .init(allocator),
@@ -920,15 +1008,27 @@ const Fixture = struct {
         fixture.edge = try fixture.strings.intern("edge");
         fixture.x = try fixture.strings.intern("X");
         fixture.y = try fixture.strings.intern("Y");
+        const z = try fixture.strings.intern("Z");
 
-        var head_terms = [_]syntax.Term{ .{ .variable = fixture.x }, .{ .variable = fixture.y } };
-        var body_terms = [_]syntax.Term{ .{ .variable = fixture.x }, .{ .variable = fixture.y } };
+        var head_terms = [_]syntax.Term{
+            .{ .variable = fixture.x },
+            .{ .variable = switch (shape) {
+                .copy => fixture.y,
+                .hop => z,
+            } },
+        };
+        var first = [_]syntax.Term{ .{ .variable = fixture.x }, .{ .variable = fixture.y } };
+        var second = [_]syntax.Term{ .{ .variable = fixture.y }, .{ .variable = z } };
         var body = [_]syntax.Clause{
-            .{ .relational = .{ .predicate = fixture.edge, .terms = &body_terms } },
+            .{ .relational = .{ .predicate = fixture.edge, .terms = &first } },
+            .{ .relational = .{ .predicate = fixture.edge, .terms = &second } },
         };
         fixture.view = try fixture.catalog.define(.{
             .head = .{ .predicate = fixture.path, .terms = &head_terms },
-            .body = &body,
+            .body = body[0..switch (shape) {
+                .copy => 1,
+                .hop => 2,
+            }],
         }, availability);
         return fixture;
     }
@@ -1230,8 +1330,10 @@ test "a fold that reconstructs a relation reports the plan it built to do it" {
 
     // A view remembering every variable of its body loses nothing, so its
     // inverse has no value it cannot name and nothing needs splitting. It is
-    // still only maximally contained: what the view stored may be less than
-    // what the relation held.
+    // still only maximally contained rather than equivalent: the guarantee is
+    // about the plan, and the plan's other relations are not this one. What
+    // this relation gets back is exact, because copying it is Definition
+    // 6.4.3's first canonical view.
     try testing.expectEqual(Guarantee.maximally_contained, outcome.guarantee());
     try testing.expectEqual(@as(usize, 2), outcome.plan().?.rules.len);
     const rendered = try outcome.explainAlloc(allocator, fixture.names());
@@ -1245,19 +1347,20 @@ test "a fold that reconstructs a relation reports the plan it built to do it" {
         \\  reach(X#2, Y#3) :- edge(X#2, Y#3).
         \\transformations:
         \\  inverted into rules reconstructing what its body read: path@0/2
-        \\  reconstructed by the plan instead of read: edge/2
+        \\  reconstructed exactly, from a canonical aggregate view of it: edge/2
         \\
     , rendered);
 }
 
 test "a reconstruction cannot stand in for a relation read under negation" {
     const allocator = testing.allocator;
-    var fixture = try Fixture.init(allocator, .materialized);
+    var fixture = try Fixture.build(allocator, .materialized, .hop);
     defer fixture.deinit();
 
-    // path(A, B), not edge(B, A). The view can reconstruct what `edge` held,
-    // but only what it can prove it held, and asking what is *not* there of a
-    // relation known incompletely answers more than the query does.
+    // path(A, B), not edge(B, A). The view remembers the pairs two edges
+    // apart, so it reconstructs what `edge` held only as far as it can prove
+    // it held it, and asking what is *not* there of a relation known
+    // incompletely answers more than the query does.
     const scope = try fixture.catalog.symbols.openScope(.query);
     const a = try fixture.catalog.symbols.userVariable(scope, fixture.x);
     const b = try fixture.catalog.symbols.userVariable(scope, fixture.y);
@@ -1295,4 +1398,47 @@ test "a reconstruction cannot stand in for a relation read under negation" {
     var allowed = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
     defer allowed.deinit();
     try testing.expectEqual(Guarantee.equivalent, allowed.guarantee());
+}
+
+test "a canonical view of the relation answers the objection to negating it" {
+    const allocator = testing.allocator;
+    var fixture = try Fixture.init(allocator, .materialized);
+    defer fixture.deinit();
+
+    // The same query as above, against `path(X, Y) :- edge(X, Y)` instead —
+    // Definition 6.4.3's copy. Lemma 6.4.2 makes inverting it equivalent to
+    // reading `edge`, so the plan does not know the relation incompletely and
+    // there is nothing left for the refusal to object to.
+    const scope = try fixture.catalog.symbols.openScope(.query);
+    const a = try fixture.catalog.symbols.userVariable(scope, fixture.x);
+    const b = try fixture.catalog.symbols.userVariable(scope, fixture.y);
+    const goals = try allocator.dupe(fold_ir.Goal, &.{
+        .{ .relation = .{
+            .predicate = fixture.catalog.view(fixture.view).predicate(),
+            .terms = try allocator.dupe(
+                fold_ir.Term,
+                &.{ .{ .variable = a }, .{ .variable = b } },
+            ),
+        } },
+        .{ .relation = .{
+            .predicate = .{ .base = .{ .name = fixture.edge, .arity = 2 } },
+            .terms = try allocator.dupe(
+                fold_ir.Term,
+                &.{ .{ .variable = b }, .{ .variable = a } },
+            ),
+            .negated = true,
+        } },
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    defer outcome.deinit();
+    try testing.expectEqual(Guarantee.maximally_contained, outcome.guarantee());
+
+    // Withholding that view is what takes the discharge away, and the fold
+    // then has nothing at all rather than a weaker plan.
+    fixture.catalog.views.items[@intFromEnum(fixture.view)].availability = .withheld;
+    var withheld = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    defer withheld.deinit();
+    try testing.expectEqual(Guarantee.unsupported, withheld.guarantee());
 }

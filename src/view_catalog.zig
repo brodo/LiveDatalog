@@ -69,7 +69,124 @@ pub const View = struct {
     pub fn readable(self: *const View) bool {
         return self.availability == .materialized;
     }
+
+    /// Whether this view is a *canonical aggregate view* of `key`, in the
+    /// sense of Definition 6.4.3.
+    ///
+    /// It matters because of what such a view remembers. Inverting an ordinary
+    /// view reconstructs a relation only as far as the view's tuples prove it,
+    /// which is why a plan may not read the result under negation or inside an
+    /// aggregate. A canonical view of a relation groups that relation by a
+    /// subset of its columns and collects *everything* in each group, so
+    /// reading its lists back out returns the relation itself — Lemma 6.4.2 —
+    /// and there is then nothing incomplete left to ask about.
+    ///
+    /// There are two shapes and `2^n` of them for an n-ary relation. One is
+    /// the relation copied: `v(X1, ..., Xn) :- r(X1, ..., Xn)`. The other
+    /// keeps `k < n` of the columns and collects the rest:
+    ///
+    /// ```text
+    /// v(Xi1, ..., Xik, S) :- r(X1, ..., Xn), setof(Ȳ, r(Z̄), S)
+    /// ```
+    ///
+    /// where `i1 < ... < ik`, the collected `Z̄` writes `Xj` in a kept column
+    /// and a variable of its own in every other, and `Ȳ` is those other
+    /// variables in column order — one of them bare, several of them consed
+    /// together, which is how Example 6.4.2 writes the pair case.
+    pub fn isCanonicalFor(self: *const View, key: relation_store.PredicateKey) bool {
+        const definition = self.definition;
+        if (definition.seed_argument != null) return false;
+        if (definition.body.len == 0 or definition.body.len > 2) return false;
+
+        const outer = positiveRead(definition.body[0], key) orelse return false;
+        if (!distinctVariables(outer)) return false;
+        if (definition.body.len == 1) {
+            // v(X1, ..., Xn) :- r(X1, ..., Xn): every column kept, in order.
+            return sameVariables(definition.head.terms, outer);
+        }
+
+        const aggregate = switch (definition.body[1]) {
+            .aggregate => |value| value,
+            else => return false,
+        };
+        if (aggregate.body.len != 1) return false;
+        const collected = positiveRead(aggregate.body[0], key) orelse return false;
+        if (!distinctVariables(collected)) return false;
+        // The head keeps the columns the aggregate did not collect, in their
+        // own order, and the collected list last.
+        if (definition.head.terms.len == 0) return false;
+        const kept = definition.head.terms[0 .. definition.head.terms.len - 1];
+        const output = definition.head.terms[definition.head.terms.len - 1];
+        if (output != .variable) return false;
+        if (aggregate.output != .variable or aggregate.output.variable != output.variable)
+            return false;
+        if (kept.len >= outer.len) return false;
+
+        // Walk the relation's columns once: a kept column carries the outer
+        // goal's variable in both goals, and every other carries a variable of
+        // the aggregate's own, which the template collects in this same order.
+        var template = aggregate.template;
+        var next_kept: usize = 0;
+        var collecting: usize = 0;
+        const projected = outer.len - kept.len;
+        for (outer, collected) |stored, gathered| {
+            if (gathered == .variable and stored == .variable and
+                gathered.variable == stored.variable)
+            {
+                if (next_kept == kept.len) return false;
+                if (kept[next_kept] != .variable or kept[next_kept].variable != stored.variable)
+                    return false;
+                next_kept += 1;
+                continue;
+            }
+            collecting += 1;
+            // The last collected column ends the template; the others are the
+            // heads of its cons cells.
+            const element = if (collecting == projected) template else blk: {
+                if (template != .cons) return false;
+                const pair = template.cons;
+                template = pair.tail;
+                break :blk pair.head;
+            };
+            if (element != .variable or gathered != .variable) return false;
+            if (element.variable != gathered.variable) return false;
+        }
+        return next_kept == kept.len;
+    }
 };
+
+/// The terms of a positive goal reading `key`, or null for anything else.
+fn positiveRead(goal: fold_ir.Goal, key: relation_store.PredicateKey) ?[]const fold_ir.Term {
+    const relation = switch (goal) {
+        .relation => |value| value,
+        else => return null,
+    };
+    if (relation.negated) return null;
+    if (!relation.predicate.equals(.{ .base = key })) return null;
+    return relation.terms;
+}
+
+/// Whether these terms are variables, no two of them the same. A canonical
+/// view reads the whole relation and nothing narrower, so a repeated column or
+/// a constant is a different view.
+fn distinctVariables(terms: []const fold_ir.Term) bool {
+    for (terms, 0..) |term, index| {
+        if (term != .variable) return false;
+        for (terms[0..index]) |earlier| {
+            if (earlier.variable == term.variable) return false;
+        }
+    }
+    return true;
+}
+
+fn sameVariables(left: []const fold_ir.Term, right: []const fold_ir.Term) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |one, other| {
+        if (one != .variable or other != .variable) return false;
+        if (one.variable != other.variable) return false;
+    }
+    return true;
+}
 
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
@@ -255,4 +372,186 @@ test "an aggregate output is a list column, whatever the head spells it" {
     try testing.expectEqual(Column{ .kind = .list }, view.schema.columns[1]);
     try testing.expect(!view.readable());
     try testing.expect(catalog.definedByView(.{ .name = score, .arity = 2 }));
+}
+
+test "the canonical aggregate views of a binary relation are the four of Example 6.4.2" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const r = try strings.intern("r");
+    const t = try strings.intern("t");
+    const x1 = try strings.intern("X1");
+    const x2 = try strings.intern("X2");
+    const y1 = try strings.intern("Y1");
+    const y2 = try strings.intern("Y2");
+    const s = try strings.intern("S");
+    const key: relation_store.PredicateKey = .{ .name = r, .arity = 2 };
+
+    var outer = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = x2 } };
+    var outer_goal = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &outer } },
+    };
+
+    // v1(S) :- r(X1, X2), setof(Y1!Y2, r(Y1, Y2), S). Every column collected,
+    // so the whole relation is one stored list.
+    var both = [_]syntax.Term{ .{ .variable = y1 }, .{ .variable = y2 } };
+    var both_goal = [_]syntax.Clause{.{ .relational = .{ .predicate = r, .terms = &both } }};
+    var pair: syntax.Term.Cons = .{ .head = .{ .variable = y1 }, .tail = .{ .variable = y2 } };
+    var v1_head = [_]syntax.Term{.{ .variable = s }};
+    var v1_body = [_]syntax.Clause{
+        outer_goal[0],
+        .{ .aggregate = .{
+            .template = .{ .cons = &pair },
+            .body = &both_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const v1 = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("v1"), .terms = &v1_head },
+        .body = &v1_body,
+    }, .materialized);
+    try testing.expect(catalog.view(v1).isCanonicalFor(key));
+
+    // v2(X1, S) :- r(X1, X2), setof(Y2, r(X1, Y2), S). Grouped by the first
+    // column, collecting the second.
+    var by_first = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = y2 } };
+    var by_first_goal = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &by_first } },
+    };
+    var v2_head = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = s } };
+    var v2_body = [_]syntax.Clause{
+        outer_goal[0],
+        .{ .aggregate = .{
+            .template = .{ .variable = y2 },
+            .body = &by_first_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const v2 = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("v2"), .terms = &v2_head },
+        .body = &v2_body,
+    }, .materialized);
+    try testing.expect(catalog.view(v2).isCanonicalFor(key));
+
+    // v3(X2, S) :- r(X1, X2), setof(Y1, r(Y1, X2), S). The other grouping, and
+    // the one that proves the kept column is found by position rather than by
+    // being first.
+    var by_second = [_]syntax.Term{ .{ .variable = y1 }, .{ .variable = x2 } };
+    var by_second_goal = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &by_second } },
+    };
+    var v3_head = [_]syntax.Term{ .{ .variable = x2 }, .{ .variable = s } };
+    var v3_body = [_]syntax.Clause{
+        outer_goal[0],
+        .{ .aggregate = .{
+            .template = .{ .variable = y1 },
+            .body = &by_second_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const v3 = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("v3"), .terms = &v3_head },
+        .body = &v3_body,
+    }, .materialized);
+    try testing.expect(catalog.view(v3).isCanonicalFor(key));
+
+    // v4(X1, X2) :- r(X1, X2). The relation copied.
+    const v4 = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("v4"), .terms = &outer },
+        .body = outer_goal[0..1],
+    }, .materialized);
+    try testing.expect(catalog.view(v4).isCanonicalFor(key));
+
+    // None of them is canonical for a relation they never read, which is the
+    // condition that matters: a view mentioning a relation is not a view that
+    // remembers all of it.
+    const other: relation_store.PredicateKey = .{ .name = t, .arity = 2 };
+    for ([_]fold_ir.ViewId{ v1, v2, v3, v4 }) |id|
+        try testing.expect(!catalog.view(id).isCanonicalFor(other));
+}
+
+test "a view that collects less than the whole relation is not canonical for it" {
+    var strings: string_table.StringTable = .init(testing.allocator);
+    defer strings.deinit();
+    var catalog: Catalog = .init(testing.allocator);
+    defer catalog.deinit();
+
+    const r = try strings.intern("r");
+    const p = try strings.intern("p");
+    const x1 = try strings.intern("X1");
+    const x2 = try strings.intern("X2");
+    const y2 = try strings.intern("Y2");
+    const s = try strings.intern("S");
+    const key: relation_store.PredicateKey = .{ .name = r, .arity = 2 };
+
+    var outer = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = x2 } };
+    var by_first = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = y2 } };
+    var by_first_goal = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &by_first } },
+    };
+    var head = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = s } };
+
+    // narrowed(X1, S) :- p(X1, X2), setof(Y2, r(X1, Y2), S). The list holds
+    // every `r` for its key, but only the keys `p` admits have a list at all,
+    // so what comes back is `r` restricted rather than `r`.
+    var narrowed_body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = p, .terms = &outer } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y2 },
+            .body = &by_first_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const narrowed = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("narrowed"), .terms = &head },
+        .body = &narrowed_body,
+    }, .materialized);
+    try testing.expect(!catalog.view(narrowed).isCanonicalFor(key));
+
+    // filtered(X1, S) :- r(X1, X1), setof(Y2, r(X1, Y2), S). A repeated column
+    // is a narrower read of the same relation, and narrower is not canonical.
+    var repeated = [_]syntax.Term{ .{ .variable = x1 }, .{ .variable = x1 } };
+    var filtered_body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &repeated } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y2 },
+            .body = &by_first_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const filtered = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("filtered"), .terms = &head },
+        .body = &filtered_body,
+    }, .materialized);
+    try testing.expect(!catalog.view(filtered).isCanonicalFor(key));
+
+    // grouped(X2, S) :- r(X1, X2), setof(Y2, r(X1, Y2), S). Grouped by one
+    // column and collecting by another: the head does not name the column the
+    // aggregate kept fixed, so a stored list says nothing about which key it
+    // belongs to.
+    var mismatched = [_]syntax.Term{ .{ .variable = x2 }, .{ .variable = s } };
+    var grouped_body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = r, .terms = &outer } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y2 },
+            .body = &by_first_goal,
+            .output = .{ .variable = s },
+        } },
+    };
+    const grouped = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("grouped"), .terms = &mismatched },
+        .body = &grouped_body,
+    }, .materialized);
+    try testing.expect(!catalog.view(grouped).isCanonicalFor(key));
+
+    // copied(X1) :- r(X1, X2). A projection is not a copy.
+    var narrow_head = [_]syntax.Term{.{ .variable = x1 }};
+    var outer_goal = [_]syntax.Clause{.{ .relational = .{ .predicate = r, .terms = &outer } }};
+    const copied = try catalog.define(.{
+        .head = .{ .predicate = try strings.intern("copied"), .terms = &narrow_head },
+        .body = &outer_goal,
+    }, .materialized);
+    try testing.expect(!catalog.view(copied).isCanonicalFor(key));
 }

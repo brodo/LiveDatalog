@@ -4216,23 +4216,26 @@ fn runPlan(db: *database.Database, executable: *folding.Executable) !results.Que
     return statement.queryClauses(db, executable.goals);
 }
 
-/// Adds one two-atom fact without staging a copy of the database, which is
-/// what the public interface would do. A sweep over hundreds of small
-/// databases cannot afford a clone per fact.
+/// Adds one fact without staging a copy of the database, which is what the
+/// public interface would do. A sweep over hundreds of small databases cannot
+/// afford a clone per fact.
+fn addFactTerms(
+    db: *database.Database,
+    predicate: []const u8,
+    terms: []const input.Term,
+) !void {
+    const expression = try compile.compileRelation(db, predicate, terms, false);
+    defer syntax.freeExpr(db.allocator, expression);
+    try statement.addFactExpr(db, expression);
+}
+
 fn addAtomPair(
     db: *database.Database,
     predicate: []const u8,
     left: []const u8,
     right: []const u8,
 ) !void {
-    const expression = try compile.compileRelation(
-        db,
-        predicate,
-        &.{ input.atom(left), input.atom(right) },
-        false,
-    );
-    defer syntax.freeExpr(db.allocator, expression);
-    try statement.addFactExpr(db, expression);
+    return addFactTerms(db, predicate, &.{ input.atom(left), input.atom(right) });
 }
 
 /// One line per answer, sorted, holding the values only.
@@ -4953,4 +4956,718 @@ fn collectingAllocationScenario(allocator: std.mem.Allocator) !void {
 
 test "inverting a collecting view releases every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(collectingAllocationScenario);
+}
+
+/// Example 6.4.1's setting: `v(X, S) :- p(X), setof(Y, r(X, Y), S).`
+///
+/// The view remembers, for each `X` that `p` admits, everything `r` related it
+/// to. It is not a canonical aggregate view of `r`, because `p` decides which
+/// keys get a list at all, so what inverting it recovers of `r` is whatever
+/// `p` let through.
+fn defineCollectingView(
+    db: *database.Database,
+    catalog: *view_catalog.Catalog,
+    availability: view_catalog.Availability,
+) !fold_ir.ViewId {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const s = input.variable("S");
+    return defineView(db, catalog, input.fact("v", &.{ x, s }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, availability);
+}
+
+/// `c(X, S) :- r(X, Y), setof(Y2, r(X, Y2), S).`
+///
+/// Definition 6.4.3's canonical aggregate view of a binary `r`, grouped by its
+/// first column. Every key `r` mentions gets a list, and the list holds every
+/// value under that key, so reading the lists back out returns `r` itself.
+fn defineCanonicalView(
+    db: *database.Database,
+    catalog: *view_catalog.Catalog,
+    availability: view_catalog.Availability,
+) !fold_ir.ViewId {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const collected = input.variable("Y2");
+    const s = input.variable("S");
+    return defineView(db, catalog, input.fact("c", &.{ x, s }), &.{
+        input.relation("r", &.{ x, y }),
+        input.setof(collected, &.{input.relation("r", &.{ x, collected })}, s),
+    }, availability);
+}
+
+/// `q(<key>) :- setof(Y, r(<key>, Y), <output>).`
+///
+/// Section 6.4.1's pair of queries, whose only difference is the collected
+/// output they ask for, and whose containment differs entirely because of it.
+fn collectingQueryRule(
+    db: *database.Database,
+    symbols: *fold_ir.Symbols,
+    key: input.Term,
+    output: input.Term,
+) !fold_ir.Rule {
+    const y = input.variable("Y");
+    return foldingRule(db, symbols, input.fact("q", &.{key}), &.{
+        input.setof(y, &.{input.relation("r", &.{ key, y })}, output),
+    });
+}
+
+test "Chapter 6's empty-set counterexample is refused and the query beside it is not" {
+    // Example 6.4.1 and the contrast of Section 6.4.1, together, because a
+    // refusal only says something next to the query it does not refuse.
+    //
+    // Both queries count what `r` holds. The plan knows `r` only as far as the
+    // view proves it, so its `r` is a subset. Asking for the collected set to
+    // be *empty* turns a subset into an answer the query does not have; asking
+    // for it to be non-empty cannot, because a subset of a non-empty set is
+    // either non-empty or absent.
+    const allocator = std.testing.allocator;
+
+    // What is really there, and what the two queries really answer. The plan
+    // never sees this database.
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(b). p(c).
+        \\r(a, 1). r(c, 2).
+        \\v(X, S) :- p(X), setof(Y, r(X, Y), S).
+        \\empty(a) :- setof(Y, r(a, Y), []).
+        \\nonempty(c) :- setof(Y, r(c, Y), H!T).
+    );
+    program.deinit();
+    var refused_answers = try source.execute("empty(X)?");
+    defer refused_answers.deinit();
+    try std.testing.expectEqual(@as(usize, 0), refused_answers.query.answers.items.len);
+    var admitted_answers = try source.execute("nonempty(X)?");
+    defer admitted_answers.deinit();
+    try std.testing.expectEqual(@as(usize, 1), admitted_answers.query.answers.items.len);
+
+    // The folded side holds the view's extension and nothing else: `b` was
+    // admitted by `p` and related to nothing, `c` was admitted and related
+    // to 2. That `r` also holds (a, 1) is exactly what is no longer there.
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(b, []). v(c, [2]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    _ = try defineCollectingView(&db.state, &catalog, .materialized);
+
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{input.variable("X")}),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    // q(a) :- setof(Y, r(a, Y), []). Nothing discharges the refusal: the view
+    // is not a canonical aggregate view of `r`, and a query asking for an
+    // empty set is not monotonic.
+    var refused_rules = [_]fold_ir.Rule{try collectingQueryRule(
+        &db.state,
+        &catalog.symbols,
+        input.atom("a"),
+        input.list(&.{}),
+    )};
+    defer for (refused_rules) |rule| fold_ir.freeRule(allocator, rule);
+    var refused = try folding.foldQuery(allocator, &catalog, .{
+        .goals = goals,
+        .rules = &refused_rules,
+    });
+    defer refused.deinit();
+    try std.testing.expectEqual(folding.Guarantee.unsupported, refused.guarantee());
+    try std.testing.expectEqual(@as(usize, 1), refused.unsupported.unmet.len);
+    try std.testing.expectEqual(
+        folding.PreconditionKind.relation_read_non_positively,
+        refused.unsupported.unmet[0].kind,
+    );
+
+    // q(c) :- setof(Y, r(c, Y), H!T). The same view, the same relation read
+    // the same way, and this one folds — the query is monotonic.
+    const head = input.variable("H");
+    const tail = input.variable("T");
+    const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
+    var admitted_rules = [_]fold_ir.Rule{try collectingQueryRule(
+        &db.state,
+        &catalog.symbols,
+        input.atom("c"),
+        input.cons(&pair),
+    )};
+    defer for (admitted_rules) |rule| fold_ir.freeRule(allocator, rule);
+    var admitted = try folding.foldQuery(allocator, &catalog, .{
+        .goals = goals,
+        .rules = &admitted_rules,
+    });
+    defer admitted.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, admitted.guarantee());
+    const explained = try admitted.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    });
+    defer allocator.free(explained);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        explained,
+        1,
+        "the query is monotonic",
+    ));
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        admitted.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(@as(usize, 1), tuples.len);
+    try std.testing.expectEqualStrings("c", tuples[0]);
+
+    // And the refusal is load-bearing rather than decorative. The inverse
+    // rules a plan is built from do not depend on which query is being folded,
+    // so the plan just installed *is* the one Example 6.4.1 warns about. Ask
+    // it the refused question and it answers `a`, which the query does not.
+    var counterexample = try db.execute(
+        \\bad(a) :- setof(Y, r(a, Y), []).
+        \\bad(X)?
+    );
+    defer counterexample.deinit();
+    try std.testing.expectEqual(@as(usize, 1), counterexample.query.answers.items.len);
+}
+
+test "a canonical aggregate view folds a query no monotonicity argument covers" {
+    // Theorem 6.4.2. The query is Example 6.4.1's, unchanged and still not
+    // monotonic, and it folds anyway — because the catalog holds a canonical
+    // aggregate view of the relation it counts, and Lemma 6.4.2 makes reading
+    // that view's lists back out equivalent to reading the relation.
+    const allocator = std.testing.allocator;
+
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\r(a, 1). r(c, 2).
+        \\c(X, S) :- r(X, Y), setof(Y2, r(X, Y2), S).
+        \\w(X) :- r(X, Y).
+        \\empty(a) :- setof(Y, r(a, Y), []).
+        \\gone(d) :- setof(Y, r(d, Y), []).
+    );
+    program.deinit();
+    var wanted = try source.execute("empty(X)?");
+    defer wanted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
+    var elsewhere = try source.execute("gone(X)?");
+    defer elsewhere.deinit();
+    try std.testing.expectEqual(@as(usize, 1), elsewhere.query.answers.items.len);
+
+    // The folded side holds both view extensions and no base relation.
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("c(a, [1]). c(c, [2]). w(a). w(c).");
+    facts.deinit();
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+
+    // Two catalogs over the same database, differing in one view. `w(X) :-
+    // r(X, Y)` mentions `r` and remembers only that a key had some value, so
+    // it can reconstruct `r` and cannot prove it complete.
+    var without: view_catalog.Catalog = .init(allocator);
+    defer without.deinit();
+    _ = try defineView(&db.state, &without, input.fact("w", &.{x}), &.{
+        input.relation("r", &.{ x, y }),
+    }, .materialized);
+
+    var with: view_catalog.Catalog = .init(allocator);
+    defer with.deinit();
+    _ = try defineView(&db.state, &with, input.fact("w", &.{x}), &.{
+        input.relation("r", &.{ x, y }),
+    }, .materialized);
+    _ = try defineCanonicalView(&db.state, &with, .materialized);
+
+    // Without the canonical view the fold has nothing to offer, and says so as
+    // the read it could not allow rather than as a missing relation.
+    {
+        const goals = try foldingGoals(&db.state, &without.symbols, &.{
+            input.relation("q", &.{x}),
+        });
+        defer fold_ir.freeGoals(allocator, goals);
+        var rules = [_]fold_ir.Rule{try collectingQueryRule(
+            &db.state,
+            &without.symbols,
+            input.atom("a"),
+            input.list(&.{}),
+        )};
+        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+        var outcome = try folding.foldQuery(allocator, &without, .{
+            .goals = goals,
+            .rules = &rules,
+        });
+        defer outcome.deinit();
+        try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
+        try std.testing.expectEqual(
+            folding.PreconditionKind.relation_read_non_positively,
+            outcome.unsupported.unmet[0].kind,
+        );
+    }
+
+    const goals = try foldingGoals(&db.state, &with.symbols, &.{
+        input.relation("q", &.{x}),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+    var rules = [_]fold_ir.Rule{try collectingQueryRule(
+        &db.state,
+        &with.symbols,
+        input.atom("a"),
+        input.list(&.{}),
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    var outcome = try folding.foldQuery(allocator, &with, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+    const explained = try outcome.explainAlloc(allocator, .{
+        .symbols = &with.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    });
+    defer allocator.free(explained);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        explained,
+        1,
+        "reconstructed exactly, from a canonical aggregate view of it: r/2",
+    ));
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &with.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    // The query's own answer, from the view extensions alone: `r` does relate
+    // `a` to something, so the empty set is not what was collected.
+    try std.testing.expectEqual(@as(usize, 0), answers.answers.items.len);
+
+    // The other half of exactness, which containment alone would not show: the
+    // plan derives all of `r`, so a key `r` never mentions still collects the
+    // empty set and still answers.
+    var absent = try db.execute(
+        \\gone(d) :- setof(Y, r(d, Y), []).
+        \\gone(X)?
+    );
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 1), absent.query.answers.items.len);
+}
+
+test "a view that projected its collected list away still remembers its outer goals" {
+    // Section 6.3.2. The head of `v(X) :- p(X, S), setof(Y, r(X, Y), S)` keeps
+    // neither the set nor anything collected into it, so the plan names that
+    // set with a Skolem term. A name is enough to reconstruct the goals
+    // *outside* the aggregate — they held for some set, and this is which —
+    // and it is not enough to reach the values inside it, because those were
+    // never stored anywhere.
+    const allocator = std.testing.allocator;
+
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(a, [1]). p(b, []).
+        \\r(a, 1).
+        \\v(X) :- p(X, S), setof(Y, r(X, Y), S).
+        \\q(X) :- p(X, S).
+    );
+    program.deinit();
+    var extension = try source.execute("v(X)?");
+    defer extension.deinit();
+    const stored = try answerTuples(&extension.query);
+    defer freeLines(stored);
+    try std.testing.expectEqual(@as(usize, 2), stored.len);
+    var wanted = try source.execute("q(X)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a). v(b).");
+    facts.deinit();
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const s = input.variable("S");
+
+    // What the outer goal remembers comes back exactly: every key `p` had a
+    // tuple for is a key the plan produces.
+    {
+        var catalog: view_catalog.Catalog = .init(allocator);
+        defer catalog.deinit();
+        _ = try defineView(&db.state, &catalog, input.fact("v", &.{x}), &.{
+            input.relation("p", &.{ x, s }),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        }, .materialized);
+
+        var rules = [_]fold_ir.Rule{try foldingRule(
+            &db.state,
+            &catalog.symbols,
+            input.fact("q", &.{x}),
+            &.{input.relation("p", &.{ x, s })},
+        )};
+        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+            input.relation("q", &.{x}),
+        });
+        defer fold_ir.freeGoals(allocator, goals);
+
+        var outcome = try folding.foldQuery(allocator, &catalog, .{
+            .goals = goals,
+            .rules = &rules,
+        });
+        defer outcome.deinit();
+        try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+        var executable = try folding.lowerPlan(
+            allocator,
+            &db.state.strings,
+            &catalog.symbols,
+            outcome.plan().?,
+        );
+        defer executable.deinit();
+        var answers = try runPlan(&db.state, &executable);
+        defer answers.deinit();
+        const actual = try answerTuples(&answers);
+        defer freeLines(actual);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |one, other| try std.testing.expectEqualStrings(one, other);
+    }
+
+    // What the aggregate collected does not, and the plan says so by answering
+    // nothing rather than by guessing. A second database, because the first
+    // now holds the rules of the first plan.
+    var second: Jatalog = .init(allocator);
+    defer second.deinit();
+    var more = try second.execute("v(a). v(b).");
+    more.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    _ = try defineView(&second.state, &catalog, input.fact("v", &.{x}), &.{
+        input.relation("p", &.{ x, s }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &second.state,
+        &catalog.symbols,
+        input.fact("t", &.{ x, y }),
+        &.{input.relation("r", &.{ x, y })},
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&second.state, &catalog.symbols, &.{
+        input.relation("t", &.{ x, y }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{
+        .goals = goals,
+        .rules = &rules,
+    });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &second.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&second.state, &executable);
+    defer answers.deinit();
+    // The source database has r(a, 1), so the query's own answer is one tuple.
+    // Nothing derives membership in a set that was never stored, so the plan
+    // has none — which is containment, and the most a plan over this view can
+    // do.
+    try std.testing.expectEqual(@as(usize, 0), answers.answers.items.len);
+}
+
+/// Two keys and two values, as one bit per possible `r` tuple and one per
+/// possible `p` tuple.
+///
+/// The bound is chosen rather than inherited. Everything the two discharges
+/// turn on occurs somewhere in this space — a key whose collected set is empty
+/// and one whose is not, a key `p` admits and one it withholds, a value
+/// reachable only through a key that was withheld, and a set that grows by one
+/// element — and a configuration outside it is one of these with more names.
+/// Three of each would be `2^3 · 2^9` databases, sixty-four times the work for
+/// the same shapes; the exhaustive sweep over graphs on three nodes already
+/// costs more than half the suite's running time, and this one is meant to sit
+/// beside it rather than double it.
+const Model = struct {
+    const size = 2;
+    const names = [size][]const u8{ "a", "b" };
+    /// Every `r` over the domain, and every `p` over it.
+    const relations = 1 << (size * size);
+    const subsets = 1 << size;
+
+    fn tuple(row: usize, column: usize) u4 {
+        return @as(u4, 1) << @intCast(row * size + column);
+    }
+
+    fn relates(mask: u4, row: usize, column: usize) bool {
+        return mask & tuple(row, column) != 0;
+    }
+
+    fn admits(mask: u2, index: usize) bool {
+        return mask & (@as(u2, 1) << @intCast(index)) != 0;
+    }
+
+    /// Whether anything is related to `column`, which is what the monotonic
+    /// query asks and what a plan reading a subset of `r` can only under-report.
+    fn reaches(mask: u4, column: usize) bool {
+        for (0..size) |row| if (relates(mask, row, column)) return true;
+        return false;
+    }
+
+    /// Adds one stored tuple whose last column is the list of everything the
+    /// row is related to.
+    fn addCollected(
+        db: *database.Database,
+        predicate: []const u8,
+        mask: u4,
+        row: usize,
+    ) !void {
+        var values: [size]input.Term = undefined;
+        var held: usize = 0;
+        for (0..size) |column| if (relates(mask, row, column)) {
+            values[held] = input.atom(names[column]);
+            held += 1;
+        };
+        try addFactTerms(db, predicate, &.{
+            input.atom(names[row]),
+            input.list(values[0..held]),
+        });
+    }
+
+    fn indexOf(answer: results.Answer, position: usize) !usize {
+        const text = try answer.bindings.items[position].value.getAtom();
+        return text[0] - 'a';
+    }
+};
+
+test "bounded exhaustive models find no counterexample to either discharge" {
+    // Both guarantees, checked by exhaustion rather than by argument, with the
+    // oracle computed by bit operations: a sweep that asked the engine what
+    // the answers were and then asked it again through a plan would agree with
+    // itself whatever either one did.
+    const allocator = std.testing.allocator;
+
+    // The monotonic discharge. `q(X) :- p(X), setof(Y, r(Y, X), H!T)` asks for
+    // some value to reach `X`, and the plan knows `r` only for the keys `p`
+    // admitted, so it can miss a value and can never invent one.
+    var planned: Jatalog = .init(allocator);
+    defer planned.deinit();
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    _ = try defineCollectingView(&planned.state, &catalog, .materialized);
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const head = input.variable("H");
+    const tail = input.variable("T");
+    const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &planned.state,
+        &catalog.symbols,
+        input.fact("q", &.{x}),
+        &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ y, x })}, input.cons(&pair)),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&planned.state, &catalog.symbols, &.{
+        input.relation("q", &.{x}),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{
+        .goals = goals,
+        .rules = &rules,
+    });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+    var executable = try folding.lowerPlan(
+        allocator,
+        &planned.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    try installPlan(&planned.state, &executable);
+
+    var answered: usize = 0;
+    for (0..Model.subsets) |admitted| {
+        const keys: u2 = @intCast(admitted);
+        for (0..Model.relations) |related| {
+            const edges: u4 = @intCast(related);
+            var folded = try planned.clone();
+            defer folded.deinit();
+            for (0..Model.size) |key| {
+                if (Model.admits(keys, key))
+                    try Model.addCollected(&folded.state, "v", edges, key);
+            }
+
+            var produced = try statement.queryClauses(&folded.state, executable.goals);
+            defer produced.deinit();
+            for (produced.answers.items) |answer| {
+                const column = try Model.indexOf(answer, 0);
+                if (!Model.admits(keys, column) or !Model.reaches(edges, column)) {
+                    std.debug.print("\np {b} r {b}: the plan answered {s}\n", .{
+                        keys,
+                        edges,
+                        Model.names[column],
+                    });
+                    return error.AnswerNotContained;
+                }
+                answered += 1;
+            }
+        }
+    }
+    // A plan that answers nothing is contained in anything, so the sweep has
+    // to have seen answers for its agreement to mean anything.
+    try std.testing.expect(answered > 0);
+
+    // The canonical-view discharge, held to the stronger claim its proof
+    // makes. Lemma 6.4.2 says the reconstruction of `r` is *equivalent* rather
+    // than merely contained, so `q(a) :- setof(Y, r(a, Y), [])` must answer
+    // exactly when the query does — including when it answers and a merely
+    // contained plan would have been allowed to stay silent.
+    var canonical: Jatalog = .init(allocator);
+    defer canonical.deinit();
+    var exact: view_catalog.Catalog = .init(allocator);
+    defer exact.deinit();
+    _ = try defineCanonicalView(&canonical.state, &exact, .materialized);
+
+    var counting = [_]fold_ir.Rule{try collectingQueryRule(
+        &canonical.state,
+        &exact.symbols,
+        input.atom("a"),
+        input.list(&.{}),
+    )};
+    defer for (counting) |rule| fold_ir.freeRule(allocator, rule);
+    const asked = try foldingGoals(&canonical.state, &exact.symbols, &.{
+        input.relation("q", &.{x}),
+    });
+    defer fold_ir.freeGoals(allocator, asked);
+
+    var folding_outcome = try folding.foldQuery(allocator, &exact, .{
+        .goals = asked,
+        .rules = &counting,
+    });
+    defer folding_outcome.deinit();
+    try std.testing.expectEqual(
+        folding.Guarantee.maximally_contained,
+        folding_outcome.guarantee(),
+    );
+    var counted = try folding.lowerPlan(
+        allocator,
+        &canonical.state.strings,
+        &exact.symbols,
+        folding_outcome.plan().?,
+    );
+    defer counted.deinit();
+    try installPlan(&canonical.state, &counted);
+
+    for (0..Model.relations) |related| {
+        const edges: u4 = @intCast(related);
+        var folded = try canonical.clone();
+        defer folded.deinit();
+        for (0..Model.size) |key| {
+            var holds = false;
+            for (0..Model.size) |column| holds = holds or Model.relates(edges, key, column);
+            if (holds) try Model.addCollected(&folded.state, "c", edges, key);
+        }
+
+        var produced = try statement.queryClauses(&folded.state, counted.goals);
+        defer produced.deinit();
+        var empty = true;
+        for (0..Model.size) |column| empty = empty and !Model.relates(edges, 0, column);
+        const expected: usize = if (empty) 1 else 0;
+        if (produced.answers.items.len != expected) {
+            std.debug.print("\nr {b}: the plan answered {d}, the query {d}\n", .{
+                edges,
+                produced.answers.items.len,
+                expected,
+            });
+            return error.AnswersDiffer;
+        }
+    }
+}
+
+/// Folds and runs the smallest problem that exercises both of F4's discharges
+/// at once: a canonical aggregate view making a relation exact, a second view
+/// that projects its collected list away and names the set instead, and a
+/// query counting the relation that neither is monotonic about.
+///
+/// Deliberately one fact and one rule. An allocation-failure sweep runs the
+/// scenario once per allocation it makes, so its cost is quadratic in its own
+/// size and two larger ones already exist.
+fn restrictedFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("c(a, [1]). v(a).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    _ = try defineCanonicalView(&db.state, &catalog, .materialized);
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const s = input.variable("S");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{x}), &.{
+        input.relation("p", &.{ x, s }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try collectingQueryRule(
+        &db.state,
+        &catalog.symbols,
+        input.atom("a"),
+        input.list(&.{}),
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{x}),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    allocator.free(try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    }));
+    if (outcome.guarantee() != .maximally_contained) return error.UnexpectedGuarantee;
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    answers.deinit();
+}
+
+test "folding under the restricted classes releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(restrictedFoldingAllocationScenario);
 }
