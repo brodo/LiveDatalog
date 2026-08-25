@@ -180,6 +180,9 @@ pub const Predicate = union(enum) {
     /// the tuples whose columns were Skolem terms, spread across the arguments
     /// those terms were applied to.
     generated: GeneratedRef,
+    /// A relation the fold defines itself, with a meaning of its own rather
+    /// than one borrowed from a query or a view.
+    auxiliary: Auxiliary,
 
     pub const ViewRef = struct { id: ViewId, name: syntax.Id, arity: usize };
 
@@ -197,6 +200,7 @@ pub const Predicate = union(enum) {
             .base => |key| key.arity,
             .view => |reference| reference.arity,
             .generated => |reference| reference.arity,
+            .auxiliary => |relation| relation.arity(),
         };
     }
 
@@ -216,6 +220,34 @@ pub const Predicate = union(enum) {
                     reference.origin.arity == other_reference.origin.arity,
                 else => false,
             },
+            .auxiliary => |relation| switch (other) {
+                .auxiliary => |other_relation| relation == other_relation,
+                else => false,
+            },
+        };
+    }
+};
+
+/// A relation a fold defines for itself. Unlike a split, it does not stand for
+/// part of a relation the query named — it means the same thing in every plan,
+/// and the fold supplies the rules that derive it.
+pub const Auxiliary = enum {
+    /// `member(X, L)`: `X` is one of the values in the list `L`. What reads a
+    /// value back out of an aggregate output a view stored.
+    member,
+
+    pub fn arity(self: Auxiliary) usize {
+        return switch (self) {
+            .member => 2,
+        };
+    }
+
+    /// The spelling it prints and executes under. The `$` is the hygiene rule:
+    /// a program cannot name this relation, so a plan defining it cannot
+    /// collide with one.
+    pub fn text(self: Auxiliary) []const u8 {
+        return switch (self) {
+            .member => "$member",
         };
     }
 };
@@ -424,6 +456,11 @@ pub const Substitution = struct {
 
     pub fn get(self: *const Substitution, variable: Variable) ?Term {
         return self.entries.get(variable);
+    }
+
+    /// Withdraws a replacement, so that a scope which introduced one can end.
+    pub fn remove(self: *Substitution, variable: Variable) void {
+        _ = self.entries.swapRemove(variable);
     }
 };
 
@@ -844,6 +881,7 @@ pub fn writePredicate(
             names.strings.resolve(reference.origin.name),
             reference.tag,
         }),
+        .auxiliary => |relation| try writer.writeAll(relation.text()),
     }
 }
 

@@ -70,6 +70,9 @@ pub const TransformationKind = enum {
     view_inverted,
     /// A relation the query reads is no longer read: the plan derives it.
     relation_reconstructed,
+    /// The plan defines what it means to be in a list, because some view
+    /// stored a collected one and the values inside it had to be read back.
+    membership_defined,
     /// The relations a reconstruction could not name a value in were split, so
     /// that every term the plan runs on is an ordinary value.
     skolem_terms_eliminated,
@@ -83,6 +86,7 @@ pub const TransformationKind = enum {
             .query_left_unchanged => "query reads only available relations",
             .view_inverted => "inverted into rules reconstructing what its body read",
             .relation_reconstructed => "reconstructed by the plan instead of read",
+            .membership_defined => "membership in a stored list is defined by the plan",
             .skolem_terms_eliminated => "relations split so that no reconstructed value stays unnameable",
             .instances_dropped => "instances that would have read a reconstructed value were dropped",
         };
@@ -114,6 +118,13 @@ pub const PreconditionKind = enum {
     /// A view mentioning a relation the query needs builds or reads a list,
     /// which is F5's.
     view_definition_uses_lists,
+    /// A view mentioning a relation the query needs projects away the list its
+    /// aggregate collected, leaving nothing for the plan to read members out
+    /// of. That is F4's Skolem set.
+    view_definition_projects_aggregate_output,
+    /// A view mentioning a relation the query needs collects a value its own
+    /// outer goals bind and its head does not keep.
+    view_definition_correlates_template,
     /// The query reads a relation under negation or inside an aggregate that
     /// the plan would know only as far as the views prove it — a reconstructed
     /// relation, or one the query derives from one. Such a relation holds what
@@ -130,8 +141,13 @@ pub const PreconditionKind = enum {
             .view_withheld => "the availability policy withholds this view's extension",
             .relation_not_reconstructible => "only views that cannot be inverted mention it",
             .view_definition_recursive => "its definition reads the relation it defines",
-            .view_definition_not_conjunctive => "its definition is not a conjunction of positive relations",
-            .view_definition_uses_lists => "its definition mentions a list",
+            .view_definition_not_conjunctive => "its definition is not a conjunction of " ++
+                "relations and aggregates",
+            .view_definition_uses_lists => "its definition mentions a list outside its aggregate",
+            .view_definition_projects_aggregate_output => "its head does not keep what its " ++
+                "aggregate collected",
+            .view_definition_correlates_template => "its aggregate collects a value its own " ++
+                "outer goals bind",
             .relation_read_non_positively => "known only as far as the views prove it, " ++
                 "and read under negation or inside an aggregate",
             .predicate_name_ambiguous => "another relation the plan may read stores under this name",
@@ -355,13 +371,19 @@ pub fn foldQuery(
         for (combined.items) |rule| fold_ir.freeRule(allocator, rule);
         combined.deinit(allocator);
     }
+    var members = false;
     for (wanted.items) |id| {
         var inverted = try inversion.invert(allocator, &catalog.symbols, catalog.view(id));
         errdefer inverted.deinit();
         try combined.ensureUnusedCapacity(allocator, inverted.rules.len);
         combined.appendSliceAssumeCapacity(inverted.rules);
         allocator.free(inverted.take());
+        members = members or inverted.reads_members;
     }
+    // Reading a value back out of a stored list needs the rules that say what
+    // being in a list means. They are the plan's own, added once however many
+    // views turned out to need them.
+    if (members) try inversion.appendMemberRules(allocator, &catalog.symbols, &combined);
     for (query.rules) |rule| {
         const copy = try fold_ir.cloneRule(allocator, rule);
         errdefer fold_ir.freeRule(allocator, copy);
@@ -378,7 +400,14 @@ pub fn foldQuery(
 
     const goals = try fold_ir.cloneGoals(allocator, query.goals);
     errdefer fold_ir.freeGoals(allocator, goals);
-    const transformations = try describe(allocator, catalog, &reads, wanted.items, eliminated);
+    const transformations = try describe(
+        allocator,
+        catalog,
+        &reads,
+        wanted.items,
+        members,
+        eliminated,
+    );
     return .{ .folded = .{
         .allocator = allocator,
         .guarantee = if (eliminated.dropped) .contained else .maximally_contained,
@@ -420,9 +449,9 @@ const Reads = struct {
                     if (!positive or relation.negated) entry.value_ptr.* = true;
                 },
                 .view => |reference| try self.views.put(self.allocator, reference.id, {}),
-                // Nothing lowered from a query holds one, and a plan is not
-                // folded a second time.
-                .generated => unreachable,
+                // Nothing lowered from a query holds either, and a plan is
+                // not folded a second time.
+                .generated, .auxiliary => unreachable,
             },
             // An aggregate reads its body to count what is in it, which a
             // reconstruction cannot stand in for however the body is written.
@@ -432,11 +461,14 @@ const Reads = struct {
     }
 };
 
+/// The relation a query rule defines. Only the query's own rules are asked,
+/// and lowering makes every one of their heads a base relation; the fold's own
+/// rules are never passed through here.
 fn headKey(rule: fold_ir.Rule) relation_store.PredicateKey {
     return switch (rule.head.predicate) {
         .base => |key| key,
         .view => |reference| .{ .name = reference.name, .arity = reference.arity },
-        .generated => |reference| reference.origin,
+        .generated, .auxiliary => unreachable,
     };
 }
 
@@ -489,6 +521,8 @@ fn examine(
                         .recursive => .view_definition_recursive,
                         .not_conjunctive => .view_definition_not_conjunctive,
                         .lists => .view_definition_uses_lists,
+                        .aggregate_output_projected => .view_definition_projects_aggregate_output,
+                        .aggregate_template_correlated => .view_definition_correlates_template,
                     },
                     .subject = candidate.predicate(),
                 });
@@ -561,7 +595,9 @@ fn readsInexact(
     for (goals) |goal| switch (goal) {
         .relation => |relation| switch (relation.predicate) {
             .base => |key| if (inexact.contains(key)) return true,
-            .view, .generated => {},
+            // A view's stored extension is exact whatever it was computed
+            // from, and so is a value read back out of one.
+            .view, .generated, .auxiliary => {},
         },
         .aggregate => |aggregate| if (readsInexact(aggregate.body, inexact)) return true,
         .builtin => {},
@@ -573,9 +609,17 @@ fn readsInexact(
 /// question over every view at once; a fold needs it per view, because which
 /// view it was decides what gets inverted.
 fn viewReads(view: *const view_catalog.View, key: relation_store.PredicateKey) bool {
-    for (view.definition.body) |goal| switch (goal) {
+    return goalsRead(view.definition.body, key);
+}
+
+fn goalsRead(goals: []const fold_ir.Goal, key: relation_store.PredicateKey) bool {
+    for (goals) |goal| switch (goal) {
         .relation => |relation| if (relation.predicate.equals(.{ .base = key })) return true,
-        else => {},
+        // What an aggregate collected is read from the relations in its body,
+        // which are as much a part of what the view remembers as its outer
+        // goals are.
+        .aggregate => |aggregate| if (goalsRead(aggregate.body, key)) return true,
+        .builtin => {},
     };
     return false;
 }
@@ -611,6 +655,7 @@ fn describe(
     catalog: *const view_catalog.Catalog,
     reads: *const Reads,
     wanted: []const fold_ir.ViewId,
+    members: bool,
     eliminated: inversion.Elimination,
 ) ![]Transformation {
     var notes: std.ArrayList(Transformation) = .empty;
@@ -626,6 +671,7 @@ fn describe(
             .subject = .{ .base = key },
         });
     }
+    if (members) try notes.append(allocator, .{ .kind = .membership_defined });
     if (eliminated.split) try notes.append(allocator, .{ .kind = .skolem_terms_eliminated });
     if (eliminated.dropped) try notes.append(allocator, .{ .kind = .instances_dropped });
     return notes.toOwnedSlice(allocator);
@@ -793,6 +839,7 @@ const Lowering = struct {
                 }) catch return error.OutOfMemory;
                 break :blk self.strings.intern(spelling.written());
             },
+            .auxiliary => |relation| try self.strings.intern(relation.text()),
         };
     }
 

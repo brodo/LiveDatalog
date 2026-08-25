@@ -260,6 +260,24 @@ relations behind it. `v` above records that *some* node sits between `X` and
 internal term the plan can join on but never return. A query for paths of any
 length, folded over `v`, gets the paths of even length.
 
+A view that *collects* is inverted the same way, read in the other direction.
+Given `v(X, S) :- p(X, Z), setof(Y, r(X, Y), S)`, the stored list is the
+evidence: every value in it is an `r` fact that must have been there, so the
+plan reaches them one at a time.
+
+```text
+p(X, f(X, S)) :- v(X, S).
+r(X, Y)       :- v(X, S), member(Y, S).
+```
+
+`p` survives only as "there was a tuple here", because the view kept nothing of
+`Z`; `r` survives exactly, because the list kept all of it. What the head must
+keep is the list — a definition that writes it down (`[a, b]`, `[]`, or a
+partial `[a!T]`) fixes it just as firmly as a variable does. Aggregates nest,
+and nesting chains: collecting `Y!T` pairs means binding one of them binds the
+inner list `T`, which is the next list to read out of. Aggregates side by side
+each collect for themselves, whatever names they happen to share.
+
 ### When a fold is refused
 
 `unsupported` is the honest answer rather than a plan that is not contained in
@@ -268,9 +286,11 @@ the query. A fold is refused when:
 - **a relation is not reachable at all** — nothing declares it available and no
   view's body mentions it;
 - **the only views that mention it cannot be inverted** — a definition that
-  reads what it defines is recursive, one containing `setof` or a negated goal
-  is not conjunctive, and one mentioning a list needs the functional-dependency
-  work; each is reported separately, naming the view;
+  reads what it defines is recursive, one containing a negated goal or a
+  comparison is not conjunctive, one mentioning a list outside an aggregate
+  needs the functional-dependency work, and one whose head does not keep the
+  list its aggregate collected leaves a set the plan cannot name; each is
+  reported separately, naming the view;
 - **a view's extension is withheld** by the availability policy;
 - **two relations a plan may read share a name and arity**, which a lowered
   plan could not tell apart;

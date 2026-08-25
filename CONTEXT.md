@@ -196,9 +196,26 @@ that view yields, because the reconstructed facts have to join back up.
 Chapter 6's even-length paths only exist because the node between `X` and `Z`
 is the same `f(X, Z)` in both halves.
 
-Only non-recursive conjunctions of positive base relations are inverted. An
-aggregate is F3's, a list is F5's, and a definition reading what it defines is
-recursion inversion cannot bound; each is reported as the precondition it is.
+A definition may also *collect*: `setof` gathers every value satisfying its
+body into one list. Inverting that reads the list back — each value in it is a
+fact the aggregate's body must have had — through `$member`, a relation the
+fold defines itself with three rules rather than a builtin, because a list the
+database holds already holds each of its own tails. What the head must keep is
+the *list*, not a variable holding one: a definition that wrote it down fixes
+it just as firmly. Aggregates nest by chaining, since collecting `Y!T` pairs
+means binding one of them binds the inner list `T`; and two aggregates side by
+side mean their own values by the names they share, so each gets its own
+Skolem functions.
+
+A value projected out of an aggregate's own body has one witness per collected
+value rather than one per stored tuple, so its Skolem term is applied to the
+collected value too. A value the definition binds outside its aggregates keeps
+the per-tuple naming, which is what preserves the join between the two halves.
+
+Only non-recursive conjunctions of positive base relations and such aggregates
+are inverted. A list outside an aggregate is F5's, a collected list the head
+does not keep is F4's, and a definition reading what it defines is recursion
+inversion cannot bound; each is reported as the precondition it is.
 Because a catalog holds one rule per view, self-reference is the only recursion
 a definition can express — mutual recursion between views is not representable
 rather than undetected. A relation read under negation or inside an aggregate

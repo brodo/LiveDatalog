@@ -1474,6 +1474,82 @@ F2 was completed on 2026-08-11:
   inversion.
 - Rewrite application terminates and produces deterministic plans.
 
+### Completed decisions
+
+F3 was completed on 2026-08-11:
+
+- The two normalization algorithms of Appendix A.1 are **not** implemented, and
+  the cases they exist for are handled directly instead. Algorithm 1.1 splits a
+  view with a nested aggregate into an auxiliary relation plus a rule, and
+  Algorithm 1.2 chains a view with several aggregates through a sequence of
+  them. Both introduce relations with *no stored extension*, so a plan would
+  have to reconstruct an auxiliary and then invert it again — and Algorithm 1.2
+  is printed in a form too garbled to follow faithfully. Reading the shapes
+  directly is simpler and covers the same class:
+  - a nested aggregate needs no rewriting because the enclosing template
+    already binds its list. Collecting `Y!T` pairs means binding one of them
+    binds `T`, so the inner relation is reconstructed by chaining a second
+    membership goal after the first;
+  - sibling aggregates need no chaining either, only their own identities. Each
+    gets its own membership goal, and — this is what the rewriting was really
+    buying — its own variables, so that two aggregates spelling a collected or
+    projected value alike do not become one.
+- `member` is three rules, not a language feature. Adding a builtin would have
+  put a list-destructuring operation into the evaluator for the sake of the
+  folder, and it is not needed: a list the database holds already holds each of
+  its own tails as interned values, so `$member(H, H!T) :- T = []`, plus the
+  first value of a longer list and everything its tail already had, derives
+  exactly the membership facts over the lists that exist. They are seeded
+  structural rules, which is a class the engine already admits.
+- What the head must keep is the *list*, not a variable holding one. A
+  definition that writes the collected list down — `[a, b]`, `[]`, or a partial
+  `[a!T]` whose tail the head keeps — fixes it exactly as firmly as a variable
+  does, and the plan reads members out of the literal. The condition is
+  therefore "every variable in the output occurs in the head, or in an
+  enclosing template", which makes the ground, empty, structural and nested
+  cases one rule rather than four. An output the head genuinely projects away
+  is the one refusal, and it is F4's Skolem set.
+- Two soundness bugs were found by writing the tests, and both are places where
+  the dissertation's Definition 6.3.1 is not enough to go on. A value projected
+  out of an aggregate's *own body* has one witness per collected value, not one
+  per stored tuple: Definition 6.3.1 names it `h(X̄, S)`, and naming every
+  element's witness alike lets a query join two elements through a witness the
+  database never had. The Skolem term is now applied to the collected value as
+  well. A value the definition binds *outside* its aggregates keeps the
+  per-tuple naming, because that is what preserves the join between the outer
+  and inner halves — the `Z̄` of Definition 6.3.1 is exactly that case.
+- The second bug is the sibling one, and it is about the language rather than
+  the algorithm. A value the surrounding goals do not bind belongs to the
+  aggregate that mentions it, so `setof(Y, r(X, Y, W), S1), setof(Y, t(X, Y,
+  W), S2)` has two independent `Y`s and two independent `W`s, however the rule
+  spells them. Skolem functions are therefore keyed by the aggregate as well as
+  the variable, and a collected value's binding is withdrawn when its aggregate
+  ends. Both tests fail with two answers and one answer respectively when the
+  keying is removed.
+- The `setof` identities `σs` are deferred to F4 rather than implemented here,
+  and the reason is that they would have nothing to fire on. `σs1` and `σs2`
+  rewrite an expansion containing a Skolem *set*, which only the projected
+  output case produces — and F2 already refuses a query that reads a
+  reconstructed relation inside an aggregate, which is the other way such an
+  expansion could arise. Implementing them now would mean writing a rewrite
+  system, proving it terminating, and testing it against no input. F4 inverts
+  the projected case and needs them in the same breath.
+- Membership is defined once per plan however many views turn out to need it,
+  and it is the plan's own relation rather than a view's: `$member` is a
+  `Predicate.auxiliary`, a fold-owned relation with a meaning of its own, as
+  against a `Predicate.generated`, which stands for part of a relation the
+  query named. The `$` keeps it out of reach of any program.
+- Not performance relevant to the engine: nothing in this phase runs during
+  evaluation and no benchmark changed. The suite goes from 159 tests to 168 in
+  the same wall clock.
+- One limit worth writing down. An aggregate whose template shares a variable
+  with the goals surrounding it is refused rather than inverted. Such a
+  variable would have to be read back out of the list *and* named by a Skolem
+  term because the head lost it, and there is no reading of the definition
+  under which those agree. It is a strange thing to write — the language admits
+  it, and it means the aggregate collects a value that is already fixed — so
+  the refusal costs nothing real.
+
 ## F4: projected aggregate output and soundness restrictions
 
 ### Scope
@@ -1565,8 +1641,8 @@ Use one session and one commit per phase unless a phase proves too large:
 13. P3 join planning and aggregate lookup — **done 2026-08-07**
 14. F1 folding IR and view catalog — **done 2026-08-11**
 15. F2 ordinary Inverse Method — **done 2026-08-11**
-16. F3 conjunctive aggregate inversion — **next**
-17. F4 soundness restrictions
+16. F3 conjunctive aggregate inversion — **done 2026-08-11**
+17. F4 soundness restrictions — **next**
 18. F5 list functions and dependency chase
 19. F6 execution and view selection
 

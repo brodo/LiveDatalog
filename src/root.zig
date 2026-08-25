@@ -4602,3 +4602,355 @@ test "a predicate the query derives from a reconstruction is no more exact than 
         outcome.unsupported.unmet[0].kind,
     );
 }
+
+test "inverting a view that collected a list reads the values back out of it" {
+    // Chapter 6's Example 6.3.1. The view keeps a list of everything `r`
+    // related each key to, so inverting it recovers `r` one list element at a
+    // time, and recovers `p` only as far as saying a tuple was there.
+    const allocator = std.testing.allocator;
+
+    // The database behind the view, kept only to say what the query really
+    // answers and what the view really stores. The plan never sees it.
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(a, 1). p(b, 2). p(c, 3).
+        \\r(a, b). r(a, c). r(c, a). r(c, c).
+        \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
+        \\q(X, Y) :- r(X, Y), p(Y, Z).
+    );
+    program.deinit();
+    var extension = try source.execute("v(X, S)?");
+    defer extension.deinit();
+    const stored = try answerTuples(&extension.query);
+    defer freeLines(stored);
+    for ([_][]const u8{ "a [b, c]", "b []", "c [a, c]" }, stored) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    var wanted = try source.execute("q(X, Y)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+
+    // The folded side holds that extension and nothing else.
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a, [b, c]). v(b, []). v(c, [a, c]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    const s = input.variable("S");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, s }), &.{
+        input.relation("p", &.{ x, z }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ x, y }),
+        &.{ input.relation("r", &.{ x, y }), input.relation("p", &.{ y, z }) },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+
+    // On this database the plan loses nothing: what the view kept is enough to
+    // answer the query exactly. The dissertation's printed answer list omits
+    // q(a, b), which both the query and the plan produce — `p(b, 2)` is what
+    // makes `b` a value `p` relates, and the empty list `v(b, [])` is what
+    // records it.
+    const actual = try answerTuples(&answers);
+    defer freeLines(actual);
+    try std.testing.expectEqual(@as(usize, 4), actual.len);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |wanted_tuple, produced|
+        try std.testing.expectEqualStrings(wanted_tuple, produced);
+}
+
+test "a value projected out of an aggregate is a witness per element, not per tuple" {
+    // The join a shared name would invent. `W` is projected out of the
+    // aggregate's own body, so the definition claims a witness for each value
+    // the list collected — not one witness for the whole list. Naming them all
+    // alike would let the query below join two elements through a `W` the
+    // database never had in common.
+    const allocator = std.testing.allocator;
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(a).
+        \\r(a, b, 1). r(a, c, 2).
+        \\v(X, S) :- p(X), setof(Y, r(X, Y, W), S).
+        \\q(Y1, Y2) :- r(X, Y1, W), r(X, Y2, W), Y1 != Y2.
+    );
+    program.deinit();
+    var wanted = try source.execute("q(A, B)?");
+    defer wanted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a, [b, c]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const w = input.variable("W");
+    const s = input.variable("S");
+    const first = input.variable("Y1");
+    const second = input.variable("Y2");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, s }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y, w })}, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ first, second }),
+        &.{
+            input.relation("r", &.{ x, first, w }),
+            input.relation("r", &.{ x, second, w }),
+            input.notEqual(first, second),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(
+        &db.state,
+        &catalog.symbols,
+        &.{input.relation("q", &.{ first, second })},
+    );
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    try std.testing.expectEqual(@as(usize, 0), answers.answers.items.len);
+}
+
+test "an aggregate nested in another is read by chaining into the list it collected" {
+    // The dissertation reaches this case by rewriting the view into one rule
+    // per aggregate. Reading it directly is what the shape already says: the
+    // outer list collects `Y!T` pairs, so binding one of them binds `T`, and
+    // `T` is the inner list to read the next value out of.
+    const allocator = std.testing.allocator;
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(a).
+        \\r(a, b). r(a, c).
+        \\s(b, 1). s(b, 2). s(c, 3).
+        \\v(X, S) :- p(X), setof(Y!T, (r(X, Y), setof(Z, s(Y, Z), T)), S).
+        \\q(Y, Z) :- s(Y, Z), r(X, Y).
+    );
+    program.deinit();
+    var extension = try source.execute("v(X, S)?");
+    defer extension.deinit();
+    const stored = try answerTuples(&extension.query);
+    defer freeLines(stored);
+    try std.testing.expectEqualStrings("a [[b, 1, 2], [c, 3]]", stored[0]);
+    var wanted = try source.execute("q(A, B)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a, [[b, 1, 2], [c, 3]]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    const pair: input.Term.Cons = .{ .head = &y, .tail = &t };
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, s }), &.{
+        input.relation("p", &.{x}),
+        input.setof(input.cons(&pair), &.{
+            input.relation("r", &.{ x, y }),
+            input.setof(z, &.{input.relation("s", &.{ y, z })}, t),
+        }, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ y, z }),
+        &.{ input.relation("s", &.{ y, z }), input.relation("r", &.{ x, y }) },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ y, z })});
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+
+    // Everything the query answers, from the nested list alone.
+    const actual = try answerTuples(&answers);
+    defer freeLines(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |wanted_tuple, produced|
+        try std.testing.expectEqualStrings(wanted_tuple, produced);
+}
+
+test "two aggregates side by side collect for themselves, not for each other" {
+    // Both aggregates spell the collected value `Y` and the projected value
+    // `W`, and the language says each means its own — a value the surrounding
+    // goals do not bind belongs to the aggregate that mentions it. Inverting
+    // them as one would name both witnesses alike and join `r` to `t` through
+    // a `W` the database never had in common.
+    const allocator = std.testing.allocator;
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\p(a).
+        \\r(a, b, 1). t(a, b, 2).
+        \\v(X, S1, S2) :- p(X), setof(Y, r(X, Y, W), S1), setof(Y, t(X, Y, W), S2).
+        \\q(Y1, Y2) :- r(X, Y1, W), t(X, Y2, W).
+    );
+    program.deinit();
+    var wanted = try source.execute("q(A, B)?");
+    defer wanted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a, [b], [b]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const w = input.variable("W");
+    const first = input.variable("S1");
+    const second = input.variable("S2");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, first, second }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y, w })}, first),
+        input.setof(y, &.{input.relation("t", &.{ x, y, w })}, second),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ input.variable("Y1"), input.variable("Y2") }),
+        &.{
+            input.relation("r", &.{ x, input.variable("Y1"), w }),
+            input.relation("t", &.{ x, input.variable("Y2"), w }),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ input.variable("Y1"), input.variable("Y2") }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    try std.testing.expectEqual(@as(usize, 0), answers.answers.items.len);
+}
+
+/// Folds and runs one small collecting view: a definition with an aggregate,
+/// the membership rules the plan defines to read its list, the Skolem term the
+/// projected outer value needs, and the answers.
+fn collectingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v(a, [b]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const z = input.variable("Z");
+    const s = input.variable("S");
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, s }), &.{
+        input.relation("p", &.{ x, z }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    var rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ x, y }),
+        &.{ input.relation("r", &.{ x, y }), input.relation("p", &.{ y, z }) },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    allocator.free(try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    }));
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    answers.deinit();
+}
+
+test "inverting a collecting view releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(collectingAllocationScenario);
+}
