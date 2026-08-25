@@ -535,6 +535,12 @@ up exactly.
 batch; a source file of 2000 facts does not, because the parser opens a
 transaction per statement.
 
+**This one held, and it was the largest constant factor on the list.** Measured
+directly it is 248 ms against 0.6 ms for the same 2000 facts, which is 398x and
+is all copying. The completed decisions below record what a run of consecutive
+assertions sharing one transaction was worth: 268x, to within 1.51x of the
+batch.
+
 **The pattern index allocates one `ArrayList` per group.** This forced three
 separate accommodations rather than one fix: index construction is expensive
 enough that P3 made `lookup` defer building to the second request; copying is
@@ -560,10 +566,11 @@ speed in either direction. The benchmarks are.
   ordering, canonicalization, and `setof` are untouched and the map is a pure
   lookup accelerator. Both tables are cloned, so decide the same
   copy-versus-rebuild question the store's caches answered.
-- Let a run of consecutive assertions share one statement transaction, without
-  weakening the guarantee that a failure leaves every earlier statement and
-  none of the failing one. This touches the transaction model and is the
-  riskiest item here; it may reasonably be split out or declined.
+- **Done 2026-08-25.** Let a run of consecutive assertions share one statement
+  transaction, without weakening the guarantee that a failure leaves every
+  earlier statement and none of the failing one. This touches the transaction
+  model and is the riskiest item here; it may reasonably be split out or
+  declined.
 - Reconsider the pattern index layout — a flat `[]u32` grouped by key plus a
   map to ranges is cheap to build and cheap to copy. The obstacle is
   `noteInserted`, which appends to a group in place; a layout that cannot
@@ -607,7 +614,9 @@ attribute.
 ### Completed decisions
 
 **The first item — a hash index beside each value table — was completed on
-2026-08-25.** The other three have not been started. These are its decisions.
+2026-08-25, and the second — one transaction per run of assertions — on the
+same day.** The remaining two have not been started. The first item's decisions
+come first; the second item's follow, under its own heading.
 
 - `intern_index.Index` is an open-addressed table of *positions*: a slot holds
   one more than an identifier so that zero means empty, and nothing else is
@@ -670,6 +679,98 @@ unit of work.
   the deferred build and the density gate — is untouched by this item: neither
   rule was consulted or altered, because a value table's index is not a
   relation's.
+
+**The second item — one transaction per run of consecutive assertions — was
+completed on 2026-08-25.** These are its decisions.
+
+- **The acceptance test came first.** P4 named one acceptance test the suite
+  did not already prove — a source file of interleaved assertions, queries and
+  retractions committing and rolling back statement by statement — and the
+  reason it did not was that the tests standing in for it passed because
+  nothing had changed. So it was written against the unchanged engine, watched
+  to pass, and only then was the transaction model touched. It is `root.zig`'s
+  "a source program commits and rolls back one statement at a time", which
+  interleaves the three statement kinds and then puts a failing statement in
+  the middle of a run of assertions, and its companion "an allocation failure
+  leaves a source program's statements as a prefix", which sweeps the failure
+  point across a four-assertion program and requires that whatever reached the
+  database is a *prefix* of the program — never a partial statement and never a
+  later statement without an earlier one.
+- A rolled-back statement's interning is observable, not merely untidy, and
+  that is what ruled out the cheap implementation. A value the database does
+  not hold still joins the seed set of admissible structural recursion — see
+  `statement.evaluateClauses`, which expands when the value table grew — so a
+  statement that failed after interning a novel ground structure could derive
+  facts. The acceptance test asserts the exact `internStats` entry counts
+  across a failing statement for that reason.
+- **Rejected: replaying the prefix.** The obvious cheap design runs the whole
+  run optimistically and, on failure, discards the copy and re-executes
+  statements one at a time down the old path — deterministic, and by
+  construction exactly today's behaviour. It fails on the one failure that can
+  strike anywhere: `std.testing.FailingAllocator` does not advance its index
+  when it denies an allocation, so once it starts failing it never stops, and a
+  replay would lose the whole prefix rather than reproduce it. The nineteen
+  sweeps would not have caught that — they check for leaks, not for what
+  survived — which is precisely why the acceptance test asks for the prefix.
+- **What is undone, and what is instead made atomic.** Interning is the one
+  thing a statement cannot undo where it happens: it goes on across many calls
+  while parsing, long before the statement knows whether it will succeed. So
+  `Database.savepoint` records the three interning tables' lengths and
+  `Database.rollback` truncates them back — identifiers are insertion
+  positions, so truncating restores them exactly, and each table's hash index
+  is rebuilt in place over what remains through `intern_index.retainBelow`.
+  Neither half allocates, because the failure being undone is usually an
+  allocation that failed. **P4's first item had to land before this one could**:
+  the rollback is a rebuild of that index.
+  Everything else a statement does it does in one operation that either lands
+  or does not, and the two that did not are now atomic — `addFactExpr` takes
+  its insertion back out if marking the closure dirty fails, and
+  `addRuleClauses` takes its rule back out on every failure below the append
+  rather than on two of the three, and spends the rule identifier only once the
+  rule is certain to stay. `rollback` asserts the fact store and the rule set
+  are where it left them, so the contract cannot be quietly broken later.
+- A run whose *first* statement fails has staged nothing and is discarded
+  rather than committed. Committing it would leave the database equal to itself
+  but not identical, since the lazily built caches it came away with would be
+  the copy's rather than its own. The existing "source persistent statements
+  roll back every allocation failure point" test measures that in bytes and is
+  what caught it — the one existing test this item had to be corrected by.
+- The commits `foldQuery` and `defineView` make are untouched, deliberately. No
+  commit anywhere became conditional, deferred or skippable: `Statement` gained
+  `commitAssertions`, which is `commit(.none)` without the error union so that
+  the failure path has neither an allocation to spend nor a second error to
+  report. `foldQuery` still commits its staged copy on a cache miss because the
+  plan it just cached holds identifiers interned on that copy, and still drops
+  the copy on a hit so that asking the same question twice cannot grow the
+  database. Both halves stand.
+- The counts go back with the rollback, so a rolled-back statement still takes
+  its own share of what interning cost with it — the property the first item's
+  decisions recorded, kept meaning the same thing now that a statement no
+  longer has a staging copy to itself.
+
+**The measurement gate's verdict, in full.** Loading 2000 facts as source
+statements went from 248 ms to 0.92 ms, **268x**, and now costs 1.51x the
+`applyChanges` batch that is the floor for that work, against 398x before.
+Every comparison count in `benchmark-interning` is identical before and after,
+on all four workloads, which is what says the item changed how often the
+database is copied and nothing about what is interned. The three rows that did
+not move have no run of statements to share: `addFact` is the embedder's
+one-fact call and clones per call by construction, `applyChanges` already was
+one transaction, and the structural workload measures `materialize`. Extending
+the same treatment to consecutive `addFact` calls would mean an
+embedder-visible transaction, which is what `applyChanges` already is, so it
+was declined. Every other benchmark landed inside its run-to-run band with all
+derived-fact, closure, group and policy counts identical, and the suite is
+unchanged at about twelve seconds. `docs/aggregation-performance.md` carries
+the tables.
+
+- One thing noted for the items still to come. The pattern-index item's prize —
+  retiring the deferred build and the density gate — is still untouched: this
+  item consulted neither rule, and `RelationStore` changed not at all. What did
+  change under it is that a run of assertions now maintains one store's caches
+  incrementally through `noteInserted` instead of rebuilding them from a fresh
+  clone per statement, so a layout that cannot absorb an insert has one more
+  caller to satisfy than it did.
 
 
 # Project M: persistent and incremental view maintenance

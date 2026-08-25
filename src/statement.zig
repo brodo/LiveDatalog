@@ -37,7 +37,16 @@ pub fn commitRetraction(db: *database.Database, removed: *const relation_store.R
 
 pub fn addFactExpr(db: *database.Database, value: syntax.Expr) !void {
     const fact = try db.applyInsertion(value) orelse return;
-    try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
+    const key: relation_store.PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
+    db.markBaseChanged(key) catch |err| {
+        // The insertion comes back out. A statement leaves the fact store
+        // either as it was or with its fact in it and nothing between, which
+        // is what lets a run of assertions share one transaction and still be
+        // undone one statement at a time: see `Database.rollback`, which has
+        // no way to put a fact back.
+        db.facts.removeAt(db.facts.len() - 1);
+        return err;
+    };
 }
 
 /// Adds a rule whose body may contain aggregate clauses. On success the
@@ -47,22 +56,20 @@ pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const s
     const seed_argument = try validation.validateRule(db, head, body);
     const owned_body = try validation.orderClauses(db, body);
     errdefer db.allocator.free(owned_body);
-    const id = db.eval.next_rule_id;
-    db.eval.next_rule_id += 1;
     try db.eval.rules.append(db.allocator, .{
-        .id = id,
+        .id = db.eval.next_rule_id,
         .head = head,
         .body = owned_body,
         .seed_argument = seed_argument,
     });
-    validation.validateRecursiveArithmetic(db) catch |err| {
-        _ = db.eval.rules.pop();
-        return err;
-    };
-    validation.validateStratification(db) catch |err| {
-        _ = db.eval.rules.pop();
-        return err;
-    };
+    // Past here the rule is installed and every failure takes it back out,
+    // which is both halves of what this promises: the caller keeps ownership
+    // of `head` and `body`, and the rule set is left exactly as it was, since
+    // `Database.rollback` has no way to put a rule back. The identifier is
+    // spent only once the rule is certain to stay.
+    errdefer _ = db.eval.rules.pop();
+    try validation.validateRecursiveArithmetic(db);
+    try validation.validateStratification(db);
     materialization.invalidateAnalysis(db);
     if (db.closure != null) {
         // Lazy rebuild policy for rule additions: invalidate from the new
@@ -70,6 +77,7 @@ pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const s
         const analysis = try db.eval.ensureAnalysis();
         db.markDirty(analysis.strata.get(syntax.predicateKey(head)) orelse 0);
     }
+    db.eval.next_rule_id += 1;
 }
 
 /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
@@ -263,9 +271,10 @@ pub const Statement = struct {
     /// and this transaction is what spans the two.
     removed: relation_store.RelationStore,
 
-    /// Opens a transaction for one statement. A statement that evaluates needs
-    /// the committed closure materialized first, so that the staged copy
-    /// shares its value identifiers and evaluation never expands.
+    /// Opens a transaction for one statement, or — with `.assertion` — for a
+    /// run of consecutive ones. A statement that evaluates needs the committed
+    /// closure materialized first, so that the staged copy shares its value
+    /// identifiers and evaluation never expands.
     pub fn begin(db: *database.Database, kind: Kind) !Statement {
         switch (kind) {
             .query, .retraction => try materialization.ensureMaterialized(db),
@@ -283,6 +292,37 @@ pub const Statement = struct {
     /// here unless the statement commits.
     pub fn target(self: *Statement) *database.Database {
         return &self.staging;
+    }
+
+    /// Where the staging copy stands, to undo a statement back to.
+    ///
+    /// Cloning the database is what a transaction costs, and for a source file
+    /// of facts it is nearly the whole cost of loading it: 2000 assertions one
+    /// statement at a time copy 1,999,000 fact entries between them. A run of
+    /// consecutive assertions therefore shares one of these. What a statement
+    /// promises is unweakened, because a statement that fails inside a run is
+    /// rolled back to its own savepoint and the run is committed without it —
+    /// which leaves every earlier statement and none of the failing one,
+    /// exactly as a transaction each would.
+    pub fn savepoint(self: *Statement) database.Savepoint {
+        return self.staging.savepoint();
+    }
+
+    /// Takes a statement that failed back out of the staging copy the
+    /// statements before it are on. Allocates nothing.
+    pub fn rollback(self: *Statement, mark: database.Savepoint) void {
+        self.staging.rollback(mark);
+    }
+
+    /// Installs what a run of assertions has staged so far.
+    ///
+    /// This is `commit(.none)` without the error union. A run is committed
+    /// both when it ends and when a statement inside it fails, and on that
+    /// second path there is nothing to spend on an allocation and no room for
+    /// a second error to report — so the operation a run commits through is
+    /// spelled as one that cannot fail.
+    pub fn commitAssertions(self: *Statement) void {
+        self.database.commit(&self.staging);
     }
 
     /// Runs a retraction against the staging copy, keeping the base facts its

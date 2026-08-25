@@ -669,3 +669,77 @@ slot means in the copy exactly what it meant in the original. That is the
 opposite answer from the one `RelationStore.membership` gave to the same
 question, and for the reason that entry gave — a map keyed by content has to
 rehash, and a map keyed by position does not.
+
+## 2026-08-25 after P4's second item (one transaction per run of assertions)
+
+The second of P4's four items, and the largest one left. The parser opened a
+statement transaction per statement, and a transaction clones the database, so
+a source file of 2000 facts copied 1,999,000 fact entries between its
+statements. A run of consecutive assertions now shares one transaction.
+
+Nothing observable changed, and the counts say so directly: every comparison
+count in `benchmark-interning` is identical before and after, on all four
+workloads. The item changed how often the database is copied, not what is
+interned or in what order.
+
+### Times
+
+ns, best of three runs, each itself the best of five in-process repeats,
+arm64, macOS 26.5.2, Zig 0.16.0, `ReleaseFast`.
+
+| Workload | Before | After | Ratio |
+| --- | --- | --- | --- |
+| 2000 facts as source statements | 248348125 | 924833 | 268.5x |
+| 2000 facts in one `applyChanges` batch | 623750 | 611125 | 1.02x |
+| 2000 facts through `addFact` | 244292833 | 245824750 | 0.99x |
+| materialize a 120-element structural recursion | 3416500 | 3428792 | 1.00x |
+
+The batch is the floor for this workload: it is the same 4000 interns and the
+same 2000 insertions with exactly one clone. Loading the facts as source
+statements now costs **1.51x that floor**, against 398x before. What remains
+is parsing and the single clone.
+
+The three rows that did not move are the three that have no run of statements
+to share. `addFact` is the embedder's one-fact call and clones per call by
+construction; `applyChanges` already was one transaction; the structural
+workload measures `materialize`. Extending the same treatment to consecutive
+`addFact` calls would mean an embedder-visible transaction, which is what
+`applyChanges` already is, so it was not done.
+
+The other benchmarks — structural deletion, folding, join planning,
+aggregation, projected aggregates, maintenance, materialization — landed inside
+their run-to-run band on every row, with every derived-fact, closure, group and
+policy count identical. The test suite is unchanged at about twelve seconds.
+
+### What the guarantee cost
+
+A statement still either commits completely or leaves the database exactly as
+it was. Inside a shared transaction that is arranged in three parts.
+
+Interning is the one thing a statement cannot undo where it happens: it goes on
+across many calls while parsing, long before the statement knows whether it
+will succeed. So `Database.savepoint` records the three interning tables'
+lengths and `Database.rollback` truncates them back. Identifiers are insertion
+positions, so truncating restores them exactly; the hash index beside each
+table is rebuilt in place over the entries that remain, which is why P4's first
+item had to land before this one could. Neither half allocates — the failure
+being undone is usually an allocation that failed.
+
+Everything else a statement does, it does in one operation that either lands or
+does not, and the two that did not are now atomic: `addFactExpr` takes its
+insertion back out if marking the closure dirty fails, and `addRuleClauses`
+takes its rule back out on every failure below the append rather than on two of
+them, and spends the rule identifier only once the rule is certain to stay.
+`rollback` asserts the fact store and the rule set are where it left them,
+which is what keeps that contract from being quietly broken later.
+
+A run whose *first* statement fails has staged nothing and is discarded rather
+than committed. Committing it would leave the database equal to itself but not
+identical: the lazily built caches it came away with would be the copy's rather
+than its own. The existing "source persistent statements roll back every
+allocation failure point" test measures exactly that, in bytes, and it is what
+caught this.
+
+The comparison counts go back with the rollback too, so a rolled-back statement
+still takes its own share of what interning cost with it — which is what they
+meant when every statement had a staging copy of its own.

@@ -102,6 +102,28 @@ pub const ValueTable = struct {
         return id;
     }
 
+    /// What the index needs to rehash an entry it is keeping when the table
+    /// is truncated. Only `hash`, because nothing is being looked for.
+    const Rehash = struct {
+        table: *const ValueTable,
+
+        pub fn hash(self: Rehash, id: u32) u64 { // ziglint-ignore: Z012
+            return hashValue(self.table.values.items[id]);
+        }
+    };
+
+    /// Drops every value interned at or after `count`, which is how a
+    /// statement rolled back out of a shared transaction gives back what it
+    /// interned. Identifiers are positions, so the values below `count` keep
+    /// theirs and every fact holding one still means what it meant. Allocates
+    /// nothing: a statement is usually being undone because an allocation
+    /// failed.
+    pub fn truncate(self: *ValueTable, count: usize) void {
+        if (count >= self.values.items.len) return;
+        self.values.shrinkRetainingCapacity(count);
+        self.index.retainBelow(count, Rehash{ .table = self });
+    }
+
     pub fn get(self: *const ValueTable, id: syntax.ValueId) Value {
         return self.values.items[@intCast(id)];
     }

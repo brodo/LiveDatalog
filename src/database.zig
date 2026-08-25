@@ -36,6 +36,27 @@ pub const InternStats = struct {
     value_entries: usize,
 };
 
+/// Where a database stood before one statement ran against it.
+///
+/// A statement interns as it parses — across many calls, long before it knows
+/// whether it will succeed — and that is the one thing it cannot undo where it
+/// happens. Everything else a statement does to a database it does in a single
+/// operation that either lands or does not: see `statement.addFactExpr` and
+/// `statement.addRuleClauses`, which take their own work back out on failure.
+/// So this records the tables interning appends to, and `Database.rollback`
+/// checks the rest is where it left it.
+pub const Savepoint = struct {
+    strings: usize,
+    scalars: usize,
+    values: usize,
+    scalar_counts: intern_index.Counts,
+    value_counts: intern_index.Counts,
+    /// Not restored, checked: the two things a statement changes that this
+    /// cannot put back.
+    facts: usize,
+    rules: usize,
+};
+
 pub const MaintenanceStats = struct {
     closure_facts: usize,
     /// Facts added to the closure by incremental insertion propagation.
@@ -193,6 +214,40 @@ pub const Database = struct {
         terms_owned = false;
         if (!added) return null;
         return self.facts.factAt(self.facts.len() - 1);
+    }
+
+    /// Where this database stands now, to undo a statement back to.
+    pub fn savepoint(self: *const Database) Savepoint {
+        return .{
+            .strings = self.strings.strings.count(),
+            .scalars = self.eval.scalars.values.items.len,
+            .values = self.eval.values.values.items.len,
+            .scalar_counts = self.eval.scalars.counts,
+            .value_counts = self.eval.values.counts,
+            .facts = self.facts.len(),
+            .rules = self.eval.rules.items.len,
+        };
+    }
+
+    /// Undoes what a statement interned, back to `mark`.
+    ///
+    /// This is what lets consecutive statements share one transaction: a
+    /// statement that fails is taken back out of the staging copy the earlier
+    /// ones are on, so committing that copy keeps every earlier statement and
+    /// none of the failing one. It allocates nothing, because the failure it
+    /// undoes is usually an allocation that failed.
+    ///
+    /// The comparison counts go back with it, so a rolled-back statement takes
+    /// its own share of what interning cost with it — which is what they meant
+    /// when every statement had a staging copy of its own.
+    pub fn rollback(self: *Database, mark: Savepoint) void {
+        std.debug.assert(self.facts.len() == mark.facts);
+        std.debug.assert(self.eval.rules.items.len == mark.rules);
+        self.strings.truncate(mark.strings);
+        self.eval.scalars.truncate(mark.scalars);
+        self.eval.values.truncate(mark.values);
+        self.eval.scalars.counts = mark.scalar_counts;
+        self.eval.values.counts = mark.value_counts;
     }
 
     /// Copies internal bindings out as owned answers, listing each answer's

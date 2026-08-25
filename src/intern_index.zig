@@ -119,6 +119,24 @@ pub const Index = struct {
         self.filled += 1;
     }
 
+    /// Drops every identifier at or above `limit` and keeps the rest, which
+    /// is what an index over a table truncated back to a savepoint has to
+    /// become. `context.hash` is the same one `reserve` rehashes through.
+    ///
+    /// Rebuilt in place rather than unlinked slot by slot: linear probing
+    /// without tombstones cannot take one entry out without re-placing the
+    /// probe run behind it, and this may not allocate — a caller undoing a
+    /// statement is usually undoing it because an allocation failed. The slots
+    /// it rebuilds into are the ones it already had, which held a longer
+    /// table and so are large enough for a shorter one.
+    pub fn retainBelow(self: *Index, limit: usize, context: anytype) void {
+        if (self.filled <= limit) return;
+        @memset(self.slots, 0);
+        self.filled = limit;
+        var id: u32 = 0;
+        while (id < limit) : (id += 1) place(self.slots, context.hash(id), id + 1);
+    }
+
     fn place(slots: []u32, hash: u64, stored: u32) void {
         const mask = slots.len - 1;
         var slot = @as(usize, @truncate(hash)) & mask;
@@ -184,6 +202,21 @@ const Numbers = struct {
         return null;
     }
 
+    fn truncate(self: *Numbers, count: usize) void {
+        self.entries.shrinkRetainingCapacity(count);
+        self.index.retainBelow(count, Rehash{ .table = self });
+    }
+
+    /// What the index needs to rehash an entry it is keeping. Nothing is
+    /// being looked for, so there is no key.
+    const Rehash = struct {
+        table: *const Numbers,
+
+        pub fn hash(self: Rehash, id: u32) u64 { // ziglint-ignore: Z012
+            return hashNumber(self.table.entries.items[id]);
+        }
+    };
+
     fn clone(self: *const Numbers) !Numbers {
         return .{
             .allocator = self.allocator,
@@ -238,4 +271,36 @@ test "an index whose slots never allocate finds nothing" {
     const found = numbers.index.find(0, Numbers.Context{ .table = &numbers, .key = 1 });
     try testing.expectEqual(@as(?u32, null), found.id);
     try testing.expectEqual(@as(usize, 0), found.compared);
+}
+
+test "an index truncated to a savepoint answers what a scan of what is left answers" {
+    // What rolling a statement back out of a shared transaction needs: the
+    // entries below the savepoint keep their identifiers and everything at or
+    // above it is gone, with no trace left in the index to find it by.
+    var numbers: Numbers = .{ .allocator = testing.allocator };
+    defer numbers.deinit();
+    var random: std.Random.DefaultPrng = .init(20260825);
+    for (0..400) |_| _ = try numbers.intern(random.random().uintLessThan(u64, 5000));
+
+    const kept = 137;
+    const survivors = try testing.allocator.dupe(u64, numbers.entries.items[0..kept]);
+    defer testing.allocator.free(survivors);
+    numbers.truncate(kept);
+    try testing.expectEqual(kept, numbers.index.filled);
+    for (survivors, 0..) |number, id| try testing.expectEqual(id, try numbers.intern(number));
+    try testing.expectEqual(kept, numbers.entries.items.len);
+
+    // And what was dropped is interned afresh, at the position it now has,
+    // rather than found at the one it used to have.
+    for (0..200) |_| {
+        const number = random.random().uintLessThan(u64, 5000);
+        const expected = numbers.scan(number);
+        const id = try numbers.intern(number);
+        if (expected) |already| {
+            try testing.expectEqual(already, id);
+        } else {
+            try testing.expectEqual(numbers.entries.items.len - 1, id);
+        }
+    }
+    try testing.expectEqual(numbers.entries.items.len, numbers.index.filled);
 }

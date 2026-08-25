@@ -18,20 +18,74 @@ const syntax = @import("syntax.zig");
 const errors = @import("errors.zig");
 const test_support = @import("test_support.zig");
 
+/// The transaction a run of consecutive assertions shares.
+///
+/// `staged` is whether any of them has landed in it. A run whose very first
+/// statement fails has staged nothing and is discarded rather than committed:
+/// installing a copy holding exactly what the database already holds would
+/// leave the database equal to itself but not identical, since the lazily
+/// built caches it would come away with are the copy's rather than its own.
+const Run = struct {
+    transaction: statement.Statement,
+    staged: bool = false,
+
+    /// Commits what the run has staged, if anything, and ends it.
+    fn close(run: *?Run) void {
+        if (run.*) |*open| {
+            if (open.staged) open.transaction.commitAssertions();
+            open.transaction.deinit();
+            run.* = null;
+        }
+    }
+};
+
 pub const Parser = struct {
     jatalog: *database.Database,
     source: []const u8,
     index: usize = 0,
 
+    /// Runs the program, one statement at a time, with a run of consecutive
+    /// assertions sharing one transaction.
+    ///
+    /// Sharing is what makes loading facts from source affordable: a
+    /// transaction clones the database, and 2000 assertions with a transaction
+    /// each copy 1,999,000 fact entries between them. It changes nothing about
+    /// what a statement promises. A statement that fails inside a run is
+    /// rolled back to its own savepoint and the run it was in is committed
+    /// without it, so a failure still leaves every earlier statement and none
+    /// of the failing one — including what the failing one interned, which is
+    /// observable rather than merely untidy, since a novel ground structure
+    /// joins the seed set of admissible structural recursion.
     pub fn executeAll(self: *Parser) !results.ExecutionResult {
         var last: ?results.ExecutionResult = null;
         errdefer if (last) |*result| result.deinit();
+        var run: ?Run = null;
+        errdefer if (run) |*open| open.transaction.deinit();
         while (true) {
             self.skipSpace();
-            if (self.index == self.source.len) return last orelse .none;
+            if (self.index == self.source.len) {
+                Run.close(&run);
+                return last orelse .none;
+            }
             if (last) |*result| result.deinit();
             last = null;
-            var transaction = try statement.Statement.begin(self.jatalog, self.peekStatementKind());
+            const kind = self.peekStatementKind();
+            if (kind == .assertion) {
+                if (run == null) run = .{
+                    .transaction = try statement.Statement.begin(self.jatalog, .assertion),
+                };
+                last = self.executeInRun(&run.?.transaction) catch |err| {
+                    // The statements before this one are staged on the copy it
+                    // has just been rolled back out of, so committing is what
+                    // keeps them and drops it.
+                    Run.close(&run);
+                    return err;
+                };
+                run.?.staged = true;
+                continue;
+            }
+            Run.close(&run);
+            var transaction = try statement.Statement.begin(self.jatalog, kind);
             defer transaction.deinit();
             var statement_parser = self.*;
             statement_parser.jatalog = transaction.target();
@@ -40,6 +94,20 @@ pub const Parser = struct {
             try transaction.commit(statement_result);
             last = statement_result;
         }
+    }
+
+    /// Runs one assertion inside the transaction it shares with the assertions
+    /// around it, undoing what it interned if it fails.
+    fn executeInRun(self: *Parser, transaction: *statement.Statement) !results.ExecutionResult {
+        const mark = transaction.savepoint();
+        var statement_parser = self.*;
+        statement_parser.jatalog = transaction.target();
+        const statement_result = statement_parser.executeStatement(transaction) catch |err| {
+            transaction.rollback(mark);
+            return err;
+        };
+        self.index = statement_parser.index;
+        return statement_result;
     }
 
     /// Classifies the next statement by scanning for its terminator without

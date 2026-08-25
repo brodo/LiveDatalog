@@ -2661,6 +2661,101 @@ test "source persistent statements roll back every allocation failure point" {
     try std.testing.expect(observed_success);
 }
 
+/// Which of `n0 … n{count-1}` the database holds under `node/1`, as one bit
+/// per index. Enough to say exactly which statements of a program reached the
+/// database and which did not.
+fn nodesPresent(db: *Jatalog, count: usize) !u32 {
+    var answers = try db.query(&.{input.relation("node", &.{input.variable("X")})});
+    defer answers.deinit();
+    var present: u32 = 0;
+    var buffer: [8]u8 = undefined;
+    for (answers.answers.items) |*answer| {
+        const atom = try answer.getAtom("X");
+        for (0..count) |index| {
+            const name = try std.fmt.bufPrint(&buffer, "n{d}", .{index});
+            if (std.mem.eql(u8, atom, name)) present |= @as(u32, 1) << @intCast(index);
+        }
+    }
+    return present;
+}
+
+test "a source program commits and rolls back one statement at a time" {
+    // Assertions, a query and a retraction interleaved. Each statement either
+    // lands completely or not at all, whatever its neighbours are, and the
+    // ones that share a transaction are no exception.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var program = try db.execute(
+        \\node(n0). node(n1).
+        \\reachable(X) :- node(X).
+        \\reachable(n0)?
+        \\node(n2). node(n3).
+        \\node(n1) ~
+        \\node(n4).
+    );
+    program.deinit();
+    try std.testing.expectEqual(@as(u32, 0b11101), try nodesPresent(&db, 5));
+    var derived = try db.query(&.{input.relation("reachable", &.{input.variable("X")})});
+    defer derived.deinit();
+    try std.testing.expectEqual(@as(usize, 4), derived.answers.items.len);
+
+    // A statement that fails part-way through a run of assertions keeps every
+    // earlier statement and none of its own — including what it interned.
+    // What a rolled-back statement interned is observable rather than merely
+    // untidy: a novel ground structure joins the seed set of admissible
+    // structural recursion, so a value left behind can derive facts.
+    var partial: Jatalog = .init(std.testing.allocator);
+    defer partial.deinit();
+    var prefix = try partial.execute("node(n0). node(n1).");
+    prefix.deinit();
+    const before = partial.internStats();
+    try std.testing.expectError(
+        Error.InvalidSyntax,
+        partial.execute("node(n2). oops(n9, [n8, n7] . node(n3)."),
+    );
+    try std.testing.expectEqual(@as(u32, 0b111), try nodesPresent(&partial, 5));
+    const after = partial.internStats();
+    // Exactly `n2`, and nothing the failing statement named.
+    try std.testing.expectEqual(before.scalar_entries + 1, after.scalar_entries);
+    try std.testing.expectEqual(before.value_entries + 1, after.value_entries);
+}
+
+test "an allocation failure leaves a source program's statements as a prefix" {
+    // The guarantee under the one failure that can strike anywhere: whatever
+    // the database ends up holding, it is the result of some number of the
+    // program's leading statements, never a partial one and never a later one
+    // without an earlier one.
+    var observed_success = false;
+    for (0..512) |offset| {
+        var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+        var db: Jatalog = .init(failing.allocator());
+        defer db.deinit();
+        var seed = try db.execute("node(n0).");
+        seed.deinit();
+
+        failing.fail_index = failing.alloc_index + offset;
+        const operation = db.execute("node(n1). node(n2). node(n3). node(n4).");
+        failing.fail_index = std.math.maxInt(usize);
+        if (operation) |value| {
+            var result = value;
+            result.deinit();
+            try std.testing.expectEqual(@as(u32, 0b11111), try nodesPresent(&db, 5));
+            observed_success = true;
+            break;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                const present = try nodesPresent(&db, 5);
+                // A prefix is exactly a run of low bits: the statement that
+                // failed stopped the program, so no later one can have run.
+                try std.testing.expect(present & (present + 1) == 0);
+                try std.testing.expect(present >= 0b1);
+            },
+            else => return err,
+        }
+    }
+    try std.testing.expect(observed_success);
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation, maintenance and aggregate tests.
 //

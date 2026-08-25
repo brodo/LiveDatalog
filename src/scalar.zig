@@ -126,6 +126,32 @@ pub const Store = struct {
         return @enumFromInt(id);
     }
 
+    /// What the index needs to rehash an entry it is keeping when the table
+    /// is truncated. Only `hash`, because nothing is being looked for.
+    const Rehash = struct {
+        store: *const Store,
+
+        pub fn hash(self: Rehash, id: u32) u64 { // ziglint-ignore: Z012
+            return hashKey(keyOf(self.store.values.items[id]));
+        }
+    };
+
+    /// Drops every scalar interned at or after `count`, which is how a
+    /// statement rolled back out of a shared transaction gives back what it
+    /// interned. Identifiers are positions, so the scalars below `count` keep
+    /// theirs and everything holding one still means what it meant. Allocates
+    /// nothing: a statement is usually being undone because an allocation
+    /// failed.
+    pub fn truncate(self: *Store, count: usize) void {
+        if (count >= self.values.items.len) return;
+        for (self.values.items[count..]) |value| switch (value) {
+            .atom => |atom| self.allocator.free(atom),
+            .integer, .float => {},
+        };
+        self.values.shrinkRetainingCapacity(count);
+        self.index.retainBelow(count, Rehash{ .store = self });
+    }
+
     pub fn internAtom(self: *Store, atom: []const u8) !Id {
         const key: Key = .{ .atom = atom };
         const hash = hashKey(key);
@@ -454,4 +480,40 @@ test "a cloned store interns to the same identifiers as the store it came from" 
     const fresh = try copy.internAtom("n200");
     try testing.expectEqual(@as(usize, @intFromEnum(fresh)), store.values.items.len);
     try testing.expectEqual(fresh, try copy.internAtom("n200"));
+}
+
+test "a store truncated to a savepoint interns like one that never held what it dropped" {
+    // What undoing a statement in a shared transaction needs from the store:
+    // the scalars below the savepoint keep their identifiers, and the ones
+    // above it leave nothing behind for a later search to find them by.
+    var store: Store = .init(testing.allocator);
+    defer store.deinit();
+    _ = try store.internAtom("kept");
+    _ = try store.internInteger(7);
+    _ = try store.internFloat(0.5);
+    const mark = store.values.items.len;
+
+    _ = try store.internAtom("dropped");
+    _ = try store.internInteger(-9);
+    _ = try store.internFloat(2.5);
+    // Enough more to make the index grow past the slots the savepoint had.
+    for (0..40) |number| _ = try store.internInteger(@intCast(1000 + number));
+    store.truncate(mark);
+
+    try testing.expectEqual(mark, store.values.items.len);
+    try testing.expectEqual(mark, store.index.filled);
+    try testing.expectEqual(@as(Id, @enumFromInt(0)), try store.internAtom("kept"));
+    try testing.expectEqual(@as(Id, @enumFromInt(1)), try store.internInteger(7));
+    try testing.expectEqual(@as(Id, @enumFromInt(2)), try store.internFloat(0.5));
+    try testing.expectEqual(mark, store.values.items.len);
+
+    // What was dropped is interned afresh at the position it now has, which is
+    // also what the scan the index replaced would say.
+    const revived = try store.internAtom("dropped");
+    try testing.expectEqual(@as(Id, @enumFromInt(@as(u32, @intCast(mark)))), revived);
+    try testing.expectEqual(revived, scanFor(&store, .{ .atom = "dropped" }).?);
+    try testing.expectEqual(
+        try store.internInteger(-9),
+        scanFor(&store, .{ .integer = -9 }).?,
+    );
 }
