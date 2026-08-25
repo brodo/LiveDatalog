@@ -285,6 +285,52 @@ test "a set another goal reads is a set whose growing is visible" {
     try testing.expect(!ofQuery(&.{}, &.{rule}));
 }
 
+test "a query that reads a collected set with a list function is never monotonic" {
+    const allocator = testing.allocator;
+    var fixture: Fixture = .init(allocator);
+    defer fixture.deinit();
+
+    // q(X, T) :- p(X), setof(Y, r(X, Y), S), sum(S, T). Section 6.5's own
+    // query shape, and it is the previous test's with a name on the second
+    // goal: a list function *is* a goal that reads the collected set, so the
+    // set occurs twice and is never free.
+    //
+    // That settles which half of Theorem 6.5.1 the list-function class can
+    // reach. The theorem offers a monotonic query or canonical aggregate
+    // views, and the first is closed to every query this phase exists for —
+    // not by policy but by the shape of the question, since asking what a
+    // collected set sums to is asking about which set it was.
+    const q = try fixture.strings.intern("q");
+    const p = try fixture.strings.intern("p");
+    const r = try fixture.strings.intern("r");
+    const sum = try fixture.strings.intern("sum");
+    const x = try fixture.strings.intern("X");
+    const y = try fixture.strings.intern("Y");
+    const s = try fixture.strings.intern("S");
+    const t = try fixture.strings.intern("T");
+
+    var head = [_]syntax.Term{ .{ .variable = x }, .{ .variable = t } };
+    var outer_terms = [_]syntax.Term{.{ .variable = x }};
+    var inner_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var summing = [_]syntax.Term{ .{ .variable = s }, .{ .variable = t } };
+    var inner = [_]syntax.Clause{.{ .relational = .{ .predicate = r, .terms = &inner_terms } }};
+    var body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = p, .terms = &outer_terms } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y },
+            .body = &inner,
+            .output = .{ .variable = s },
+        } },
+        .{ .relational = .{ .predicate = sum, .terms = &summing } },
+    };
+    const rule = try fixture.rule(allocator, .{
+        .head = .{ .predicate = q, .terms = &head },
+        .body = &body,
+    });
+    defer fold_ir.freeRule(allocator, rule);
+    try testing.expect(!ofQuery(&.{}, &.{rule}));
+}
+
 test "a negated goal is the shape the class exists to exclude" {
     const allocator = testing.allocator;
     var fixture: Fixture = .init(allocator);

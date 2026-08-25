@@ -18,8 +18,10 @@ const fold_ir = @import("fold_ir.zig");
 const folding = @import("folding.zig");
 const input_compiler = @import("input_compiler.zig");
 const inversion = @import("inversion.zig");
+const list_functions = @import("list_functions.zig");
 const maintenance = @import("maintenance.zig");
 const materialization = @import("materialization.zig");
+const monotonicity = @import("monotonicity.zig");
 const parser = @import("parser.zig");
 const planner = @import("planner.zig");
 const relation_store = @import("relation_store.zig");
@@ -295,7 +297,9 @@ test {
     _ = folding;
     _ = input_compiler;
     _ = inversion;
+    _ = list_functions;
     _ = maintenance;
+    _ = monotonicity;
     _ = relation_store;
     _ = scalar;
     _ = string_table;
@@ -5670,4 +5674,979 @@ fn restrictedFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
 
 test "folding under the restricted classes releases every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(restrictedFoldingAllocationScenario);
+}
+
+/// Example 6.5.2's setting, restated over the arithmetic this language has.
+///
+/// The dissertation's list function is `avg(X, A) :- sum(X, S), length(X, C),
+/// A = S / C`, and DatalogA here has `+` and `-` and no `/` — adding division
+/// is a Project S decision about the finite-`f64` policy, mixed numeric
+/// canonicalization and division by zero, and none of that is what this phase
+/// is about. So the example is restated with the same shape and a different
+/// operator: `excess(L, E) :- sum(L, T), length(L, C), E = T - C` is a list
+/// function the views do not expose, defined as a conjunctive view over two
+/// they do, combined arithmetically. Everything the folding turns on — the
+/// expansion, the two auxiliary layers, the identity of the two sets — is the
+/// same; only the last goal differs.
+const Excess = struct {
+    /// `sum` and `length` as Appendix B defines them, plus the data.
+    ///
+    /// `seed` names the lists the aggregate will collect. It is there because
+    /// the structural rules deriving `sum` and `length` are *seeded*: they
+    /// derive over the lists the database holds, and a list that only ever
+    /// exists as an aggregate's output inside a higher stratum is not one of
+    /// them. That is a property of this engine's list functions and not of the
+    /// folding — the plan needs no such seeding, because it holds no
+    /// structural rules at all — but the query has to be answerable for its
+    /// answers to be worth comparing against.
+    const program =
+        \\sum([], 0).
+        \\sum(H!T, S) :- sum(T, A), S = A + H.
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\p(a). p(b).
+        \\r(a, 1). r(a, 2). r(b, 5).
+        \\seed([1, 2]). seed([5]).
+        \\v1(X, T) :- p(X), setof(Y, r(X, Y), S), sum(S, T).
+        \\v2(X, C) :- p(X), setof(Y, r(X, Y), S), length(S, C).
+        \\cr(X, S) :- r(X, Y0), setof(Y, r(X, Y), S).
+        \\excess(L, E) :- sum(L, T), length(L, C), E = T - C.
+        \\q(X, E) :- p(X), setof(Y, r(X, Y), S), excess(S, E).
+    ;
+
+    /// What the three view extensions come to over that data, and nothing
+    /// else. `p`, `r`, `sum` and `length` are gone.
+    const extensions = "v1(a, 3). v1(b, 5). v2(a, 2). v2(b, 1). cr(a, [1, 2]). cr(b, [5]).";
+
+    /// Defines the three views, in the order their names suggest.
+    fn catalog(db: *database.Database, into: *view_catalog.Catalog) !void {
+        const x = input.variable("X");
+        const y = input.variable("Y");
+        const y0 = input.variable("Y0");
+        const s = input.variable("S");
+        const t = input.variable("T");
+        const c = input.variable("C");
+        _ = try defineView(db, into, input.fact("v1", &.{ x, t }), &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("sum", &.{ s, t }),
+        }, .materialized);
+        _ = try defineView(db, into, input.fact("v2", &.{ x, c }), &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("length", &.{ s, c }),
+        }, .materialized);
+        _ = try defineView(db, into, input.fact("cr", &.{ x, s }), &.{
+            input.relation("r", &.{ x, y0 }),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        }, .materialized);
+    }
+
+    /// `excess(L, E) :- sum(L, T), length(L, C), E = T - C.` and
+    /// `q(X, E) :- p(X), setof(Y, r(X, Y), S), excess(S, E).`
+    fn query(db: *database.Database, symbols: *fold_ir.Symbols, into: *[2]fold_ir.Rule) !void {
+        const x = input.variable("X");
+        const y = input.variable("Y");
+        const s = input.variable("S");
+        const t = input.variable("T");
+        const c = input.variable("C");
+        const l = input.variable("L");
+        const e = input.variable("E");
+        into[0] = try foldingRule(db, symbols, input.fact("excess", &.{ l, e }), &.{
+            input.relation("sum", &.{ l, t }),
+            input.relation("length", &.{ l, c }),
+            input.subtract(e, t, c),
+        });
+        errdefer fold_ir.freeRule(db.allocator, into[0]);
+        into[1] = try foldingRule(db, symbols, input.fact("q", &.{ x, e }), &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("excess", &.{ s, e }),
+        });
+    }
+};
+
+test "a list function no view exposes is folded through the two that do" {
+    // Example 6.5.2, restated over subtraction. The query asks for something
+    // computed from a collected set, and every relation it names is gone: the
+    // plan has two views that each read *their* set with one list function,
+    // and a canonical aggregate view of the relation inside the set.
+    //
+    // What makes it work is the identity of two sets nothing stored. Each view
+    // is split at its aggregate into an auxiliary view that collects and a
+    // layer that reads, both views turn out to collect the same set, and the
+    // Skolem set each layer's inverse would have named is therefore the set
+    // the auxiliary view derives. That is Section 6.5's functional dependency,
+    // and without it the plan has a sum of one unnameable set and a length of
+    // another and can say nothing about either.
+    const allocator = std.testing.allocator;
+
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(Excess.program);
+    program.deinit();
+    var wanted = try source.execute("q(X, E)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+    // a is related to 1 and 2, so its set sums to 3 and holds 2; b to 5 alone.
+    try std.testing.expectEqual(@as(usize, 2), expected.len);
+    try std.testing.expectEqualStrings("a 1", expected[0]);
+    try std.testing.expectEqualStrings("b 4", expected[1]);
+
+    // The folded side holds the three view extensions and nothing else. It has
+    // no `p`, no `r`, and — this is what Section 6.5 turns on — no definition
+    // of `sum` or of `length` either.
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute(Excess.extensions);
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    try Excess.catalog(&db.state, &catalog);
+    var rules: [2]fold_ir.Rule = undefined;
+    try Excess.query(&db.state, &catalog.symbols, &rules);
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ input.variable("X"), input.variable("E") }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    const explained = try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    });
+    defer allocator.free(explained);
+    for ([_][]const u8{
+        "expanded into the list functions the views expose: excess/2",
+        "split into the set it collects and the list functions reading it: v1@0/2",
+        "split into the set it collects and the list functions reading it: v2@1/2",
+        "views proved to have collected one set",
+        "reconstructed exactly, from a canonical aggregate view of it: r/2",
+    }) |note| {
+        if (!std.mem.containsAtLeast(u8, explained, 1, note)) {
+            std.debug.print("\nnot in the explanation: {s}\n{s}\n", .{ note, explained });
+            return error.TransformationNotReported;
+        }
+    }
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    const actual = try answerTuples(&answers);
+    defer freeLines(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |one, other| try std.testing.expectEqualStrings(one, other);
+}
+
+test "Example 6.5.1's recursive list function is refused rather than merely survived" {
+    // The view of Example 6.5.1 is `v(X, A) :- p(X), setof(Y, r(X, Y), S),
+    // sum(S, A)`, and there is nothing wrong with it: inverting it gives
+    // Definition 6.5.1's rules. What cannot go into the plan is `sum`'s own
+    // definition. Coupled with `sum(f(X, A), A) :- v(X, A)` the recursive case
+    // derives a sum of a one-element list holding that Skolem set, then of a
+    // two-element one, and never stops.
+    //
+    // Skolem elimination happens to prevent the nesting — a list holding a
+    // reconstructed value cannot be split, so the instance is dropped — and
+    // that is not a rejection. It is an accident of the machinery that leaves
+    // the plan quietly answering less than it looks like it answers. The
+    // refusal is stated instead, and it is the query's *rules* that state it,
+    // because a caller can hand `sum`'s definition over as part of the query.
+    const allocator = std.testing.allocator;
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute(Excess.extensions);
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    try Excess.catalog(&db.state, &catalog);
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    const e = input.variable("E");
+    const head = input.variable("H");
+    const tail = input.variable("T2");
+    const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
+
+    // sum(H!T2, S) :- sum(T2, A), S = A + H. Appendix B's definition, handed
+    // to the fold as one of the query's own rules.
+    var rules: [3]fold_ir.Rule = undefined;
+    try Excess.query(&db.state, &catalog.symbols, rules[0..2]);
+    rules[2] = try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("sum", &.{ input.cons(&pair), s }),
+        &.{
+            input.relation("sum", &.{ tail, t }),
+            input.add(s, t, head),
+        },
+    );
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ x, e }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
+    var refused = false;
+    for (outcome.unsupported.unmet) |precondition| {
+        if (precondition.kind == .query_list_function_recursive) refused = true;
+    }
+    try std.testing.expect(refused);
+    const explained = try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    });
+    defer allocator.free(explained);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        explained,
+        1,
+        "sum/2: the query defines it by structural recursion",
+    ));
+
+    // The same query without that rule is the one the phase folds, so the
+    // refusal is the rule and not the setting.
+    var without = try folding.foldQuery(allocator, &catalog, .{
+        .goals = goals,
+        .rules = rules[0..2],
+    });
+    defer without.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, without.guarantee());
+
+    // And the other way such a definition could reach a plan is closed
+    // already: a view whose head holds a list is outside the class F2 inverts,
+    // because a list outside an aggregate is not something the Inverse Method
+    // has a rule for.
+    var recursive: view_catalog.Catalog = .init(allocator);
+    defer recursive.deinit();
+    _ = try defineView(&db.state, &recursive, input.fact("sum", &.{ input.cons(&pair), s }), &.{
+        input.relation("sum", &.{ tail, t }),
+    }, .materialized);
+    const rules_only = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &recursive.symbols,
+        input.fact("total", &.{ y, s }),
+        &.{input.relation("sum", &.{ y, s })},
+    )};
+    defer for (rules_only) |rule| fold_ir.freeRule(allocator, rule);
+    const asking = try foldingGoals(&db.state, &recursive.symbols, &.{
+        input.relation("total", &.{ y, s }),
+    });
+    defer fold_ir.freeGoals(allocator, asking);
+    var view_side = try folding.foldQuery(allocator, &recursive, .{
+        .goals = asking,
+        .rules = &rules_only,
+    });
+    defer view_side.deinit();
+    try std.testing.expectEqual(folding.Guarantee.unsupported, view_side.guarantee());
+    try std.testing.expectEqual(
+        folding.PreconditionKind.view_definition_uses_lists,
+        view_side.unsupported.unmet[0].kind,
+    );
+}
+
+/// `v1` over a set collected one link away, with the head keeping either end.
+///
+/// Which end it keeps is the whole difference. Keeping `Z` makes the collected
+/// set a function of the stored tuple — one `Z`, one set — so the auxiliary
+/// view is functional in its key and the layer's Skolem set is that key's set.
+/// Keeping `X` does not: two links out of one `X` collect two different sets,
+/// and a `va(X, S)` written from that definition would hold both. There is
+/// then nothing the set a stored `v1(x, t)` was the sum of can be identified
+/// with, and the plan has no rule to derive `sum` from.
+fn defineLinkedView(
+    db: *database.Database,
+    catalog: *view_catalog.Catalog,
+    keeps: enum { collected_end, linking_end },
+) !void {
+    const x = input.variable("X");
+    const z = input.variable("Z");
+    const y = input.variable("Y");
+    const y0 = input.variable("Y0");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    _ = try defineView(&db.*, catalog, input.fact("cr", &.{ z, s }), &.{
+        input.relation("r", &.{ z, y0 }),
+        input.setof(y, &.{input.relation("r", &.{ z, y })}, s),
+    }, .materialized);
+    _ = try defineView(&db.*, catalog, input.fact("v1", &.{
+        if (keeps == .collected_end) z else x,
+        t,
+    }), &.{
+        input.relation("link", &.{ x, z }),
+        input.setof(y, &.{input.relation("r", &.{ z, y })}, s),
+        input.relation("sum", &.{ s, t }),
+    }, .materialized);
+}
+
+test "a plan whose views leave the collected set undetermined is unsupported" {
+    // The last of Theorem 6.5.1's parts. A query's list function may be one
+    // the views expose rather than a conjunction over them — here it is `sum`
+    // itself — and that is enough only when the set the view read is a set the
+    // plan can name. The auxiliary view is what names it, and it names
+    // nothing unless the definition determines its set from what the head
+    // kept.
+    const allocator = std.testing.allocator;
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). link(w, a).");
+    facts.deinit();
+
+    const x = input.variable("X");
+    const z = input.variable("Z");
+    const y = input.variable("Y");
+    const s = input.variable("S");
+    const t = input.variable("T");
+
+    // q(Z, T) :- link(X, Z), setof(Y, r(Z, Y), S), sum(S, T). The same
+    // question of both catalogs; only the view differs.
+    inline for (.{ .linking_end, .collected_end }) |keeps| {
+        var catalog: view_catalog.Catalog = .init(allocator);
+        defer catalog.deinit();
+        try defineLinkedView(&db.state, &catalog, keeps);
+
+        const rules = [_]fold_ir.Rule{try foldingRule(
+            &db.state,
+            &catalog.symbols,
+            input.fact("q", &.{ z, t }),
+            &.{
+                input.relation("link", &.{ x, z }),
+                input.setof(y, &.{input.relation("r", &.{ z, y })}, s),
+                input.relation("sum", &.{ s, t }),
+            },
+        )};
+        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+            input.relation("q", &.{ z, t }),
+        });
+        defer fold_ir.freeGoals(allocator, goals);
+
+        var outcome = try folding.foldQuery(allocator, &catalog, .{
+            .goals = goals,
+            .rules = &rules,
+        });
+        defer outcome.deinit();
+        if (keeps == .linking_end) {
+            try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
+            try std.testing.expectEqual(@as(usize, 1), outcome.unsupported.unmet.len);
+            try std.testing.expectEqual(
+                folding.PreconditionKind.list_function_set_unidentified,
+                outcome.unsupported.unmet[0].kind,
+            );
+            const explained = try outcome.explainAlloc(allocator, .{
+                .symbols = &catalog.symbols,
+                .strings = &db.state.strings,
+                .scalars = &db.state.eval.scalars,
+            });
+            defer allocator.free(explained);
+            try std.testing.expect(std.mem.containsAtLeast(
+                u8,
+                explained,
+                1,
+                "sum/2: no view read the collected set with it",
+            ));
+            continue;
+        }
+
+        // The same query, the same relations, one variable different in the
+        // view's head — and now the set has a name, so the plan has a rule for
+        // `sum` and answers what the stored tuple says.
+        try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+        var executable = try folding.lowerPlan(
+            allocator,
+            &db.state.strings,
+            &catalog.symbols,
+            outcome.plan().?,
+        );
+        defer executable.deinit();
+        var answers = try runPlan(&db.state, &executable);
+        defer answers.deinit();
+        const tuples = try answerTuples(&answers);
+        defer freeLines(tuples);
+        try std.testing.expectEqual(@as(usize, 1), tuples.len);
+        try std.testing.expectEqualStrings("a 3", tuples[0]);
+    }
+}
+
+test "a set collected from a relation the plan half knows is refused, monotonic or not" {
+    // Where Section 6.5's dependency stops being a containment argument.
+    //
+    // Everywhere else a reconstruction being a subset costs answers: the plan
+    // reads less of a relation and returns less. Here the plan does not read
+    // the set, it *asserts* something about it — `sum(S, T) :- v1(X, T),
+    // va(X, S)` says the stored `T` is the sum of whatever the auxiliary view
+    // collected. Collect a shorter set and the plan holds a `sum` fact that is
+    // false, and a query reading a false fact answers wrongly however
+    // monotonic it is.
+    //
+    // This query is monotonic — it has no aggregate of its own and negates
+    // nothing — so nothing but the exactness of what the auxiliary view
+    // collects stands between it and a wrong answer.
+    const allocator = std.testing.allocator;
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). asked(a, [1, 2]).");
+    facts.deinit();
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const y0 = input.variable("Y0");
+    const s = input.variable("S");
+    const t = input.variable("T");
+
+    // q(X, T) :- asked(X, S), sum(S, T). `asked` is the caller's own relation,
+    // declared available, so the query itself never reads `r` at all — only
+    // the auxiliary view does.
+    inline for (.{ false, true }) |canonical| {
+        var catalog: view_catalog.Catalog = .init(allocator);
+        defer catalog.deinit();
+        try catalog.declareBaseAvailable(.{
+            .name = try db.state.strings.intern("asked"),
+            .arity = 2,
+        });
+        _ = try defineView(&db.state, &catalog, input.fact("v1", &.{ x, t }), &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("sum", &.{ s, t }),
+        }, .materialized);
+        if (canonical) _ = try defineView(&db.state, &catalog, input.fact("cr", &.{ x, s }), &.{
+            input.relation("r", &.{ x, y0 }),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        }, .materialized);
+
+        const rules = [_]fold_ir.Rule{try foldingRule(
+            &db.state,
+            &catalog.symbols,
+            input.fact("q", &.{ x, t }),
+            &.{
+                input.relation("asked", &.{ x, s }),
+                input.relation("sum", &.{ s, t }),
+            },
+        )};
+        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+            input.relation("q", &.{ x, t }),
+        });
+        defer fold_ir.freeGoals(allocator, goals);
+
+        var outcome = try folding.foldQuery(allocator, &catalog, .{
+            .goals = goals,
+            .rules = &rules,
+        });
+        defer outcome.deinit();
+        if (!canonical) {
+            // Only `v1` mentions `r`, and what it remembers of it is whatever
+            // its own outer goals admitted. The refusal names the relation the
+            // auxiliary view collects rather than one the query reads, because
+            // the query reads none of it.
+            try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
+            var refused = false;
+            for (outcome.unsupported.unmet) |precondition| {
+                if (precondition.kind == .set_collected_from_inexact_relation) refused = true;
+            }
+            try std.testing.expect(refused);
+            continue;
+        }
+
+        // With a canonical aggregate view of `r` the auxiliary view collects
+        // exactly what `r` held, so the stored `3` really is the sum of the
+        // set the query asked about.
+        try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+        var executable = try folding.lowerPlan(
+            allocator,
+            &db.state.strings,
+            &catalog.symbols,
+            outcome.plan().?,
+        );
+        defer executable.deinit();
+        var answers = try runPlan(&db.state, &executable);
+        defer answers.deinit();
+        const tuples = try answerTuples(&answers);
+        defer freeLines(tuples);
+        try std.testing.expectEqual(@as(usize, 1), tuples.len);
+        try std.testing.expectEqualStrings("a 3", tuples[0]);
+    }
+}
+
+/// Two keys and two values, as one bit per possible `r` tuple and one per
+/// possible `p` tuple: 64 databases for Section 6.5's folding.
+///
+/// The bound is chosen for what it contains rather than inherited. A key `p`
+/// admits whose collected set is empty and one whose is not; a key `r` relates
+/// that `p` withholds, so the canonical view has a tuple where the two layers
+/// have none; two keys collecting *different* sets, which is what an auxiliary
+/// view shared wrongly would confuse; and sets of size zero, one and two, so
+/// that the sum and the length disagree in more than one way. The two values
+/// are 2 and 5 because that makes all four reachable answers distinct — a plan
+/// that paired one key's sum with another key's length would have to answer a
+/// number the query never does, rather than coincidentally the right one.
+///
+/// Three keys or three values would be sixteen or sixty-four times the work
+/// for the same shapes, and the exhaustive three-node sweep already costs more
+/// than half of the suite's running time.
+const ExcessModel = struct {
+    const size = 2;
+    const keys = [size][]const u8{ "a", "b" };
+    const values = [size]i64{ 2, 5 };
+    const relations = 1 << (size * size);
+    const subsets = 1 << size;
+
+    fn relates(mask: u4, key: usize, value: usize) bool {
+        return mask & (@as(u4, 1) << @intCast(key * size + value)) != 0;
+    }
+
+    fn admits(mask: u2, key: usize) bool {
+        return mask & (@as(u2, 1) << @intCast(key)) != 0;
+    }
+
+    fn total(mask: u4, key: usize) i64 {
+        var sum: i64 = 0;
+        for (0..size) |value| if (relates(mask, key, value)) {
+            sum += values[value];
+        };
+        return sum;
+    }
+
+    fn count(mask: u4, key: usize) i64 {
+        var held: i64 = 0;
+        for (0..size) |value| if (relates(mask, key, value)) {
+            held += 1;
+        };
+        return held;
+    }
+
+    /// The three view extensions this database comes to. The two layers have a
+    /// tuple for every key `p` admits, including one whose set is empty; the
+    /// canonical view has one for every key `r` relates, whatever `p` said.
+    fn extend(db: *database.Database, admitted: u2, related: u4) !void {
+        for (0..size) |key| {
+            if (admits(admitted, key)) {
+                try addFactTerms(db, "v1", &.{
+                    input.atom(keys[key]),
+                    input.integer(total(related, key)),
+                });
+                try addFactTerms(db, "v2", &.{
+                    input.atom(keys[key]),
+                    input.integer(count(related, key)),
+                });
+            }
+            if (count(related, key) == 0) continue;
+            var held: [size]input.Term = undefined;
+            var written: usize = 0;
+            for (0..size) |value| if (relates(related, key, value)) {
+                held[written] = input.integer(values[value]);
+                written += 1;
+            };
+            try addFactTerms(db, "cr", &.{ input.atom(keys[key]), input.list(held[0..written]) });
+        }
+    }
+};
+
+test "bounded exhaustive models find no counterexample to the folded list function" {
+    // The claim, checked by exhaustion rather than by argument, and held to
+    // *equality* rather than to containment. The reconstruction of `r` is
+    // exact — a canonical aggregate view is what Theorem 6.5.1 requires — so
+    // Lemma 6.4.2 makes the auxiliary view's set the set the query collects,
+    // and the two views between them know every key. A containment check would
+    // pass a plan that had simply gone quiet.
+    //
+    // The oracle is arithmetic here rather than a second run of the engine: a
+    // sweep that asked the engine what the answers were and then asked it
+    // again through a plan would agree with itself whatever either one did.
+    const allocator = std.testing.allocator;
+
+    var planned: Jatalog = .init(allocator);
+    defer planned.deinit();
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    try Excess.catalog(&planned.state, &catalog);
+    var rules: [2]fold_ir.Rule = undefined;
+    try Excess.query(&planned.state, &catalog.symbols, &rules);
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&planned.state, &catalog.symbols, &.{
+        input.relation("q", &.{ input.variable("X"), input.variable("E") }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+    var executable = try folding.lowerPlan(
+        allocator,
+        &planned.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    try installPlan(&planned.state, &executable);
+
+    var answered: usize = 0;
+    for (0..ExcessModel.subsets) |admitted| {
+        for (0..ExcessModel.relations) |related| {
+            const keys: u2 = @intCast(admitted);
+            const edges: u4 = @intCast(related);
+            var folded = try planned.clone();
+            defer folded.deinit();
+            try ExcessModel.extend(&folded.state, keys, edges);
+
+            var produced = try statement.queryClauses(&folded.state, executable.goals);
+            defer produced.deinit();
+            var seen: usize = 0;
+            for (produced.answers.items) |answer| {
+                const text = try answer.bindings.items[0].value.getAtom();
+                const key = text[0] - 'a';
+                const excess = try answer.bindings.items[1].value.getInteger();
+                const wanted = ExcessModel.total(edges, key) - ExcessModel.count(edges, key);
+                if (!ExcessModel.admits(keys, key) or excess != wanted) {
+                    std.debug.print("\np {b} r {b}: the plan answered {s} {d}, the query {d}\n", .{
+                        keys,
+                        edges,
+                        text,
+                        excess,
+                        wanted,
+                    });
+                    return error.AnswerNotContained;
+                }
+                seen += 1;
+                answered += 1;
+            }
+            // Equality, not containment: every key `p` admitted has an answer,
+            // including one whose collected set is empty.
+            var expected: usize = 0;
+            for (0..ExcessModel.size) |key| {
+                if (ExcessModel.admits(keys, key)) expected += 1;
+            }
+            if (seen != expected) {
+                std.debug.print("\np {b} r {b}: the plan answered {d}, the query {d}\n", .{
+                    keys,
+                    edges,
+                    seen,
+                    expected,
+                });
+                return error.AnswersDiffer;
+            }
+        }
+    }
+    try std.testing.expect(answered > 0);
+}
+
+/// Folds and runs the smallest problem that exercises all three of F5's parts:
+/// a query list function expanded into one a view exposes, a view split at its
+/// aggregate, and the chase identifying the set its layer read with the set
+/// the auxiliary view derives.
+///
+/// Deliberately two facts, two views and two rules. An allocation-failure
+/// sweep runs the scenario once per allocation it makes, so its cost is
+/// quadratic in its own size and three larger ones already exist.
+fn listFunctionFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v1(a, 1). cr(a, [1]).");
+    facts.deinit();
+
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const y0 = input.variable("Y0");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    const l = input.variable("L");
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    _ = try defineView(&db.state, &catalog, input.fact("v1", &.{ x, t }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        input.relation("sum", &.{ s, t }),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("cr", &.{ x, s }), &.{
+        input.relation("r", &.{ x, y0 }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    // Built one at a time, because an array initializer whose second element
+    // fails never assigns the array and never reaches the `defer` that would
+    // have released the first.
+    var rules: [2]fold_ir.Rule = undefined;
+    var built: usize = 0;
+    defer for (rules[0..built]) |rule| fold_ir.freeRule(allocator, rule);
+    rules[0] = try foldingRule(&db.state, &catalog.symbols, input.fact("total", &.{ l, t }), &.{
+        input.relation("sum", &.{ l, t }),
+    });
+    built = 1;
+    rules[1] = try foldingRule(&db.state, &catalog.symbols, input.fact("q", &.{ x, t }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        input.relation("total", &.{ s, t }),
+    });
+    built = 2;
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ x, t }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    allocator.free(try outcome.explainAlloc(allocator, .{
+        .symbols = &catalog.symbols,
+        .strings = &db.state.strings,
+        .scalars = &db.state.eval.scalars,
+    }));
+    if (outcome.guarantee() != .maximally_contained) return error.UnexpectedGuarantee;
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    answers.deinit();
+}
+
+test "folding a query's list functions releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(listFunctionFoldingAllocationScenario);
+}
+
+test "identifying two collected sets that were never one answers more than the query" {
+    // The chase's own containment claim. `va` is functional in its key, so two
+    // views written against *one* auxiliary view have collected one set — and
+    // that is a claim about their definitions, not a convenience. Three views
+    // here read a set with a list function and only two of them read the same
+    // set: `v1` and `v3` group `r` by its first column, `v2` by its second.
+    //
+    // Get that wrong and the plan holds `length(the successors of X, how many
+    // predecessors X has)`, which never held of anything, and the query built
+    // on it answers a number it does not have. Merging the two classes in
+    // `collectTheSameSet` is what this test breaks, and it then answers twice.
+    const allocator = std.testing.allocator;
+
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\sum([], 0).
+        \\sum(H!T, S) :- sum(T, A), S = A + H.
+        \\length([], 0).
+        \\length(H!T, N) :- length(T, M), N = M + 1.
+        \\p(a).
+        \\r(a, 2). r(a, 5). r(b, a).
+        \\seed([2, 5]). seed([b]).
+        \\q(X, E) :- p(X), setof(Y, r(X, Y), S), sum(S, T), length(S, C), E = T - C.
+    );
+    program.deinit();
+    var wanted = try source.execute("q(X, E)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+    // The successors of `a` are 2 and 5, so seven less two of them is five.
+    try std.testing.expectEqual(@as(usize, 1), expected.len);
+    try std.testing.expectEqualStrings("a 5", expected[0]);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    // v1 sums the successors, v3 counts them, v2 counts the predecessors — and
+    // `a` has two successors and one predecessor, so a plan confusing the two
+    // sets answers six as well as five.
+    var facts = try db.execute("v1(a, 7). v3(a, 2). v2(a, 1). cr(a, [2, 5]). cr(b, [a]).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const y0 = input.variable("Y0");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    const c = input.variable("C");
+    const e = input.variable("E");
+    _ = try defineView(&db.state, &catalog, input.fact("v1", &.{ x, t }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        input.relation("sum", &.{ s, t }),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("v3", &.{ x, c }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        input.relation("length", &.{ s, c }),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("v2", &.{ x, c }), &.{
+        input.relation("p", &.{x}),
+        input.setof(y, &.{input.relation("r", &.{ y, x })}, s),
+        input.relation("length", &.{ s, c }),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("cr", &.{ x, s }), &.{
+        input.relation("r", &.{ x, y0 }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    const rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ x, e }),
+        &.{
+            input.relation("p", &.{x}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("sum", &.{ s, t }),
+            input.relation("length", &.{ s, c }),
+            input.subtract(e, t, c),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ x, e }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    const actual = try answerTuples(&answers);
+    defer freeLines(actual);
+    // Exactly the query's answers: the view counting predecessors reports
+    // about its own set, which the query never asks about, so it contributes
+    // nothing rather than contributing a second answer.
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |one, other| try std.testing.expectEqualStrings(one, other);
+}
+
+test "an auxiliary view whose group a plan cannot name derives nothing rather than crashing" {
+    // What an auxiliary view makes reachable that nothing before it did. `va`
+    // is the first head a fold derives into that is neither a base relation
+    // nor a split of one, and its body is the only place where an aggregate
+    // stands beside goals that bind values for it. Both of those meet Skolem
+    // elimination for the first time here.
+    //
+    // Two views project a column of the relations `va` groups by, so the plan
+    // reconstructs `p` and `g` partly as splits holding values it cannot name.
+    // A group keyed by such a value is a group with no name: the aggregate
+    // beside it would read a variable that elimination spread across several
+    // columns, and the head would be a split of a relation that has no parts.
+    // Those instances are dropped — which costs answers and keeps containment,
+    // like every other drop — and the plan answers from the groups it can name.
+    const allocator = std.testing.allocator;
+
+    var source: Jatalog = .init(allocator);
+    defer source.deinit();
+    var program = try source.execute(
+        \\sum([], 0).
+        \\sum(H!T, S) :- sum(T, A), S = A + H.
+        \\p(a). g(w). m(z).
+        \\r(a, 2). r(a, 5).
+        \\seed([2, 5]).
+        \\q(X, W, T) :- p(X), g(W), setof(Y, r(X, Y), S), sum(S, T).
+    );
+    program.deinit();
+    var wanted = try source.execute("q(X, W, T)?");
+    defer wanted.deinit();
+    const expected = try answerTuples(&wanted.query);
+    defer freeLines(expected);
+    try std.testing.expectEqual(@as(usize, 1), expected.len);
+    try std.testing.expectEqualStrings("a w 7", expected[0]);
+
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var facts = try db.execute("v1(a, w, 7). cr(a, [2, 5]). hp(z). hg(z). m(z).");
+    facts.deinit();
+
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+    try catalog.declareBaseAvailable(.{ .name = try db.state.strings.intern("m"), .arity = 1 });
+    const x = input.variable("X");
+    const w = input.variable("W");
+    const y = input.variable("Y");
+    const y0 = input.variable("Y0");
+    const z = input.variable("Z");
+    const s = input.variable("S");
+    const t = input.variable("T");
+    _ = try defineView(&db.state, &catalog, input.fact("v1", &.{ x, w, t }), &.{
+        input.relation("p", &.{x}),
+        input.relation("g", &.{w}),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+        input.relation("sum", &.{ s, t }),
+    }, .materialized);
+    // `hp` remembers that `p` held of something and not of what, so inverting
+    // it reconstructs `p` at a value the plan can only name. `hg` does the
+    // same to `g` — the difference that matters is that the auxiliary view's
+    // aggregate reads its `p` column and not its `g` column.
+    _ = try defineView(&db.state, &catalog, input.fact("hp", &.{z}), &.{
+        input.relation("p", &.{x}),
+        input.relation("m", &.{z}),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("hg", &.{z}), &.{
+        input.relation("g", &.{w}),
+        input.relation("m", &.{z}),
+    }, .materialized);
+    _ = try defineView(&db.state, &catalog, input.fact("cr", &.{ x, s }), &.{
+        input.relation("r", &.{ x, y0 }),
+        input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+    }, .materialized);
+
+    const rules = [_]fold_ir.Rule{try foldingRule(
+        &db.state,
+        &catalog.symbols,
+        input.fact("q", &.{ x, w, t }),
+        &.{
+            input.relation("p", &.{x}),
+            input.relation("g", &.{w}),
+            input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
+            input.relation("sum", &.{ s, t }),
+        },
+    )};
+    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        input.relation("q", &.{ x, w, t }),
+    });
+    defer fold_ir.freeGoals(allocator, goals);
+
+    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer outcome.deinit();
+    // Dropping an instance answers less, which is sound and is not maximal.
+    try std.testing.expectEqual(folding.Guarantee.contained, outcome.guarantee());
+
+    var executable = try folding.lowerPlan(
+        allocator,
+        &db.state.strings,
+        &catalog.symbols,
+        outcome.plan().?,
+    );
+    defer executable.deinit();
+    var answers = try runPlan(&db.state, &executable);
+    defer answers.deinit();
+    const actual = try answerTuples(&answers);
+    defer freeLines(actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |one, other| try std.testing.expectEqualStrings(one, other);
 }

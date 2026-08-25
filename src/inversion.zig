@@ -895,6 +895,17 @@ const Eliminator = struct {
         }
 
         const shapes = try self.shapesOf(rule.head.terms, instance);
+        // A relation the fold defines itself is never split. It has no
+        // original to stand for a part of, so there is nothing a split of it
+        // could mean; an instance that would derive one is dropped instead,
+        // which loses answers and keeps containment like every other drop.
+        if (rule.head.predicate == .auxiliary) {
+            for (shapes) |shape| if (shape != .plain) {
+                self.allocator.free(shapes);
+                self.dropped = true;
+                return;
+            };
+        }
         const head = try self.register(rule.head.predicate, shapes);
         if (self.emitting) try self.emit(rule, instance, head);
     }
@@ -1061,13 +1072,32 @@ fn admits(goal: fold_ir.Goal, instance: *const Instance) bool {
         else
             termsAdmit(relation.terms, instance),
         .builtin => |builtin| return termsPlain(builtin.terms, instance),
+        // An aggregate is not rewritten to read the splits its goals matched:
+        // it counts what a relation holds, and a split holds part of one. So
+        // every value it touches has to be an ordinary one — not only what it
+        // collects and reports, but what the goals around it bound for its
+        // body to join on, since a variable spread across several columns
+        // outside would arrive here as itself and mean nothing.
         .aggregate => |aggregate| {
             if (!termPlain(aggregate.template, instance)) return false;
             if (!termPlain(aggregate.output, instance)) return false;
-            for (aggregate.body) |inner| if (!admits(inner, instance)) return false;
+            for (aggregate.body) |inner| if (!goalPlain(inner, instance)) return false;
             return true;
         },
     }
+}
+
+/// Whether every value this goal touches is an ordinary one.
+fn goalPlain(goal: fold_ir.Goal, instance: *const Instance) bool {
+    return switch (goal) {
+        .relation => |relation| termsPlain(relation.terms, instance),
+        .builtin => |builtin| termsPlain(builtin.terms, instance),
+        .aggregate => |aggregate| termPlain(aggregate.template, instance) and
+            termPlain(aggregate.output, instance) and
+            for (aggregate.body) |inner| {
+                if (!goalPlain(inner, instance)) break false;
+            } else true,
+    };
 }
 
 /// Whether the terms of a positive goal or head can be spread out: a list
@@ -1247,6 +1277,73 @@ test "a projected variable becomes one Skolem term, the same one in every invers
     try testing.expectEqualStrings(
         \\edge(X#3, $f0(X#3, Z#4)) :- v@0(X#3, Z#4) % generated.
         \\edge($f0(X#3, Z#4), Z#4) :- v@0(X#3, Z#4) % generated.
+        \\
+    , rendered);
+}
+
+test "a view reading its collected set with a list function inverts as it stands" {
+    // Definition 6.5.1, verbatim, and it needs nothing this module did not
+    // already have. To `obstacle` a list function is an ordinary positive
+    // relation over variables, so `v1(X, T) :- p(X), setof(Y, r(X, Y), S),
+    // sum(S, T)` is inside the conjunctive class and inverts like any other
+    // definition — which is what Section 6.5's proof relies on when it says
+    // the list functions in the views are treated no differently than base
+    // relations.
+    const allocator = testing.allocator;
+    var strings: string_table.StringTable = .init(allocator);
+    defer strings.deinit();
+    var scalars: scalar.Store = .init(allocator);
+    defer scalars.deinit();
+    var catalog: view_catalog.Catalog = .init(allocator);
+    defer catalog.deinit();
+
+    const v1 = try strings.intern("v1");
+    const p = try strings.intern("p");
+    const r = try strings.intern("r");
+    const sum = try strings.intern("sum");
+    const x = try strings.intern("X");
+    const y = try strings.intern("Y");
+    const s = try strings.intern("S");
+    const t = try strings.intern("T");
+
+    var head_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = t } };
+    var outer_terms = [_]syntax.Term{.{ .variable = x }};
+    var inner_terms = [_]syntax.Term{ .{ .variable = x }, .{ .variable = y } };
+    var summing = [_]syntax.Term{ .{ .variable = s }, .{ .variable = t } };
+    var inner = [_]syntax.Clause{.{ .relational = .{ .predicate = r, .terms = &inner_terms } }};
+    var body = [_]syntax.Clause{
+        .{ .relational = .{ .predicate = p, .terms = &outer_terms } },
+        .{ .aggregate = .{
+            .template = .{ .variable = y },
+            .body = &inner,
+            .output = .{ .variable = s },
+        } },
+        .{ .relational = .{ .predicate = sum, .terms = &summing } },
+    };
+    const id = try catalog.define(.{
+        .head = .{ .predicate = v1, .terms = &head_terms },
+        .body = &body,
+    }, .materialized);
+
+    const view = catalog.view(id);
+    try testing.expectEqual(@as(?Obstacle, null), obstacle(view));
+    var inverted = try invert(allocator, &catalog.symbols, view);
+    defer inverted.deinit();
+
+    const names: fold_ir.Names = .{
+        .symbols = &catalog.symbols,
+        .strings = &strings,
+        .scalars = &scalars,
+    };
+    const rendered = try renderRules(allocator, names, inverted.rules);
+    defer allocator.free(rendered);
+    // The head projected the collected list away, so it is a Skolem set — and
+    // it is the *same* set in the membership goal and in the reconstructed
+    // `sum` fact, which is the whole of what Definition 6.5.1 says.
+    try testing.expectEqualStrings(
+        \\p(X#4) :- v1@0(X#4, T#5) % generated.
+        \\r(X#4, Y#6) :- v1@0(X#4, T#5) % generated, $member(Y#6, $f0(X#4, T#5)) % generated.
+        \\sum($f0(X#4, T#5), T#5) :- v1@0(X#4, T#5) % generated.
         \\
     , rendered);
 }

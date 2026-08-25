@@ -32,6 +32,7 @@
 const std = @import("std");
 const fold_ir = @import("fold_ir.zig");
 const inversion = @import("inversion.zig");
+const list_functions = @import("list_functions.zig");
 const monotonicity = @import("monotonicity.zig");
 const relation_store = @import("relation_store.zig");
 const string_table = @import("string_table.zig");
@@ -91,6 +92,21 @@ pub const TransformationKind = enum {
     /// positive relation would have had to read a reconstructed value. The
     /// plan is still sound and returns less.
     instances_dropped,
+    /// The query named a list function the views do not expose and defined it
+    /// as a conjunction of ones they do, so the goal was replaced by that
+    /// definition and the definition dropped. A plan holds no list-function
+    /// definitions: what derives `sum` is the inverse of a view that stored
+    /// one.
+    list_function_expanded,
+    /// A view that collects a set and then reads it with list functions was
+    /// written as the two views it is — one collecting, one reading — so that
+    /// what it collected can be spoken of apart from what it reported.
+    view_split_at_its_aggregate,
+    /// Two views were proved to have collected the same set, so the set one of
+    /// them only named is the set the plan derives. This is Section 6.5's
+    /// functional dependency, decided while the plan was built rather than
+    /// carried in it.
+    collected_sets_identified,
 
     pub fn text(self: TransformationKind) []const u8 {
         return switch (self) {
@@ -104,6 +120,11 @@ pub const TransformationKind = enum {
             .membership_defined => "membership in a stored list is defined by the plan",
             .skolem_terms_eliminated => "relations split so that no reconstructed value stays unnameable",
             .instances_dropped => "instances that would have read a reconstructed value were dropped",
+            .list_function_expanded => "expanded into the list functions the views expose",
+            .view_split_at_its_aggregate => "split into the set it collects and the list " ++
+                "functions reading it",
+            .collected_sets_identified => "views proved to have collected one set, so the set " ++
+                "each only named is the one the plan derives",
         };
     }
 };
@@ -151,6 +172,30 @@ pub const PreconditionKind = enum {
     /// Two relations a plan may read store under one name and arity, so a
     /// lowered plan could not tell them apart.
     predicate_name_ambiguous,
+    /// The query defines a list function by recursion over the structure of a
+    /// list. Such a definition applied to a set the plan can only *name* builds
+    /// a longer list at every step, which is Example 6.5.1's non-termination,
+    /// and it is outside Theorem 6.5.1's class either way: a query's list
+    /// function has to be one the views expose or a conjunction of ones they
+    /// do.
+    query_list_function_recursive,
+    /// The query reads a collected set with a list function, and no view read
+    /// *that* set with it. Either no view exposes the function at all, or the
+    /// one that does collected a set nothing identified with this one — so
+    /// there is no rule the plan could derive the goal from.
+    list_function_set_unidentified,
+    /// An auxiliary view collects this relation, and the plan would know it
+    /// only as far as the views prove it.
+    ///
+    /// This is not the ordinary doubt about reading a reconstruction, and
+    /// monotonicity does not touch it. The plan says a view's stored value is
+    /// the sum of *the set the auxiliary view derived*; if that set is short a
+    /// value, the plan is not reading a subset of `sum` but asserting a `sum`
+    /// fact that is false, and a query monotonic in every relation it reads
+    /// still answers wrongly from a false fact. Only a relation the plan knows
+    /// exactly will do, which is Theorem 6.5.1's canonical-aggregate-view
+    /// condition read strictly.
+    set_collected_from_inexact_relation,
 
     pub fn text(self: PreconditionKind) []const u8 {
         return switch (self) {
@@ -166,6 +211,11 @@ pub const PreconditionKind = enum {
             .relation_read_non_positively => "known only as far as the views prove it, " ++
                 "and read under negation or inside an aggregate",
             .predicate_name_ambiguous => "another relation the plan may read stores under this name",
+            .query_list_function_recursive => "the query defines it by structural recursion, " ++
+                "which a named set would nest without end",
+            .list_function_set_unidentified => "no view read the collected set with it",
+            .set_collected_from_inexact_relation => "a view's list function read a set " ++
+                "collected from it, and the plan would know it only as far as the views prove",
         };
     }
 };
@@ -347,35 +397,76 @@ pub fn foldQuery(
     catalog: *view_catalog.Catalog,
     query: Query,
 ) !Outcome {
+    // The query first says what it wants in the vocabulary the views kept. A
+    // list function it defines for itself as a conjunction of ones they expose
+    // is replaced by that definition; one it defines by structural recursion
+    // is outside Theorem 6.5.1's class and there is nothing further to do.
+    var expansion = try list_functions.expandQuery(
+        allocator,
+        &catalog.symbols,
+        query.goals,
+        query.rules,
+    );
+    defer expansion.deinit();
+    const expanded: Query = .{ .goals = expansion.goals, .rules = expansion.rules };
+
     var reads: Reads = .{ .allocator = allocator };
     defer reads.deinit();
-    try reads.walkGoals(query.goals, true);
-    for (query.rules) |rule| {
+    try reads.walkGoals(expanded.goals, true);
+    for (expanded.rules) |rule| {
         try reads.defined.put(allocator, headKey(rule), {});
         try reads.walkGoals(rule.body, true);
     }
 
+    // Which views are two views wearing one head, and which of them collected
+    // the same set. Decided before the relations are examined, because an
+    // auxiliary view reads the relations its own aggregate reads and a plan
+    // deriving it has to get them from somewhere.
+    var splitting: Splitting = .{
+        .allocator = allocator,
+        .chase = .{ .allocator = allocator },
+        .scope = try catalog.symbols.openScope(.generated),
+    };
+    defer splitting.deinit();
+    try splitting.plan(catalog, &reads);
+
     var examination: Examination = .{ .allocator = allocator };
     defer examination.deinit();
-    try examine(&examination, catalog, query, &reads);
+    try examine(&examination, catalog, expanded, &reads);
+    // Both refusals are about what a *plan* would have to hold, so a query
+    // already inside the availability boundary meets neither: it is its own
+    // plan, its own rules are the ones that run, and no set was ever named.
+    if (examination.wanted.items.len != 0) {
+        if (expansion.recursive) |key| try note(allocator, &examination.unmet, .{
+            .kind = .query_list_function_recursive,
+            .subject = .{ .base = key },
+        });
+        try splitting.requireIdentified(&examination, catalog, expanded, &reads);
+        try splitting.requireExactlyCollected(&examination, catalog, &reads);
+    }
     if (examination.unmet.items.len != 0) return .{ .unsupported = .{
         .allocator = allocator,
         .unmet = try examination.unmet.toOwnedSlice(allocator),
     } };
 
     if (examination.wanted.items.len == 0) {
-        const copied = try fold_ir.cloneGoals(allocator, query.goals);
+        const copied = try fold_ir.cloneGoals(allocator, expanded.goals);
         errdefer fold_ir.freeGoals(allocator, copied);
-        const rules = try cloneRules(allocator, query.rules);
+        const rules = try cloneRules(allocator, expanded.rules);
         errdefer freeRules(allocator, rules);
-        const transformations = try allocator.alloc(Transformation, 1);
-        transformations[0] = .{ .kind = .query_left_unchanged };
+        var notes: std.ArrayList(Transformation) = .empty;
+        errdefer notes.deinit(allocator);
+        for (expansion.expanded) |key| try notes.append(allocator, .{
+            .kind = .list_function_expanded,
+            .subject = .{ .base = key },
+        });
+        try notes.append(allocator, .{ .kind = .query_left_unchanged });
         return .{ .folded = .{
             .allocator = allocator,
             .guarantee = .equivalent,
             .goals = copied,
             .rules = rules,
-            .transformations = transformations,
+            .transformations = try notes.toOwnedSlice(allocator),
         } };
     }
 
@@ -386,6 +477,13 @@ pub fn foldQuery(
     }
     var members = false;
     for (examination.wanted.items) |id| {
+        if (splitting.rewrites(id)) {
+            // The outer goals hold no aggregate — every one of them is in the
+            // auxiliary view — so nothing this emits reads a value out of a
+            // list.
+            try splitting.emit(catalog, id, &combined);
+            continue;
+        }
         var inverted = try inversion.invert(allocator, &catalog.symbols, catalog.view(id));
         errdefer inverted.deinit();
         try combined.ensureUnusedCapacity(allocator, inverted.rules.len);
@@ -393,11 +491,12 @@ pub fn foldQuery(
         allocator.free(inverted.take());
         members = members or inverted.reads_members;
     }
+    try splitting.emitAuxiliaryViews(catalog, &examination, &combined);
     // Reading a value back out of a stored list needs the rules that say what
     // being in a list means. They are the plan's own, added once however many
     // views turned out to need them.
     if (members) try inversion.appendMemberRules(allocator, &catalog.symbols, &combined);
-    for (query.rules) |rule| {
+    for (expanded.rules) |rule| {
         const copy = try fold_ir.cloneRule(allocator, rule);
         errdefer fold_ir.freeRule(allocator, copy);
         try combined.append(allocator, copy);
@@ -411,13 +510,15 @@ pub fn foldQuery(
     );
     errdefer eliminated.deinit();
 
-    const goals = try fold_ir.cloneGoals(allocator, query.goals);
+    const goals = try fold_ir.cloneGoals(allocator, expanded.goals);
     errdefer fold_ir.freeGoals(allocator, goals);
     const transformations = try describe(
         allocator,
         catalog,
         &reads,
         &examination,
+        &expansion,
+        &splitting,
         members,
         eliminated,
     );
@@ -449,6 +550,17 @@ const Reads = struct {
         self.* = undefined;
     }
 
+    /// Records one read of a base relation. An auxiliary view's own goals
+    /// arrive here as well as the query's, because a plan that derives such a
+    /// view reads them exactly as the query would have.
+    fn record(self: *Reads, key: relation_store.PredicateKey, positive: bool) !bool {
+        const entry = try self.relations.getOrPut(self.allocator, key);
+        if (!entry.found_existing) entry.value_ptr.* = false;
+        const was = entry.value_ptr.*;
+        if (!positive) entry.value_ptr.* = true;
+        return !entry.found_existing or (was != entry.value_ptr.*);
+    }
+
     fn walkGoals(self: *Reads, goals: []const fold_ir.Goal, positive: bool) !void {
         for (goals) |goal| try self.walkGoal(goal, positive);
     }
@@ -456,11 +568,7 @@ const Reads = struct {
     fn walkGoal(self: *Reads, goal: fold_ir.Goal, positive: bool) std.mem.Allocator.Error!void {
         switch (goal) {
             .relation => |relation| switch (relation.predicate) {
-                .base => |key| {
-                    const entry = try self.relations.getOrPut(self.allocator, key);
-                    if (!entry.found_existing) entry.value_ptr.* = false;
-                    if (!positive or relation.negated) entry.value_ptr.* = true;
-                },
+                .base => |key| _ = try self.record(key, positive and !relation.negated),
                 .view => |reference| try self.views.put(self.allocator, reference.id, {}),
                 // Nothing lowered from a query holds either, and a plan is
                 // not folded a second time.
@@ -482,6 +590,539 @@ fn headKey(rule: fold_ir.Rule) relation_store.PredicateKey {
         .base => |key| key,
         .view => |reference| .{ .name = reference.name, .arity = reference.arity },
         .generated, .auxiliary => unreachable,
+    };
+}
+
+/// A view that collects a set its head does not keep and then reads it, and
+/// what became of that set.
+const Split = struct {
+    id: fold_ir.ViewId,
+    layers: list_functions.Layers,
+    /// Which auxiliary view collects this view's set, or null when the
+    /// collecting half is not a rule and there is no auxiliary view to write.
+    /// Two views share a tag exactly when they collect the same set.
+    tag: ?u32,
+    /// The Skolem set inverting this view's layer names: the set that must
+    /// have been collected for its stored tuple to be there. What the chase is
+    /// about, and — for a view with no auxiliary view behind it — the only
+    /// name that set will ever have.
+    function: fold_ir.Function,
+};
+
+/// Section 6.5's steps 2(a) and 4, together: which views are split, which of
+/// them collect one set, and what a set a Skolem term names turns out to be.
+///
+/// The two belong together because neither is worth anything alone. Splitting
+/// a view without identifying the sets leaves two Skolem sets with no relation
+/// to each other, which is exactly where the dissertation's derivation gets
+/// stuck; identifying sets without splitting has nothing to identify them by,
+/// because the dependency is a property of the auxiliary view.
+const Splitting = struct {
+    allocator: std.mem.Allocator,
+    chase: list_functions.Chase,
+    /// Where the Skolem set of each layer is named.
+    scope: fold_ir.Scope,
+    splits: std.ArrayList(Split) = .empty,
+    /// The auxiliary views whose rules the plan has: one per tag some split
+    /// view actually contributed.
+    emitted: std.ArrayList(u32) = .empty,
+    identified: bool = false,
+    next_tag: u32 = 0,
+
+    fn deinit(self: *Splitting) void {
+        for (self.splits.items) |*split| split.layers.deinit();
+        self.splits.deinit(self.allocator);
+        self.emitted.deinit(self.allocator);
+        self.chase.deinit();
+        self.* = undefined;
+    }
+
+    fn find(self: *const Splitting, id: fold_ir.ViewId) ?*const Split {
+        for (self.splits.items) |*split| if (split.id == id) return split;
+        return null;
+    }
+
+    /// Splits every view whose list functions the query is going to need, and
+    /// records what its auxiliary view will read.
+    ///
+    /// Run to a fixpoint, because an auxiliary view's own goals are reads like
+    /// any others and can make a further view's list functions needed. It ends
+    /// because each round either splits a view the catalog holds or changes
+    /// nothing.
+    fn plan(self: *Splitting, catalog: *view_catalog.Catalog, reads: *Reads) !void {
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (catalog.views.items) |*view| {
+                if (self.find(view.id) != null) continue;
+                if (!view.readable()) continue;
+                if (inversion.obstacle(view) != null) continue;
+                var read = (try list_functions.layers(self.allocator, view.definition)) orelse
+                    continue;
+                errdefer read.deinit();
+                if (!wanted(&read, catalog, reads)) {
+                    read.deinit();
+                    continue;
+                }
+                try self.record(catalog, view, &read, reads);
+                changed = true;
+                // The list only grows, and `find` reads it, so a pointer taken
+                // before this round would be stale.
+                break;
+            }
+        }
+    }
+
+    /// Whether the query needs something only this view's layer can give it: a
+    /// list function it reads, that nothing else already supplies.
+    fn wanted(
+        read: *const list_functions.Layers,
+        catalog: *const view_catalog.Catalog,
+        reads: *const Reads,
+    ) bool {
+        for (read.functions) |function| {
+            const key = switch (function.predicate) {
+                .base => |value| value,
+                else => continue,
+            };
+            if (!reads.relations.contains(key)) continue;
+            if (catalog.baseAvailable(key)) continue;
+            if (reads.defined.contains(key)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn record(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        view: *const view_catalog.View,
+        read: *list_functions.Layers,
+        reads: *Reads,
+    ) !void {
+        // Every collected set gets a name of its own, whether or not anything
+        // will be proved about it. A set with only that name is one no plan
+        // can read, which is what the chase reports by leaving it alone.
+        const function = try catalog.symbols.freshFunction(self.scope);
+        _ = try self.chase.intern(.{ .skolem = function });
+
+        var tag: ?u32 = null;
+        if (read.auxiliary) |_| {
+            // The tag is the set's identity, so a view collecting a set
+            // another view already collects joins that one rather than
+            // starting a class of its own. This is the whole of the functional
+            // dependency: `va` is functional in its key, so two views written
+            // against one `va` read one set for one group.
+            tag = self.next_tag;
+            for (self.splits.items) |*existing| {
+                if (!try list_functions.collectTheSameSet(self.allocator, &existing.layers, read))
+                    continue;
+                tag = existing.tag;
+                break;
+            } else self.next_tag += 1;
+            try self.chase.unite(.{ .skolem = function }, .{ .collected = tag.? });
+
+            // What the auxiliary view will read. Its outer goals are read
+            // positively; the relations inside its aggregate are not, because
+            // it counts what they hold, and a plan that knows one of them only
+            // as far as the views prove it would collect a smaller set and
+            // then claim the stored sum was of *that*. Recording them before
+            // the split is kept, so that a failure here leaves the caller
+            // owning what it handed over.
+            for (read.auxiliary.?.outer) |relation| switch (relation.predicate) {
+                .base => |key| _ = try reads.record(key, true),
+                else => {},
+            };
+            try recordAggregate(reads, read.aggregate.body);
+        }
+        try self.splits.append(self.allocator, .{
+            .id = view.id,
+            .layers = read.*,
+            .tag = tag,
+            .function = function,
+        });
+    }
+
+    fn recordAggregate(reads: *Reads, goals: []const fold_ir.Goal) !void {
+        for (goals) |goal| switch (goal) {
+            .relation => |relation| switch (relation.predicate) {
+                .base => |key| _ = try reads.record(key, false),
+                else => {},
+            },
+            .aggregate => |aggregate| try recordAggregate(reads, aggregate.body),
+            .builtin => {},
+        };
+    }
+
+    /// Refuses a query whose list functions read a set no view read.
+    ///
+    /// A plan holds no list-function definitions, so a goal over a collected
+    /// set is derivable only from the inverse of a view that read *that* set
+    /// with *that* function. Without both there is no rule to derive it from
+    /// and the plan would quietly answer nothing, which is sound and is not an
+    /// answer to the question that was asked.
+    fn requireIdentified(
+        self: *Splitting,
+        examination: *Examination,
+        catalog: *const view_catalog.Catalog,
+        query: Query,
+        reads: *const Reads,
+    ) !void {
+        try self.requireIdentifiedIn(examination, catalog, query.goals, reads);
+        for (query.rules) |rule|
+            try self.requireIdentifiedIn(examination, catalog, rule.body, reads);
+    }
+
+    fn requireIdentifiedIn(
+        self: *Splitting,
+        examination: *Examination,
+        catalog: *const view_catalog.Catalog,
+        body: []const fold_ir.Goal,
+        reads: *const Reads,
+    ) !void {
+        var sets: std.array_hash_map.Auto(fold_ir.Variable, void) = .empty;
+        defer sets.deinit(self.allocator);
+        for (body) |goal| switch (goal) {
+            .aggregate => |aggregate| if (aggregate.output == .variable)
+                try sets.put(self.allocator, aggregate.output.variable, {}),
+            else => {},
+        };
+        if (sets.count() == 0) return;
+
+        for (body) |goal| {
+            const relation = switch (goal) {
+                .relation => |value| value,
+                else => continue,
+            };
+            if (relation.negated) continue;
+            const key = switch (relation.predicate) {
+                .base => |value| value,
+                else => continue,
+            };
+            if (catalog.baseAvailable(key) or reads.defined.contains(key)) continue;
+            var reads_set = false;
+            for (relation.terms) |term| switch (term) {
+                .variable => |variable| if (sets.contains(variable)) {
+                    reads_set = true;
+                },
+                else => {},
+            };
+            if (!reads_set) continue;
+            if (try self.exposes(key)) {
+                self.identified = true;
+                continue;
+            }
+            try note(examination.allocator, &examination.unmet, .{
+                .kind = .list_function_set_unidentified,
+                .subject = .{ .base = key },
+            });
+        }
+    }
+
+    /// Refuses a plan whose auxiliary view would collect from a relation it
+    /// knows incompletely.
+    ///
+    /// Everywhere else in this module a reconstruction being a subset costs
+    /// answers and keeps containment. Here it does not, and the difference is
+    /// worth being exact about. The layer rule says the value a view stored is
+    /// what the list function returns *of the set the auxiliary view derived*.
+    /// Derive a smaller set and the rule asserts something that never held —
+    /// not less of `sum` but a different `sum` — and a query that reads it
+    /// answers what it should not, however monotonic it is. So the relations
+    /// inside the aggregate have to be known exactly, and Theorem 6.5.1's
+    /// canonical aggregate views are what makes them so.
+    fn requireExactlyCollected(
+        self: *Splitting,
+        examination: *Examination,
+        catalog: *const view_catalog.Catalog,
+        reads: *const Reads,
+    ) !void {
+        for (self.splits.items) |*split| {
+            if (split.tag == null) continue;
+            for (examination.wanted.items) |id| {
+                if (id != split.id) continue;
+                try requireExact(examination, catalog, reads, split.layers.aggregate.body);
+            }
+        }
+    }
+
+    /// Whether some split view read a set with this function and the chase
+    /// knows which set that was.
+    fn exposes(self: *Splitting, key: relation_store.PredicateKey) !bool {
+        for (self.splits.items) |*split| {
+            for (split.layers.functions) |function| {
+                if (!function.predicate.equals(.{ .base = key })) continue;
+                if ((try self.chase.resolve(.{ .skolem = split.function })) != null) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Whether this view's rules come from the split rather than from the
+    /// ordinary Inverse Method. A view whose collecting half is not a rule has
+    /// no auxiliary view to write against, so there is nothing to rewrite and
+    /// it is inverted as it stands.
+    fn rewrites(self: *const Splitting, id: fold_ir.ViewId) bool {
+        const split = self.find(id) orelse return false;
+        return split.tag != null;
+    }
+
+    /// The rules a split view contributes, in place of the ones the ordinary
+    /// Inverse Method would have given it.
+    ///
+    /// Two halves. The outer goals are inverted exactly as any projection is,
+    /// which is what still reconstructs what the view's own body read. The
+    /// layer becomes one rule per list function, and this is where the chase
+    /// is spent: the set that function read is a Skolem term, and a Skolem
+    /// term proved to be an auxiliary view's set is replaced by the variable
+    /// that view binds. The rule saying the auxiliary view holds that set is
+    /// then dropped, because after the substitution it says only that the
+    /// auxiliary view holds what it holds.
+    fn emit(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        id: fold_ir.ViewId,
+        into: *std.ArrayList(fold_ir.Rule),
+    ) !void {
+        const split = self.find(id).?;
+        const view = catalog.view(id);
+        try self.emitOuterInverse(catalog, view, split, into);
+        try self.emitLayerInverse(catalog, view, split, into);
+        self.identified = true;
+        for (self.emitted.items) |already| {
+            if (already == split.tag.?) break;
+        } else try self.emitted.append(self.allocator, split.tag.?);
+    }
+
+    fn emitOuterInverse(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        view: *const view_catalog.View,
+        split: *const Split,
+        into: *std.ArrayList(fold_ir.Rule),
+    ) !void {
+        const outer = split.layers.auxiliary.?.outer;
+        const goals = try self.allocator.alloc(fold_ir.Goal, outer.len);
+        defer self.allocator.free(goals);
+        for (outer, goals) |relation, *slot| slot.* = .{ .relation = relation };
+
+        // A view of this catalog with the same head and only the outer goals.
+        // Everything `obstacle` refuses is refused of the original too, since
+        // this body is a subset of that one, so the inversion is admissible
+        // exactly when the view was.
+        var outer_only = view.*;
+        outer_only.definition = .{
+            .scope = view.definition.scope,
+            .head = view.definition.head,
+            .body = goals,
+        };
+        var inverted = try inversion.invert(self.allocator, &catalog.symbols, &outer_only);
+        errdefer inverted.deinit();
+        try into.ensureUnusedCapacity(self.allocator, inverted.rules.len);
+        into.appendSliceAssumeCapacity(inverted.rules);
+        self.allocator.free(inverted.take());
+    }
+
+    /// One rule per list function: `λ(S, T̄) :- v(X̄), va(K̄, S)`.
+    ///
+    /// What the Inverse Method writes here is `λ(f(X̄), T̄) :- v(X̄)`, naming
+    /// the set the view read and leaving it unreadable. `f(X̄)` and the set
+    /// `va(K̄, S)` derives are the same set — that is the dependency, and the
+    /// chase has already decided it — so the name is replaced by the variable
+    /// the auxiliary view binds, and the goal binding it is joined on. The
+    /// companion rule `va(K̄, f(X̄)) :- v(X̄)` is not written at all: after the
+    /// same substitution it says the auxiliary view holds what it holds.
+    fn emitLayerInverse(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        view: *const view_catalog.View,
+        split: *const Split,
+        into: *std.ArrayList(fold_ir.Rule),
+    ) !void {
+        const symbols = &catalog.symbols;
+        const definition = view.definition;
+        const auxiliary = split.layers.auxiliary.?;
+        const scope = try symbols.openScope(.generated);
+
+        var head_variables: std.array_hash_map.Auto(fold_ir.Variable, void) = .empty;
+        defer head_variables.deinit(self.allocator);
+        try fold_ir.collectRelationVariables(self.allocator, definition.head, &head_variables);
+
+        var renaming: fold_ir.Substitution = .{};
+        defer renaming.deinit(self.allocator);
+        for (head_variables.keys()) |variable| {
+            const fresh: fold_ir.Term = .{ .variable = switch (symbols.originOf(variable)) {
+                .user => |name| try symbols.freshUserVariable(scope, name),
+                .generated => try symbols.freshVariable(scope),
+            } };
+            try renaming.put(self.allocator, variable, fresh);
+        }
+        try renaming.put(
+            self.allocator,
+            split.layers.set,
+            .{ .variable = try symbols.freshVariable(scope) },
+        );
+
+        const stored = try fold_ir.substituteTerms(
+            self.allocator,
+            definition.head.terms,
+            &renaming,
+        );
+        defer fold_ir.freeTerms(self.allocator, stored);
+
+        for (split.layers.functions) |function| {
+            const head_terms = try fold_ir.substituteTerms(
+                self.allocator,
+                function.terms,
+                &renaming,
+            );
+            errdefer fold_ir.freeTerms(self.allocator, head_terms);
+
+            const collected = try self.allocator.alloc(fold_ir.Term, auxiliary.arity());
+            errdefer self.allocator.free(collected);
+            for (auxiliary.key, collected[0..auxiliary.key.len]) |variable, *slot|
+                slot.* = renaming.get(variable).?;
+            collected[collected.len - 1] = renaming.get(split.layers.set).?;
+
+            const body = try self.allocator.alloc(fold_ir.Goal, 2);
+            errdefer self.allocator.free(body);
+            body[0] = .{ .relation = .{
+                .predicate = view.predicate(),
+                .terms = try fold_ir.cloneTerms(self.allocator, stored),
+                .provenance = .generated,
+            } };
+            errdefer fold_ir.freeGoal(self.allocator, body[0]);
+            body[1] = .{ .relation = .{
+                .predicate = self.auxiliaryPredicate(split),
+                .terms = collected,
+                .provenance = .generated,
+            } };
+            try into.append(self.allocator, .{
+                .scope = scope,
+                .head = .{
+                    .predicate = function.predicate,
+                    .terms = head_terms,
+                    .provenance = .generated,
+                },
+                .body = body,
+            });
+        }
+    }
+
+    fn auxiliaryPredicate(self: *const Splitting, split: *const Split) fold_ir.Predicate {
+        _ = self;
+        return .{ .auxiliary = .{ .collected = .{
+            .tag = split.tag.?,
+            .arity = split.layers.auxiliary.?.arity(),
+        } } };
+    }
+
+    /// The auxiliary views themselves: `va(K̄, S) :- Φ, setof(Ȳ, Ψ, S)`, the
+    /// half of each split view that collects.
+    ///
+    /// This is the relation with no stored extension that F3 declined to
+    /// introduce, and the reason it earns its keep here is that the plan
+    /// *derives* it rather than inverting it. Its tuples are the sets the
+    /// reconstructed relations really collect, which is what a Skolem set can
+    /// be replaced by; F3's objection was to reconstructing an auxiliary and
+    /// then inverting it again, and nothing here inverts one.
+    fn emitAuxiliaryViews(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        examination: *const Examination,
+        into: *std.ArrayList(fold_ir.Rule),
+    ) !void {
+        var written: std.ArrayList(u32) = .empty;
+        defer written.deinit(self.allocator);
+        for (self.emitted.items) |tag| {
+            for (written.items) |already| {
+                if (already == tag) break;
+            } else {
+                const split = self.representative(tag, examination) orelse continue;
+                try written.append(self.allocator, tag);
+                try self.emitAuxiliaryView(catalog, split, into);
+            }
+        }
+    }
+
+    /// Which split's definition an auxiliary view is written from. Any of the
+    /// views sharing the tag will do — that they say the same thing is what
+    /// the tag means — so the first one the plan inverts is taken.
+    fn representative(
+        self: *const Splitting,
+        tag: u32,
+        examination: *const Examination,
+    ) ?*const Split {
+        for (self.splits.items) |*split| {
+            if (split.tag == null or split.tag.? != tag) continue;
+            for (examination.wanted.items) |id| if (id == split.id) return split;
+        }
+        return null;
+    }
+
+    fn emitAuxiliaryView(
+        self: *Splitting,
+        catalog: *view_catalog.Catalog,
+        split: *const Split,
+        into: *std.ArrayList(fold_ir.Rule),
+    ) !void {
+        const read = &split.layers;
+        const auxiliary = read.auxiliary.?;
+        const terms = try self.allocator.alloc(fold_ir.Term, auxiliary.arity());
+        defer self.allocator.free(terms);
+        for (auxiliary.key, terms[0..auxiliary.key.len]) |variable, *slot|
+            slot.* = .{ .variable = variable };
+        terms[terms.len - 1] = .{ .variable = read.set };
+
+        const goals = try self.allocator.alloc(fold_ir.Goal, auxiliary.outer.len + 1);
+        defer self.allocator.free(goals);
+        for (auxiliary.outer, goals[0..auxiliary.outer.len]) |relation, *slot| {
+            var copy = relation;
+            copy.provenance = .generated;
+            slot.* = .{ .relation = copy };
+        }
+        var collecting = read.aggregate;
+        collecting.provenance = .generated;
+        goals[goals.len - 1] = .{ .aggregate = collecting };
+
+        // Borrowed throughout: renaming is what copies it, into a scope of its
+        // own so that the auxiliary view's variables are nobody else's.
+        const borrowed: fold_ir.Rule = .{
+            .scope = catalog.view(split.id).definition.scope,
+            .head = .{
+                .predicate = self.auxiliaryPredicate(split),
+                .terms = terms,
+                .provenance = .generated,
+            },
+            .body = goals,
+        };
+        const renamed = try fold_ir.renameRule(self.allocator, &catalog.symbols, borrowed);
+        errdefer fold_ir.freeRule(self.allocator, renamed);
+        try into.append(self.allocator, renamed);
+    }
+};
+
+/// Notes every relation these goals read that the plan would not know exactly.
+fn requireExact(
+    examination: *Examination,
+    catalog: *const view_catalog.Catalog,
+    reads: *const Reads,
+    goals: []const fold_ir.Goal,
+) std.mem.Allocator.Error!void {
+    for (goals) |goal| switch (goal) {
+        .relation => |relation| switch (relation.predicate) {
+            .base => |key| {
+                if (catalog.baseAvailable(key)) continue;
+                if (!reads.defined.contains(key) and examination.isExact(key)) continue;
+                try note(examination.allocator, &examination.unmet, .{
+                    .kind = .set_collected_from_inexact_relation,
+                    .subject = .{ .base = key },
+                });
+            },
+            else => {},
+        },
+        .aggregate => |aggregate| try requireExact(examination, catalog, reads, aggregate.body),
+        .builtin => {},
     };
 }
 
@@ -721,15 +1362,27 @@ fn describe(
     catalog: *const view_catalog.Catalog,
     reads: *const Reads,
     examination: *const Examination,
+    expansion: *const list_functions.Expansion,
+    splitting: *const Splitting,
     members: bool,
     eliminated: inversion.Elimination,
 ) ![]Transformation {
     var notes: std.ArrayList(Transformation) = .empty;
     errdefer notes.deinit(allocator);
-    for (examination.wanted.items) |id| try notes.append(allocator, .{
-        .kind = .view_inverted,
-        .subject = catalog.view(id).predicate(),
+    for (expansion.expanded) |key| try notes.append(allocator, .{
+        .kind = .list_function_expanded,
+        .subject = .{ .base = key },
     });
+    for (examination.wanted.items) |id| {
+        if (splitting.rewrites(id)) try notes.append(allocator, .{
+            .kind = .view_split_at_its_aggregate,
+            .subject = catalog.view(id).predicate(),
+        });
+        try notes.append(allocator, .{
+            .kind = .view_inverted,
+            .subject = catalog.view(id).predicate(),
+        });
+    }
     for (reads.relations.keys()) |key| {
         if (reads.defined.contains(key) or catalog.baseAvailable(key)) continue;
         try notes.append(allocator, .{
@@ -740,6 +1393,8 @@ fn describe(
             .subject = .{ .base = key },
         });
     }
+    if (splitting.identified)
+        try notes.append(allocator, .{ .kind = .collected_sets_identified });
     if (examination.monotonic_admitted)
         try notes.append(allocator, .{ .kind = .monotonic_reads_admitted });
     if (members) try notes.append(allocator, .{ .kind = .membership_defined });
@@ -910,7 +1565,12 @@ const Lowering = struct {
                 }) catch return error.OutOfMemory;
                 break :blk self.strings.intern(spelling.written());
             },
-            .auxiliary => |relation| try self.strings.intern(relation.text()),
+            .auxiliary => |relation| blk: {
+                var spelling: std.Io.Writer.Allocating = .init(self.allocator);
+                defer spelling.deinit();
+                relation.write(&spelling.writer) catch return error.OutOfMemory;
+                break :blk self.strings.intern(spelling.written());
+            },
         };
     }
 

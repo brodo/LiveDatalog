@@ -221,7 +221,7 @@ pub const Predicate = union(enum) {
                 else => false,
             },
             .auxiliary => |relation| switch (other) {
-                .auxiliary => |other_relation| relation == other_relation,
+                .auxiliary => |other_relation| relation.equals(other_relation),
                 else => false,
             },
         };
@@ -231,24 +231,45 @@ pub const Predicate = union(enum) {
 /// A relation a fold defines for itself. Unlike a split, it does not stand for
 /// part of a relation the query named — it means the same thing in every plan,
 /// and the fold supplies the rules that derive it.
-pub const Auxiliary = enum {
+pub const Auxiliary = union(enum) {
     /// `member(X, L)`: `X` is one of the values in the list `L`. What reads a
     /// value back out of an aggregate output a view stored.
     member,
+    /// `va(K̄, S)`: the group `K̄` collected the set `S`. The aggregate half of
+    /// a view that collects a set and then reads it with list functions, held
+    /// apart from that reading so that two views collecting the *same* set can
+    /// say so — which is the whole content of Section 6.5's functional
+    /// dependency, and is not statable while each view keeps its own copy.
+    collected: Collected,
+
+    /// One such auxiliary view. `tag` is its identity within one fold and
+    /// means nothing outside it; several views share a tag exactly when they
+    /// collect the same set.
+    pub const Collected = struct { tag: u32, arity: usize };
 
     pub fn arity(self: Auxiliary) usize {
         return switch (self) {
             .member => 2,
+            .collected => |auxiliary| auxiliary.arity,
+        };
+    }
+
+    pub fn equals(self: Auxiliary, other: Auxiliary) bool {
+        return switch (self) {
+            .member => other == .member,
+            .collected => |auxiliary| other == .collected and
+                other.collected.tag == auxiliary.tag,
         };
     }
 
     /// The spelling it prints and executes under. The `$` is the hygiene rule:
     /// a program cannot name this relation, so a plan defining it cannot
     /// collide with one.
-    pub fn text(self: Auxiliary) []const u8 {
-        return switch (self) {
-            .member => "$member",
-        };
+    pub fn write(self: Auxiliary, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .member => try writer.writeAll("$member"),
+            .collected => |auxiliary| try writer.print("$va{d}", .{auxiliary.tag}),
+        }
     }
 };
 
@@ -881,7 +902,7 @@ pub fn writePredicate(
             names.strings.resolve(reference.origin.name),
             reference.tag,
         }),
-        .auxiliary => |relation| try writer.writeAll(relation.text()),
+        .auxiliary => |relation| try relation.write(writer),
     }
 }
 

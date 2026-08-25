@@ -288,6 +288,72 @@ first of all: Chapter 6 assumes negation has been rewritten into a `setof` with
 an empty output, which is precisely the shape this rejects, so the monotonic
 class never discharges a negated read.
 
+### List function
+
+A relation over a list — `sum(L, T)`, `length(L, C)`, Appendix B's whole
+catalogue — which in this engine is an ordinary user relation defined by
+*seeded structural rules*, not a language feature. Inverting a view that uses
+one needs no special machinery: to `inversion.obstacle` a list function is a
+positive relational goal over variables, so
+`v1(X, T) :- p(X), setof(Y, r(X, Y), S), sum(S, T)` is inside the conjunctive
+class and yields Definition 6.5.1's rules unchanged — the collected list
+becomes a Skolem set, and the *same* Skolem set stands in the membership goal
+and in the reconstructed `sum` fact. That is what Section 6.5's proof means by
+saying the list functions in the views are treated no differently than base
+relations.
+
+A plan holds no list-function *definitions*. What derives `sum` is the inverse
+of a view that stored a sum; the structural rules stay out, because applied to
+a set the plan can only name they build a longer list at every step, which is
+Example 6.5.1's non-termination. A query that defines its own list function is
+therefore either identical to one the views expose, or a conjunction over ones
+they do — `excess(L, E) :- sum(L, T), length(L, C), E = T - C` — in which case
+the goal is *expanded* into that definition and the definition dropped
+(`list_functions.zig`). A query defining one by structural recursion is refused
+rather than expanded, wherever in its rules that definition is written.
+
+### Auxiliary view and the chase
+
+What lets two views speak about one set (`list_functions.zig`, driven from
+`folding.zig`). A view that collects a set its head does not keep and then
+reads it with list functions is two views wearing one head: an auxiliary view
+`va(K̄, S) :- Φ(K̄), setof(Ȳ, Ψ, S)` that collects, and a layer
+`v(X̄) :- va(K̄, S), λ(S, T)` that reads. Splitting is not tidying — two views
+say nothing about each other while each keeps its own copy of the set, and
+everything about each other once both are written against one `va`.
+
+`va` is functional in its key, so two views written against one of them read
+one set for one group. Inverting a layer names the set it read with a Skolem
+term, and the dependency says that term *is* the auxiliary view's set — so the
+term is replaced by the variable `va` binds and the goal binding it is joined
+on, and the companion rule saying `va` holds that set is dropped as saying only
+that it holds what it holds. The equalities are decided while the plan is being
+built, by a union-find over set terms, rather than carried in it as Section
+6.5's chase rules: `e(X, X)` ranges over every term there is, and a plan that
+only answers correctly when something applies its equalities is not a plan.
+The union-find terminates because set terms are finite and do not nest, and it
+gives symmetry through canonical representatives, which the dissertation's rule
+set — reflexivity and transitivity only — does not.
+
+Three conditions decide whether a view has an auxiliary view at all. Its
+collecting half has to be a rule, so the key must be bound by the goals that
+half kept; and every value the aggregate takes from outside itself has to be
+one the head kept, or two stored tuples with one key would have collected
+different sets. A view failing either keeps its set nameless, the chase leaves
+it alone, and a query reading that set with a list function is `unsupported`
+rather than quietly answered from nothing.
+
+The relations *inside* an auxiliary view's aggregate must be known exactly, and
+this is the one place in folding where a reconstruction being a subset is not
+merely a loss. The layer rule asserts that a view's stored value is what the
+list function returns of the set `va` derived; derive a shorter set and the
+plan holds a `sum` fact that never held — not less of `sum` but a different
+one — and a query reading it answers wrongly however monotonic it is. Only a
+canonical aggregate view will do, which is Theorem 6.5.1's second condition
+read strictly. Its first condition, a monotonic query, is unreachable here:
+reading a collected set with a list function *is* reading the set with a second
+goal, which is what Definition 6.4.1's second condition forbids.
+
 ### Canonical aggregate view
 
 A view that remembers a whole relation (`view_catalog.zig`), in the sense of

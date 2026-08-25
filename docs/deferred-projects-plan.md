@@ -1717,6 +1717,173 @@ F4 was completed on 2026-08-25:
   and transitive without nontermination.
 - Plans lacking the required functional dependency remain unsupported.
 
+### Completed decisions
+
+F5 was completed on 2026-08-25:
+
+- **F4 already produces Definition 6.5.1's inverse rules, verbatim, and the
+  first thing this phase did was confirm it rather than rebuild it.** To
+  `inversion.obstacle` a list function is an ordinary positive relational goal
+  over variables, so `v1(X, T) :- p(X), setof(Y, r(X, Y), S), sum(S, T)` is
+  inside the conjunctive class and inverts like any other definition: `p(X) :-
+  v1(X, T)`, `r(X, Y) :- v1(X, T), $member(Y, $f0(X, T))`, `sum($f0(X, T), T)
+  :- v1(X, T)` — the same Skolem set in the membership goal and in the
+  reconstructed `sum` fact, which is the whole of what Definition 6.5.1 says.
+  A rendering test in `inversion.zig` holds it to exactly that text. Treating
+  the views' list functions as base relations is therefore not something this
+  phase built; it is what the code already did, and it is also what Section
+  6.5's proof relies on. What was left is three things: expanding a query list
+  function defined as a conjunctive view over the views' list functions, the
+  `va` auxiliary rewriting, and the equality chase. All three are in one new
+  module, `list_functions.zig`, beside the other five at `planner.zig`'s level,
+  importing only `fold_ir` and `relation_store` and taking no `*Database`.
+- **Example 6.5.2 could not be written as printed, and was restated rather than
+  approximated.** `avg(X, A) :- sum(X, S), length(X, C), A = S / C` needs
+  division, and `syntax.GoalKind` has `add` and `subtract`. Adding division is a
+  Project S decision — it touches S1's finite-`f64` policy, S2's canonical mixed
+  numeric semantics, division by zero and integer/float canonicalization — and
+  none of that is what a phase about the chase should be deciding. The headline
+  test is therefore `excess(L, E) :- sum(L, T), length(L, C), E = T - C`: the
+  same shape, a query list function defined as a conjunctive view over two the
+  views expose, combined arithmetically, and the same folding in every respect
+  that matters. The literal example becomes writable the day Project S adds
+  division, and the test changes by one goal when it does.
+- **F3's refusal of Appendix A.1 was right about its own case and does not
+  cover this one, and the difference is which way the auxiliary is used.** F3
+  declined Algorithms 1.1 and 1.2 because both introduce relations with no
+  stored extension, so a plan would have to reconstruct an auxiliary and then
+  *invert it again*. That is still true and nothing here does it: `va` is
+  derived forward, from the relations the plan reconstructed, and it is never
+  inverted. What it buys is a name for a set — the layer's Skolem set is proved
+  equal to a set the plan can actually compute — and that is not something F3's
+  cases needed, because there the enclosing template already bound the list.
+  Section 6.5's step 2(a) is implemented, step 1 (Algorithm 1.2) and step 2(b)
+  are not, and the shapes they exist for are refused with preconditions that
+  name what was missing rather than silently mishandled.
+- **The chase is a plan transformation and not a relation the plan carries**,
+  which is F2's rule about Skolem elimination applied again: a plan that only
+  answers correctly when something knows to apply its equalities is not a plan.
+  `e(X, X)` ranges over every term there is and the transitive rule over an
+  unbounded domain, so the dissertation's rules could not be materialized in
+  any case. What is there instead is a union-find over set terms — an
+  auxiliary view's set, or the Skolem set a layer's inverse names — decided
+  while the plan is built, with the substituted rules as the output. It
+  terminates for the reason splitting does: set terms are finite and do not
+  nest. And it gives *symmetry through canonical representatives*, which is
+  what the acceptance test asks for and what the dissertation's rule set, which
+  lists reflexivity and transitivity only, does not — though its own dependency
+  `e(S1, S2) :- va(X, S1), va(X, S2)` is symmetric by construction.
+- **Example 6.5.1 is refused, not merely survived.** Skolem elimination does
+  already prevent the nesting — a list holding a reconstructed value cannot be
+  split, so the instance is dropped — and an accident that happens to terminate
+  is not a rejection; it leaves a plan quietly answering less than it looks
+  like it answers. The query-rule path was open besides, because a caller can
+  hand `sum`'s definition over as one of the query's own rules, and
+  `compiledRule` does not run admission so the rule arrives with no seed
+  argument to notice. `list_functions.isStructuralRecursion` reads the shape
+  instead — a head holding a list, and a body reading the head's own predicate
+  — and any such rule in the query makes the fold `unsupported` whenever the
+  fold reconstructs anything. A query already inside the availability boundary
+  is untouched, because it is its own plan and no set was ever named.
+- **The monotonic branch of Theorem 6.5.1 is unreachable for the list-function
+  class, and this is stated rather than tested around.** A list function reads
+  the collected set, so the set occurs in the aggregate's output and in the
+  goal reading it — two occurrences, which is exactly the second condition of
+  Definition 6.4.1 and exactly what `monotonicity.ofQuery` refuses. A test in
+  `monotonicity.zig` holds Section 6.5's own query shape to that. Every F5 test
+  therefore lives in the canonical-aggregate-view branch, and `monotonicity` is
+  reused unchanged rather than relaxed.
+- **One condition is stronger here than the two F4 proved, and it had to be.**
+  Everywhere else in folding a reconstruction being a subset costs answers and
+  keeps containment. The layer rule does not read the set, it *asserts* about
+  it: `sum(S, T) :- v1(X, T), va(K̄, S)` says the stored `T` is the sum of
+  whatever the auxiliary view collected. Collect a shorter set and the plan
+  holds a `sum` fact that never held — not less of `sum` but a different `sum`
+  — and a query reading a false fact answers wrongly however monotonic it is.
+  So the relations inside an auxiliary view's aggregate must be *exact*, which
+  is Theorem 6.5.1's canonical-aggregate-view condition read strictly, and
+  `set_collected_from_inexact_relation` is the refusal when they are not. The
+  test that holds it down is deliberately a monotonic query that never reads
+  the relation at all — only the auxiliary view does — so nothing else in the
+  fold would have objected.
+- **A view has an auxiliary view only when its collecting half is a rule and
+  its set is determined by what the head kept.** The key must be bound by the
+  goals that half kept, or `va(K̄, S) :- setof(...)` has a head variable
+  nothing binds; and every value the aggregate takes from outside itself must
+  be a head variable, or two stored tuples sharing a key collected different
+  sets and the dependency is simply false. A view failing either keeps its set
+  nameless: the chase leaves it in a class of its own, and a query reading that
+  set with a list function is `list_function_set_unidentified` rather than
+  quietly answered from nothing. The first condition is also what keeps
+  Section 6.3.2's shape — `v(X) :- p(X, S), setof(Y, r(X, Y), S)`, where the
+  goal outside the aggregate *binds* the collected list rather than reading a
+  function of it — inverted the ordinary way, which is what F4's test of it
+  expects.
+- The IR gained one thing: `fold_ir.Auxiliary` is a union rather than an enum,
+  so a fold-owned relation can carry an identity. `$member` means the same
+  thing in every plan; `$va0` means one particular group's set within one, and
+  two views share a tag exactly when they collect the same set. It is compared
+  by tag and printed as `$va{n}`, which no source program can spell.
+- Two tightenings in `inversion.zig` that an auxiliary view makes reachable and
+  nothing before it did, because `va` is the first head a fold derives into
+  that is neither a base relation nor a split of one, and its body is the only
+  place where an aggregate stands beside goals binding values for it. An
+  instance whose auxiliary head would carry a Skolem shape is dropped — a
+  relation the fold defines has no original to stand for part of, so a split of
+  it would mean nothing, and without the drop `register` reaches its
+  `unreachable`. And `admits` now requires every value an aggregate touches to
+  be ordinary, not only what it collects and reports: a variable elimination
+  spread across several columns outside would arrive inside the aggregate as
+  itself and be bound nowhere. The first is held down by a test that crashes
+  without it. The second is not: junk derived under a Skolem shape stays inside
+  Skolem-shaped relations, so no answer changes, and it is kept as a
+  well-formedness fix rather than a containment one. Recording that plainly is
+  better than implying a test proves it.
+- **A finding about the dissertation worth writing down.** Figure 6.2's plan
+  does not derive its own example answer under bottom-up evaluation. `tq` still
+  contains `setof(Y, r(X, Y), S)`, `r` is reconstructed only from
+  `va(X, S), member(X, S)` over Skolem sets, so `S` is `[]`, and `sum([], T)`
+  has no rule because the plan deliberately excludes the list functions'
+  definitions. The derivation the chapter draws needs `va`'s *forward*
+  definition in the plan, which step 5 does not put there. This implementation
+  does put it there — `va` is derived, not inverted — and that is what makes
+  the chase land on a set with a value in it rather than on two names.
+- The containment claims were checked by breaking each and watching a test
+  fail. Merging two set classes that were never one makes the containment test
+  answer twice and fails the identity unit test; dropping the exactness
+  requirement fails the monotonic-query test; dropping either separability
+  condition fails the unidentified-set test or F4's projected-list test;
+  making `isStructuralRecursion` blind fails the Example 6.5.1 test; dropping
+  the identification requirement fails the unidentified-set test; dropping the
+  auxiliary-head guard crashes the unnameable-group test.
+- The bounded sweep is 64 databases — two keys and two values, exhaustively —
+  held to *equality* rather than containment, because the canonical view makes
+  the reconstruction exact and a containment check would pass a plan that had
+  simply gone quiet. The bound contains a key whose collected set is empty and
+  one whose is not, a key `r` relates that `p` withholds, two keys collecting
+  different sets, and sets of size zero, one and two. The two values are 2 and
+  5 so that all four reachable answers are distinct: a plan pairing one key's
+  sum with another's length would have to answer a number the query never does,
+  rather than coincidentally the right one. Three of either would be sixteen or
+  sixty-four times the work for the same shapes.
+- One wrinkle in the *oracle* rather than in the folding, recorded because it
+  looks like a bug and is not. The source database needs the collected lists to
+  exist as base structures — a `seed` relation naming them — before the seeded
+  structural rules defining `sum` and `length` derive over them, since a list
+  that only ever exists as an aggregate's output inside a higher stratum is not
+  a list those rules are seeded from. The plan needs no such thing, because it
+  holds no structural rules at all: it derives `sum` from the inverse of a view
+  that stored one. So the folded side is, in this narrow sense, better behaved
+  than the database it was folded from.
+- Folding still has no public entry point, so there is no public API or
+  ownership documentation to update; the README's "Query folding" section was
+  cut at `dc20056` and stays cut. The vocabulary is in `CONTEXT.md`, which now
+  has entries for list functions and for the auxiliary view and the chase. F6
+  is when an embedder can declare a view.
+- Not performance relevant to the engine: nothing in this phase runs during
+  evaluation and no benchmark changed. The suite goes from 180 tests to 197 in
+  about twelve seconds.
+
 ## F6: execution integration and view selection
 
 ### Scope
@@ -1762,8 +1929,8 @@ Use one session and one commit per phase unless a phase proves too large:
 15. F2 ordinary Inverse Method — **done 2026-08-11**
 16. F3 conjunctive aggregate inversion — **done 2026-08-11**
 17. F4 soundness restrictions — **done 2026-08-25**
-18. F5 list functions and dependency chase — **next**
-19. F6 execution and view selection
+18. F5 list functions and dependency chase — **done 2026-08-25**
+19. F6 execution and view selection — **next**
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
