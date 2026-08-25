@@ -224,6 +224,21 @@ pub fn build(b: *std.Build) void {
     );
     folding_benchmark_step.dependOn(&b.addRunArtifact(folding_benchmark_exe).step);
 
+    const interning_benchmark_exe = b.addExecutable(.{
+        .name = "interning-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/interning.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "LiveDatalog", .module = mod }},
+        }),
+    });
+    const interning_benchmark_step = b.step(
+        "benchmark-interning",
+        "Report what interning costs while loading facts and while materializing",
+    );
+    interning_benchmark_step.dependOn(&b.addRunArtifact(interning_benchmark_exe).step);
+
     const fmt_paths: []const []const u8 = &.{
         "build.zig",
         "build.zig.zon",

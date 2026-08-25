@@ -10,6 +10,7 @@ const std = @import("std");
 const auxiliary_view = @import("auxiliary_view.zig");
 const cost_model = @import("cost_model.zig");
 const evaluator = @import("evaluator.zig");
+const intern_index = @import("intern_index.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const string_table = @import("string_table.zig");
@@ -23,6 +24,16 @@ pub const Materialization = union(enum) {
     uninitialized,
     clean,
     dirty_from_stratum: usize,
+};
+
+/// What interning has cost, and over how large a table. Reported in
+/// comparisons because a comparison count does not depend on the machine that
+/// made it; see `Database.internStats`.
+pub const InternStats = struct {
+    scalars: intern_index.Counts,
+    values: intern_index.Counts,
+    scalar_entries: usize,
+    value_entries: usize,
 };
 
 pub const MaintenanceStats = struct {
@@ -253,6 +264,20 @@ pub const Database = struct {
             },
         };
         return node;
+    }
+
+    /// What interning has cost this database, in comparisons rather than in
+    /// time: interning is on the path of every fact loaded and every value
+    /// derived, and a comparison count is the same number on every machine.
+    /// The counts follow a statement's staging copy back on commit, so a
+    /// statement rolled back takes its own share of them with it.
+    pub fn internStats(self: *const Database) InternStats {
+        return .{
+            .scalars = self.eval.scalars.counts,
+            .values = self.eval.values.counts,
+            .scalar_entries = self.eval.scalars.values.items.len,
+            .value_entries = self.eval.values.values.items.len,
+        };
     }
 
     /// Records how the maintained views are classified and how much work

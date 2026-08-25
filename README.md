@@ -180,7 +180,15 @@ never retained. Query results own their data and outlive the database.
 **Debugging.** `setShadowVerification(true)` makes every maintained closure
 be compared against a fresh rebuild before the change commits, reporting a
 disagreement as `MaintenanceMismatch`. It roughly doubles update cost and is
-meant for tests.
+meant for tests. `internStats` reports what interning ground values has cost
+this database, in searches made and table entries compared rather than in
+time, so a workload can be checked against a machine-independent number.
+
+**Value identity.** A ground value is interned once per database: equal values
+share one identifier, and a copy of a database gives the same value the same
+identifier. Loading many facts one at a time is much more expensive than
+loading them in one `applyChanges` batch — each statement is its own
+transaction and copies the database — so prefer the batch when you have one.
 
 ### Join planning
 

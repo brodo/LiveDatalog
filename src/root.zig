@@ -17,6 +17,7 @@ const evaluator = @import("evaluator.zig");
 const fold_ir = @import("fold_ir.zig");
 const folding = @import("folding.zig");
 const input_compiler = @import("input_compiler.zig");
+const intern_index = @import("intern_index.zig");
 const inversion = @import("inversion.zig");
 const list_functions = @import("list_functions.zig");
 const maintenance = @import("maintenance.zig");
@@ -49,6 +50,7 @@ pub const MaintenancePolicy = cost_model.MaintenancePolicy;
 /// Re-exported so callers select a policy without importing the planner.
 pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
+pub const InternStats = database.InternStats;
 pub const Statement = statement.Statement;
 
 /// A view this database's catalog holds, as `defineView` handed it back.
@@ -691,6 +693,14 @@ pub const Jatalog = struct {
         return self.state.maintenanceStats();
     }
 
+    /// What interning has cost this database, in comparisons rather than in
+    /// time. Every fact loaded and every value derived goes through the value
+    /// tables, and a comparison count is the same number on every machine,
+    /// which is what makes a change to how they are searched reportable.
+    pub fn internStats(self: *const Jatalog) InternStats {
+        return self.state.internStats();
+    }
+
     pub fn execute(self: *Jatalog, source: []const u8) !results.ExecutionResult {
         var statement_parser: parser.Parser = .{ .jatalog = &self.state, .source = source };
         return statement_parser.executeAll();
@@ -947,6 +957,7 @@ test {
     _ = fold_ir;
     _ = folding;
     _ = input_compiler;
+    _ = intern_index;
     _ = inversion;
     _ = list_functions;
     _ = maintenance;
@@ -3486,6 +3497,69 @@ test "random mixed update traces match a clean rebuild after every batch" {
         try std.testing.expect(db.state.materialization == .clean);
         try test_support.expectClosureMatchesRebuild(&db.state);
     }
+}
+
+test "a cloned database interns to the same identifiers as the database it came from" {
+    // Three things rest on this, and the hash index beside each value table
+    // is why it is worth restating. A retraction resolves its goals against a
+    // copy and lets only the facts it resolved to cross back, which they can
+    // because the copy shares the original's identifiers. A view catalog's
+    // constants are this database's scalars — its predicate names are string
+    // table entries, which nothing here touches — and `Jatalog.clone` hands
+    // out the catalog and the database together, so what `Catalog.clone`
+    // recorded has to mean the same thing in what `Database.clone` returns.
+    // And a cached folded plan holds lowered rules interned against the
+    // database that cached it. The index is a lookup accelerator over an
+    // unchanged ordered table, so identifiers stay insertion positions and a
+    // copy assigns them exactly as the original did.
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var loaded = try db.execute(
+        \\edge(a, b).
+        \\edge(b, c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Y) :- path(X, Z), edge(Z, Y).
+        \\reach(X, S) :- path(X, Y), setof(Y, path(X, Y), S).
+    );
+    loaded.deinit();
+    try db.materialize();
+
+    var copy = try db.clone();
+    defer copy.deinit();
+
+    const scalars = &db.state.eval.scalars;
+    const copied_scalars = &copy.state.eval.scalars;
+    for ([_][]const u8{ "a", "b", "c" }) |atom| {
+        try std.testing.expectEqual(
+            try scalars.internAtom(atom),
+            try copied_scalars.internAtom(atom),
+        );
+    }
+
+    const values = &db.state.eval.values;
+    const copied_values = &copy.state.eval.values;
+    for (values.values.items, 0..) |value, id| {
+        try std.testing.expectEqual(@as(syntax.ValueId, @intCast(id)), try values.intern(value));
+        try std.testing.expectEqual(
+            @as(syntax.ValueId, @intCast(id)),
+            try copied_values.intern(value),
+        );
+    }
+
+    // A value neither has seen lands at the same identifier on both sides,
+    // which is what makes a fact resolved on the copy nameable here.
+    const fresh_scalar = try copied_scalars.internAtom("d");
+    try std.testing.expectEqual(fresh_scalar, try scalars.internAtom("d"));
+    const head = try values.intern(.{ .scalar = fresh_scalar });
+    try std.testing.expectEqual(head, try copied_values.intern(.{ .scalar = fresh_scalar }));
+    const tail = try values.intern(.nil);
+    try std.testing.expectEqual(tail, try copied_values.intern(.nil));
+    const fresh_value: evaluator.Value = .{ .cons = .{ .head = head, .tail = tail } };
+    try std.testing.expectEqual(
+        try values.intern(fresh_value),
+        try copied_values.intern(fresh_value),
+    );
+    try std.testing.expectEqual(values.values.items.len, copied_values.values.items.len);
 }
 
 test "retraction maintains the closure incrementally" {

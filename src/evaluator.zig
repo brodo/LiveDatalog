@@ -15,6 +15,7 @@
 //! instead of the error set and does not compile.
 
 const std = @import("std");
+const intern_index = @import("intern_index.zig");
 const scalar = @import("scalar.zig");
 const syntax = @import("syntax.zig");
 const planner = @import("planner.zig");
@@ -29,9 +30,40 @@ pub const Value = union(enum) {
     cons: struct { head: syntax.ValueId, tail: syntax.ValueId },
 };
 
+/// A hash agreeing with the `std.meta.eql` the table compares values by.
+/// `Value` holds no slices, so the automatic hash covers exactly the bytes
+/// equality compares.
+fn hashValue(value: Value) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    std.hash.autoHash(&hasher, value);
+    return hasher.final();
+}
+
 pub const ValueTable = struct {
     allocator: std.mem.Allocator,
     values: std.ArrayList(Value) = .empty,
+    /// Where a value equal to the one being interned already is. The ordered
+    /// table above stays the source of truth and an identifier stays its
+    /// position in it, so this accelerates the search and changes nothing
+    /// about identity, ordering, or canonicalization.
+    index: intern_index.Index = .empty,
+    /// What interning this table has cost, machine-independently.
+    counts: intern_index.Counts = .{},
+
+    /// How the index reaches the table: what an entry hashes to, and whether
+    /// the entry at an identifier is the value being looked for.
+    const Lookup = struct {
+        table: *const ValueTable,
+        key: Value,
+
+        pub fn matches(self: Lookup, id: u32) bool { // ziglint-ignore: Z012
+            return std.meta.eql(self.table.values.items[id], self.key);
+        }
+
+        pub fn hash(self: Lookup, id: u32) u64 { // ziglint-ignore: Z012
+            return hashValue(self.table.values.items[id]);
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) ValueTable {
         return .{ .allocator = allocator };
@@ -39,22 +71,35 @@ pub const ValueTable = struct {
 
     pub fn deinit(self: *ValueTable) void {
         self.values.deinit(self.allocator);
+        self.index.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn clone(self: *const ValueTable) !ValueTable {
+        var values = try self.values.clone(self.allocator);
+        errdefer values.deinit(self.allocator);
         return .{
             .allocator = self.allocator,
-            .values = try self.values.clone(self.allocator),
+            .values = values,
+            .index = try self.index.clone(self.allocator),
+            .counts = self.counts,
         };
     }
 
     pub fn intern(self: *ValueTable, value: Value) !syntax.ValueId {
-        for (self.values.items, 0..) |existing, index| {
-            if (std.meta.eql(existing, value)) return @intCast(index);
-        }
+        const lookup: Lookup = .{ .table = self, .key = value };
+        const hash = hashValue(value);
+        self.counts.calls += 1;
+        const found = self.index.find(hash, lookup);
+        self.counts.compared += found.compared;
+        if (found.id) |id| return id;
+        // The index reserves before the table appends, so a failure on either
+        // side leaves the two agreeing with each other.
+        try self.index.reserve(self.allocator, lookup);
         try self.values.append(self.allocator, value);
-        return @intCast(self.values.items.len - 1);
+        const id: u32 = @intCast(self.values.items.len - 1);
+        self.index.insertAssumeCapacity(hash, id);
+        return id;
     }
 
     pub fn get(self: *const ValueTable, id: syntax.ValueId) Value {
@@ -776,3 +821,81 @@ pub const Evaluator = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+/// What the table answered before it had an index: the scan `intern` used to
+/// make over the ordered values.
+fn scanFor(table: *const ValueTable, value: Value) ?syntax.ValueId {
+    for (table.values.items, 0..) |existing, index| {
+        if (std.meta.eql(existing, value)) return @intCast(index);
+    }
+    return null;
+}
+
+test "interning a value through the index agrees with a linear scan over the same table" {
+    var scalars: scalar.Store = .init(testing.allocator);
+    defer scalars.deinit();
+    var table: ValueTable = .init(testing.allocator);
+    defer table.deinit();
+
+    // Scalars, `nil`, and lists nested deeply enough that the cons cells of
+    // one list are the tails of another.
+    var values: std.ArrayList(Value) = .empty;
+    defer values.deinit(testing.allocator);
+    try values.append(testing.allocator, .nil);
+    for (0..64) |number| {
+        try values.append(testing.allocator, .{
+            .scalar = try scalars.internInteger(@intCast(number)),
+        });
+    }
+    var tail = try table.intern(.nil);
+    for (0..64) |number| {
+        const head = try table.intern(.{
+            .scalar = try scalars.internInteger(@intCast(number)),
+        });
+        const cell: Value = .{ .cons = .{ .head = head, .tail = tail } };
+        try values.append(testing.allocator, cell);
+        tail = try table.intern(cell);
+    }
+
+    for (values.items) |value| {
+        const id = try table.intern(value);
+        try testing.expectEqual(id, scanFor(&table, value).?);
+    }
+    // Everything above was already interned, so the table did not grow.
+    try testing.expectEqual(@as(usize, 129), table.values.items.len);
+    try testing.expectEqual(table.values.items.len, table.index.filled);
+
+    // A value the table has never held is appended at the end, once.
+    const fresh: Value = .{ .cons = .{ .head = tail, .tail = tail } };
+    try testing.expectEqual(@as(?syntax.ValueId, null), scanFor(&table, fresh));
+    try testing.expectEqual(@as(syntax.ValueId, 129), try table.intern(fresh));
+    try testing.expectEqual(@as(syntax.ValueId, 129), try table.intern(fresh));
+    try testing.expectEqual(@as(usize, 130), table.values.items.len);
+}
+
+test "a cloned value table interns to the same identifiers as the table it came from" {
+    var table: ValueTable = .init(testing.allocator);
+    defer table.deinit();
+    var tail = try table.intern(.nil);
+    for (0..200) |number| {
+        tail = try table.intern(.{ .cons = .{
+            .head = @intCast(number % 7),
+            .tail = tail,
+        } });
+    }
+
+    var copy = try table.clone();
+    defer copy.deinit();
+    for (table.values.items) |value| {
+        try testing.expectEqual(try table.intern(value), try copy.intern(value));
+    }
+    try testing.expectEqual(table.values.items.len, copy.values.items.len);
+
+    const fresh: Value = .{ .cons = .{ .head = tail, .tail = tail } };
+    try testing.expectEqual(
+        @as(syntax.ValueId, @intCast(table.values.items.len)),
+        try copy.intern(fresh),
+    );
+}

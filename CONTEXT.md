@@ -32,6 +32,24 @@ order, atoms in lexical byte order, `nil`, then cons values lexicographically
 by head and tail. The total order reports equality exactly when scalar identity
 is equal.
 
+### Interning
+
+How a ground value becomes an identifier (`scalar.zig`, `evaluator.zig`). A
+database holds one ordered table of scalars and one of structural values, and
+an identifier *is* a position in one of them: interning an equal value twice
+gives one identifier, which is what makes equality, set semantics and the
+canonical order cheap. Both tables only ever grow, and a copy of a database
+has the same entries in the same order, so a value has the same identifier in
+a copy as in the original — which is what lets a retraction resolve its goals
+on a copy, a view catalog record the database's names, and a cached folded
+plan hold rules interned against the database that cached it.
+
+An index of positions sits beside each table so that finding an equal entry
+does not walk it. The table stays the source of truth: the index holds no
+keys and decides nothing, so identity, ordering and canonicalization are the
+table's alone. `internStats` reports what interning has cost in searches and
+comparisons, which is a machine-independent number.
+
 ### Materialization
 
 The persistent derived closure. A database with rules materializes lazily at

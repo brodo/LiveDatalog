@@ -1,4 +1,5 @@
 const std = @import("std");
+const intern_index = @import("intern_index.zig");
 
 pub const Id = enum(u64) { _ };
 
@@ -10,9 +11,70 @@ pub const Value = union(enum) {
 
 const two_pow_63: f64 = 9223372036854775808.0;
 
+/// What a lookup is for: the three cases of `Value` with the atom borrowed
+/// rather than owned, because a lookup has not decided to store anything yet.
+const Key = union(enum) {
+    atom: []const u8,
+    integer: i64,
+    float: f64,
+};
+
+fn keyOf(value: Value) Key {
+    return switch (value) {
+        .atom => |atom| .{ .atom = atom },
+        .integer => |number| .{ .integer = number },
+        .float => |number| .{ .float = number },
+    };
+}
+
+/// Whether a stored value is what a lookup is for. This is exactly what the
+/// three interning scans compared: values of different kinds are never equal,
+/// atoms compare by their bytes, and numbers by their own equality.
+fn matchesKey(value: Value, key: Key) bool {
+    return switch (key) {
+        .atom => |wanted| value == .atom and std.mem.eql(u8, value.atom, wanted),
+        .integer => |wanted| value == .integer and value.integer == wanted,
+        .float => |wanted| value == .float and value.float == wanted,
+    };
+}
+
+/// A hash agreeing with `matchesKey`. Hashing a float by its bits agrees with
+/// `==` here because the only two distinct bit patterns that compare equal are
+/// the two zeroes, and both canonicalize to the integer zero in `internFloat`
+/// before any float reaches the table.
+fn hashKey(key: Key) u64 {
+    return switch (key) {
+        .atom => |atom| std.hash.Wyhash.hash(0, atom),
+        .integer => |number| std.hash.Wyhash.hash(1, std.mem.asBytes(&number)),
+        .float => |number| std.hash.Wyhash.hash(2, std.mem.asBytes(&number)),
+    };
+}
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     values: std.ArrayList(Value) = .empty,
+    /// Where a scalar equal to the one being interned already is. The ordered
+    /// table above stays the source of truth and an identifier stays its
+    /// position in it, so this accelerates the search and changes nothing
+    /// about identity, ordering, or canonicalization.
+    index: intern_index.Index = .empty,
+    /// What interning this store has cost, machine-independently.
+    counts: intern_index.Counts = .{},
+
+    /// How the index reaches the store: what an entry hashes to, and whether
+    /// the entry at an identifier is the scalar being looked for.
+    const Lookup = struct {
+        store: *const Store,
+        key: Key,
+
+        pub fn matches(self: Lookup, id: u32) bool { // ziglint-ignore: Z012
+            return matchesKey(self.store.values.items[id], self.key);
+        }
+
+        pub fn hash(self: Lookup, id: u32) u64 { // ziglint-ignore: Z012
+            return hashKey(keyOf(self.store.values.items[id]));
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -24,11 +86,13 @@ pub const Store = struct {
             .integer, .float => {},
         };
         self.values.deinit(self.allocator);
+        self.index.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn clone(self: *const Store) !Store {
         var result: Store = .init(self.allocator);
+        result.counts = self.counts;
         errdefer result.deinit();
         for (self.values.items) |value| switch (value) {
             .atom => |atom| {
@@ -40,27 +104,46 @@ pub const Store = struct {
             },
             .integer, .float => try result.values.append(self.allocator, value),
         };
+        result.index = try self.index.clone(self.allocator);
         return result;
     }
 
+    /// The identifier of the scalar `key` names, if the store already holds
+    /// it, counting the comparisons the search made.
+    fn find(self: *Store, key: Key, hash: u64) ?Id {
+        self.counts.calls += 1;
+        const found = self.index.find(hash, Lookup{ .store = self, .key = key });
+        self.counts.compared += found.compared;
+        return if (found.id) |id| @enumFromInt(id) else null;
+    }
+
+    /// Records the value just appended to the table. The caller reserved room
+    /// before appending, so this cannot fail and cannot leave the index
+    /// disagreeing with the table.
+    fn noteInterned(self: *Store, hash: u64) Id {
+        const id: u32 = @intCast(self.values.items.len - 1);
+        self.index.insertAssumeCapacity(hash, id);
+        return @enumFromInt(id);
+    }
+
     pub fn internAtom(self: *Store, atom: []const u8) !Id {
-        for (self.values.items, 0..) |value, index| switch (value) {
-            .atom => |existing| if (std.mem.eql(u8, existing, atom)) return @enumFromInt(index),
-            .integer, .float => {},
-        };
+        const key: Key = .{ .atom = atom };
+        const hash = hashKey(key);
+        if (self.find(key, hash)) |id| return id;
+        try self.index.reserve(self.allocator, Lookup{ .store = self, .key = key });
         const owned = try self.allocator.dupe(u8, atom);
         errdefer self.allocator.free(owned);
         try self.values.append(self.allocator, .{ .atom = owned });
-        return @enumFromInt(self.values.items.len - 1);
+        return self.noteInterned(hash);
     }
 
     pub fn internInteger(self: *Store, number: i64) !Id {
-        for (self.values.items, 0..) |value, index| switch (value) {
-            .integer => |existing| if (existing == number) return @enumFromInt(index),
-            .atom, .float => {},
-        };
+        const key: Key = .{ .integer = number };
+        const hash = hashKey(key);
+        if (self.find(key, hash)) |id| return id;
+        try self.index.reserve(self.allocator, Lookup{ .store = self, .key = key });
         try self.values.append(self.allocator, .{ .integer = number });
-        return @enumFromInt(self.values.items.len - 1);
+        return self.noteInterned(hash);
     }
 
     /// Interns a float under the canonical numeric policy: NaN reports
@@ -74,12 +157,12 @@ pub const Store = struct {
         if (floored == number and number >= -two_pow_63 and number < two_pow_63) {
             return self.internInteger(@intFromFloat(number));
         }
-        for (self.values.items, 0..) |value, index| switch (value) {
-            .float => |existing| if (existing == number) return @enumFromInt(index),
-            .atom, .integer => {},
-        };
+        const key: Key = .{ .float = number };
+        const hash = hashKey(key);
+        if (self.find(key, hash)) |id| return id;
+        try self.index.reserve(self.allocator, Lookup{ .store = self, .key = key });
         try self.values.append(self.allocator, .{ .float = number });
-        return @enumFromInt(self.values.items.len - 1);
+        return self.noteInterned(hash);
     }
 
     pub fn parseBare(self: *Store, literal: []const u8) !Id {
@@ -268,4 +351,107 @@ fn isBareAtom(atom: []const u8) bool {
     if (atom.len == 0 or std.ascii.isUpper(atom[0]) or isNumericLeading(atom)) return false;
     for (atom) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
     return true;
+}
+
+const testing = std.testing;
+
+/// What `find` answers if the index is not consulted at all: the scan the
+/// three interning functions used to make.
+fn scanFor(store: *const Store, key: Key) ?Id {
+    for (store.values.items, 0..) |value, index| {
+        if (matchesKey(value, key)) return @enumFromInt(index);
+    }
+    return null;
+}
+
+/// The float one representation step above `value`, which is as close to it
+/// as a distinct `f64` gets.
+fn adjacent(value: f64) f64 {
+    return @bitCast(@as(u64, @bitCast(value)) + 1);
+}
+
+test "interning through the index agrees with a linear scan over the same table" {
+    var store: Store = .init(testing.allocator);
+    defer store.deinit();
+
+    const atoms = [_][]const u8{ "a", "alice", "n1000", "n1001", "", "1x", "alice " };
+    for (atoms) |atom| {
+        const id = try store.internAtom(atom);
+        try testing.expectEqual(id, scanFor(&store, .{ .atom = atom }).?);
+    }
+
+    const integers = [_]i64{ 0, -1, 1, std.math.minInt(i64), std.math.maxInt(i64) };
+    for (integers) |number| {
+        const id = try store.internInteger(number);
+        try testing.expectEqual(id, scanFor(&store, .{ .integer = number }).?);
+    }
+
+    const floats = [_]f64{
+        0.5,
+        adjacent(0.5),
+        -0.5,
+        std.math.floatMin(f64),
+        std.math.floatTrueMin(f64),
+        adjacent(std.math.floatTrueMin(f64)),
+        1e300,
+    };
+    for (floats) |number| {
+        const id = try store.internFloat(number);
+        try testing.expectEqual(id, scanFor(&store, .{ .float = number }).?);
+    }
+
+    // A float that is exactly an in-range integer canonicalizes before any
+    // table is searched, so the index never sees it and the two zeroes are
+    // one scalar.
+    const zero = try store.internInteger(0);
+    try testing.expectEqual(zero, try store.internFloat(0.0));
+    try testing.expectEqual(zero, try store.internFloat(-0.0));
+    try testing.expectEqual(try store.internInteger(1), try store.internFloat(1.0));
+
+    // Everything above is already there, so nothing more is stored and every
+    // identifier comes back unchanged.
+    const entries = store.values.items.len;
+    for (atoms) |atom| try testing.expectEqual(
+        scanFor(&store, .{ .atom = atom }).?,
+        try store.internAtom(atom),
+    );
+    for (integers) |number| try testing.expectEqual(
+        scanFor(&store, .{ .integer = number }).?,
+        try store.internInteger(number),
+    );
+    for (floats) |number| try testing.expectEqual(
+        scanFor(&store, .{ .float = number }).?,
+        try store.internFloat(number),
+    );
+    try testing.expectEqual(entries, store.values.items.len);
+    try testing.expectEqual(entries, store.index.filled);
+}
+
+test "a cloned store interns to the same identifiers as the store it came from" {
+    var store: Store = .init(testing.allocator);
+    defer store.deinit();
+    for (0..200) |number| {
+        var spelling: [16]u8 = undefined;
+        _ = try store.internAtom(try std.fmt.bufPrint(&spelling, "n{d}", .{number}));
+        _ = try store.internInteger(@intCast(number));
+    }
+
+    var copy = try store.clone();
+    defer copy.deinit();
+    for (0..200) |number| {
+        var spelling: [16]u8 = undefined;
+        const atom = try std.fmt.bufPrint(&spelling, "n{d}", .{number});
+        try testing.expectEqual(try store.internAtom(atom), try copy.internAtom(atom));
+        try testing.expectEqual(
+            try store.internInteger(@intCast(number)),
+            try copy.internInteger(@intCast(number)),
+        );
+    }
+    try testing.expectEqual(store.values.items.len, copy.values.items.len);
+
+    // The copy owns its own atoms, so the index it inherited has to be
+    // reaching them through the copy's table rather than the original's.
+    const fresh = try copy.internAtom("n200");
+    try testing.expectEqual(@as(usize, @intFromEnum(fresh)), store.values.items.len);
+    try testing.expectEqual(fresh, try copy.internAtom("n200"));
 }

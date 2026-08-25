@@ -576,3 +576,96 @@ database seeded with lists for structural rules to derive over. That asymmetry
 is real where it applies — F5's tests need it and the folded side does not —
 and reporting it as a speedup would be reporting a difference in what each side
 can answer.
+
+## 2026-08-25 after P4's first item (a hash index beside each value table)
+
+The first of P4's four items: `ValueTable.intern` and `scalar.Store`'s three
+interning functions no longer walk their table. Each table keeps an index of
+positions beside it — the ordered table is still the source of truth and an
+identifier is still an insertion position — so nothing observable changed and
+every existing test passes unchanged.
+
+A new `zig build benchmark-interning` runs the workloads P4 counted and reports
+`internStats` next to the times. The counts are the measurement; the times say
+only what the counts were worth on this machine.
+
+### Comparisons, which are the same number on every machine
+
+| Workload | Scalar comparisons | Value comparisons |
+| --- | --- | --- |
+| load 2000 facts, 2001 distinct atoms | 4001999 → 10591 | 4001999 → 10112 |
+| the same 2000 facts as source statements | 4007998 → 12588 | 4001999 → 10149 |
+| materialize a 120-element structural recursion | 1239519 → 15326 | 5194046 → 43603 |
+
+The searches themselves are unchanged — 4000 scalar and 4000 value interns for
+the fact loads, 7500 and 22622 for the structural one — so these ratios, 378x,
+319x and 119x, are what the index did. The three tables are 2001, 2002 and 244
+entries; the structural workload's 5.2M comparisons were 22,622 walks of a
+362-entry table.
+
+### Times
+
+ns, best of three runs, each itself the best of five in-process repeats,
+arm64, macOS 26.5.2, Zig 0.16.0, `ReleaseFast`. Both sides are the same
+benchmark binary with only the two interning implementations exchanged.
+
+| Workload | Scan | Index | Ratio |
+| --- | --- | --- | --- |
+| 2000 facts in one `applyChanges` batch | 7401667 | 622042 | 11.90x |
+| materialize a 120-element structural recursion | 6542708 | 3411584 | 1.92x |
+| 2000 facts through `addFact` | 269226583 | 244751542 | 1.10x |
+| 2000 facts as source statements | 245837875 | 246067625 | 1.00x |
+
+And the existing benchmarks, best of three runs each, on the rows that moved
+beyond their run-to-run band:
+
+| Workload | Before | After | Ratio |
+| --- | --- | --- | --- |
+| structural deletion, base recompute, restore | 7486485 | 4336966 | 1.73x |
+| structural deletion, leaf recompute, delete | 7364918 | 4293768 | 1.72x |
+| structural deletion, leaf automatic, restore | 1479072 | 870218 | 1.70x |
+| aggregation, recomputed edge change | 633858 | 448216 | 1.41x |
+| projected aggregate, recompute policy | 25064752 | 19705505 | 1.27x |
+| folding, grouped 50x40, folded run | 7220654 | 6345835 | 1.14x |
+| maintenance, delete-only recompute | 400686 | 370618 | 1.08x |
+
+Everything else landed between 0.93x and 1.09x, which is this suite's noise
+band — the same band the 2026-08-08 entry found code layout moving benchmarks
+through. Nothing regressed outside it.
+
+### The fact load did not move, and the batch says why
+
+P4's measurement gate named two workloads that should move most:
+`benchmark-structural-deletion` and a fact load. The first moved by 1.7x on
+every rebuilding path. **The fact load did not move at all**, and this is worth
+recording rather than explaining away, because the item was justified partly on
+it.
+
+The reason is not that the item failed to do what it claimed. The same load
+run as one `applyChanges` batch — the same 4000 interns over the same growing
+table, with the per-statement copying taken away — is 11.9x faster. Interning
+was about 92% of what that workload cost.
+
+What the per-statement load spends its time on is the copying. Loading 2000
+facts one statement at a time costs 245 ms; the same 2000 facts in one batch
+cost 0.6 ms. The interning P4 measured was real, and 4.0M comparisons of short
+atoms is still only a few percent of a workload that clones the database 2000
+times.
+
+So P4's inference is the part that was wrong, and it is worth correcting in
+place: it compared 4.0M *comparisons* against 1,999,000 *cloned entries* and
+concluded that loading facts "spends roughly four times as much in interning as
+in the per-statement cloning". Those are not the same unit. A cloned entry is
+an allocation and a copy; a comparison is a length check and a few bytes. The
+diversion P4 recorded is real and the ranking it drew from it was not.
+
+### What it costs
+
+An index is `4` bytes per slot at a load factor of three quarters, so between
+5.3 and 10.7 bytes per table entry, allocated only once a table holds
+something. A clone copies it with `memcpy`: slots hold positions rather than
+keys, and a copy of a table has the same entries in the same order, so every
+slot means in the copy exactly what it meant in the original. That is the
+opposite answer from the one `RelationStore.membership` gave to the same
+question, and for the reason that entry gave — a map keyed by content has to
+rehash, and a map keyed by position does not.

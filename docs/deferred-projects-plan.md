@@ -521,6 +521,14 @@ after — half of it in string comparison. And the structural case scans 5.4M
 times over a table of **242 entries**: the table is small, it is simply walked
 22,500 times. That is the same program `benchmark-structural-deletion` runs.
 
+**The first of those two is wrong, and the completed decisions below record
+what replaced it.** It compares 4.0M *comparisons* against 1,999,000 *cloned
+entries*, which are not the same unit of work: a cloned entry is an allocation
+and a copy, a comparison is a length check and a few bytes. Interning is at
+most a tenth of what that load costs and on the source path is not separable
+from noise at all; the copying is nearly all of it. The structural figure held
+up exactly.
+
 **A run of assertions is quadratic.** Every statement clones the database, and
 `RelationStore.clone` dupes every fact's terms, so 2000 `addFact` calls copy
 1,999,000 entries between them. `applyChanges` already amortizes this over a
@@ -538,10 +546,16 @@ a near-unique index costs an allocation per fact either way.
 3.8s to 4.9s, and it buys nothing on the one- and two-goal bodies where it
 shows up.
 
+The suite half of that evidence has since expired and should not be reached
+for: it is about twelve seconds as of F6, and F2's exhaustive sweep over all
+512 three-node graphs is roughly half of that on its own — hundreds of engine
+runs over tiny databases. Suite wall clock is no longer a proxy for engine
+speed in either direction. The benchmarks are.
+
 ### Scope
 
-- Give `ValueTable` and `scalar.Store` a hash index beside their ordered
-  tables, in the shape of `RelationStore.membership`: the ordered table stays
+- **Done 2026-08-25.** Give `ValueTable` and `scalar.Store` a hash index beside
+  their ordered tables, in the shape of `RelationStore.membership`: the ordered table stays
   the source of truth and IDs stay insertion-ordered indices, so identity,
   ordering, canonicalization, and `setof` are untouched and the map is a pure
   lookup accelerator. Both tables are cloned, so decide the same
@@ -589,6 +603,73 @@ order. Stop after any one of them with its measurement recorded. Do not take
 the transaction-batching item and the pattern-index item in the same session:
 both change contracts other phases rest on, and a regression would be hard to
 attribute.
+
+### Completed decisions
+
+**The first item — a hash index beside each value table — was completed on
+2026-08-25.** The other three have not been started. These are its decisions.
+
+- `intern_index.Index` is an open-addressed table of *positions*: a slot holds
+  one more than an identifier so that zero means empty, and nothing else is
+  stored. It holds no keys, so the comparison stays the caller's and is made
+  against the ordered table, which stays the source of truth with identifiers
+  still its insertion positions. Identity, ordering, canonicalization and
+  `setof` are untouched, and `scalar.Store` — which owns the bytes of its
+  atoms — needs no re-pointing when it is copied.
+- The copy-versus-rebuild question the store's caches answered gets a third
+  answer here: **copy, because this layout copies with `memcpy`.** A slot means
+  the same in a copy as in the original, since cloning a table preserves both
+  order and content, so there is nothing to rehash. `RelationStore.membership`
+  is keyed by facts and must rehash, which is why it stays lazy; positions do
+  not, which is why these are carried. Interning happens on staging copies, so
+  it was the copy that had to be cheap.
+- The index reserves room before the table appends, so a failure on either side
+  leaves the two agreeing. No new allocation-failure sweep was added, and none
+  was needed: the new allocation site is on paths the nineteen existing sweeps
+  already walk, and they pass unchanged.
+- `Database.internStats` and `Jatalog.internStats` report the searches made and
+  the entries compared. The counts follow a statement's staging copy back on
+  commit, so a rolled-back statement takes its own share of them with it. This
+  is the measurement gate's instrument: a comparison count is the same number
+  on every machine, and it is what says whether a workload's cost is in the
+  value tables at all.
+- The acceptance tests are `scalar.zig`'s and `evaluator.zig`'s agreement with
+  a linear scan over the same table — atoms, both integer limits, subnormal and
+  adjacent floats, canonicalized integral floats, `nil` and nested cons — and
+  `root.zig`'s "a cloned database interns to the same identifiers as the
+  database it came from", which now names its three dependents: the retraction
+  path, the alignment between `Catalog.clone` and `Database.clone` that F1 and
+  F6 created, and F6's cached folded plans. The fourth acceptance test —
+  interleaved assertions, queries and retractions committing statement by
+  statement — needed nothing new: "source persistent statements roll back every
+  allocation failure point" and the retraction and parser tests cover it and
+  pass unchanged.
+- Hashing a float by its bits agrees with the `==` the scans used because the
+  only two distinct bit patterns that compare equal are the two zeroes, and
+  `internFloat` canonicalizes both to the integer zero before any float reaches
+  the table. That is a property of the S2 numeric policy, so it is written down
+  next to the hash rather than assumed.
+
+**The measurement gate's verdict, in full.** Comparisons fell 378x on a fact
+load and 119x on the structural workload.
+`benchmark-structural-deletion` moved 1.7x on every rebuilding path and
+materializing a 120-element structural recursion moved 1.92x. **The fact load
+did not move**, and rather than being dropped the item was kept with the reason
+measured: the same 2000 facts loaded in one `applyChanges` batch — the same
+4000 interns without the per-statement copying — moved 11.9x, so interning was
+about 92% of that and the per-statement load is 400x more expensive than the
+batch for reasons that are entirely the second item's. P4's own inference is
+what was wrong, and `docs/aggregation-performance.md` corrects it: it compared
+4.0M comparisons against 1,999,000 cloned entries as though those were the same
+unit of work.
+
+- Two things noted for the items still to come. The transaction-batching item
+  now has the measurement it was missing: 245 ms against 0.6 ms for the same
+  2000 facts is what a statement-per-fact transaction costs, and the risks
+  recorded above are unchanged. And the pattern-index item's prize — retiring
+  the deferred build and the density gate — is untouched by this item: neither
+  rule was consulted or altered, because a value table's index is not a
+  relation's.
 
 
 # Project M: persistent and incremental view maintenance
@@ -2102,7 +2183,9 @@ Use one session and one commit per phase unless a phase proves too large:
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
-speed matters more than its features — including before F1.
+speed matters more than its features — including before F1. Its first item, a
+hash index beside each value table, is **done 2026-08-25**; the other three are
+not started.
 
 F1–F5 may run in parallel with the rest in separate branches because they share
 only the stable P1 storage interface.
