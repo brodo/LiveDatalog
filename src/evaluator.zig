@@ -180,23 +180,48 @@ pub fn ruleStratum(
     return levels.get(syntax.predicateKey(rule.head)) orelse 0;
 }
 
-/// Every distinct predicate `body` reads, positively or negatively, anywhere
-/// including inside a `setof` — what a `PlanCache` entry's fingerprint tracks
-/// for change. Reuses `noteBodyDependencies`'s walk rather than repeating it;
-/// the per-predicate values it records are not needed here, only the keys.
-fn bodyPredicates(
+/// What a `PlanCache` entry's staleness check compares: the exact
+/// `RelationStore.selectivity` result a placed step's own `(key, mask)`
+/// reported when the plan around it was chosen — the same figures
+/// `planner.describe` measured to cost that step, not a coarser proxy for
+/// them.
+const StepFingerprint = struct {
+    key: relation_store.PredicateKey,
+    mask: u64,
+    facts: usize,
+    groups: ?usize,
+};
+
+/// Every lookup `plan` performs, recursively through a `setof`'s inner plan,
+/// each with the selectivity `facts` currently reports for its own `(key,
+/// mask)` — what a fresh `PlanCache` entry fingerprints itself with. A
+/// filter step (a builtin) performs no lookup and contributes nothing.
+fn collectStepFingerprints(
     allocator: std.mem.Allocator,
-    body: []const syntax.Clause,
-) ![]relation_store.PredicateKey {
-    var set: std.array_hash_map.Auto(relation_store.PredicateKey, usize) = .empty;
-    defer set.deinit(allocator);
-    try syntax.noteBodyDependencies(allocator, body, 0, &set);
-    const result = try allocator.dupe(relation_store.PredicateKey, set.keys());
-    return result;
+    facts: *relation_store.RelationStore,
+    plan: *const planner.Plan,
+    into: *std.ArrayList(StepFingerprint),
+) !void {
+    for (plan.steps) |step| {
+        switch (step.kind) {
+            .join, .anti_join => {
+                const key: relation_store.PredicateKey = .{ .name = step.predicate.?, .arity = step.arity };
+                const measured = try facts.selectivity(key, step.mask);
+                try into.append(allocator, .{
+                    .key = key,
+                    .mask = step.mask,
+                    .facts = measured.facts,
+                    .groups = measured.groups,
+                });
+            },
+            .filter => {},
+            .aggregate => try collectStepFingerprints(allocator, facts, step.inner.?, into),
+        }
+    }
 }
 
-/// A plan `applyRule` already chose for a rule, kept until the fact count of
-/// some predicate the rule's body reads changes.
+/// A plan `applyRule` already chose for a rule, kept until the selectivity of
+/// some lookup its plan performs changes.
 ///
 /// Keyed by rule id alone: `applyRule` always plans a rule with the same
 /// pre-bound variable set every time it is called — empty for an ordinary
@@ -204,33 +229,31 @@ fn bodyPredicates(
 /// is fixed by the rule itself — so `(rule id, pre-bound set)` collapses to
 /// the rule id at this call site.
 ///
-/// The staleness check is deliberately coarser than the planner's own cost
-/// model: a relation that grew by one fact invalidates the same as one that
-/// doubled, and a pattern index appearing with no change in fact count goes
-/// unnoticed. Both are accepted approximations. What this exists to avoid is
-/// a plan chosen while a relation is small and reused once that relation has
+/// The staleness check is still an approximation of the planner's own cost
+/// model, not a proof of it: a fingerprint records what each *placed* step's
+/// own `(key, mask)` reported, not what every clause the planner rejected in
+/// favor of it would report now, so a losing candidate that has since become
+/// cheaper than the winner goes unnoticed. What this exists to avoid is a
+/// plan chosen while a relation is small and reused once that relation has
 /// grown large enough to change the planner's choice — a seeded rule
 /// deriving into its own head across `expandLevel`'s rounds, or a rule
 /// recomputed from scratch across several outer calls — and that failure
-/// always shows up as a fact-count change in some predicate the plan's own
-/// body reads. See P4's fourth item in `docs/deferred-projects-plan.md` for
-/// the attempt this replaces, which had no staleness check at all and
-/// regressed two benchmarks by reusing exactly such a plan.
+/// always shows up as a selectivity change on some step the plan itself
+/// performs, including a pattern index appearing where the plan was built
+/// against a scan (`groups` moving from `null` to a value at the same `mask`
+/// it was already using). See P4's fourth item in
+/// `docs/deferred-projects-plan.md` for the narrower, facts-only version this
+/// replaced and the gap closing it left recorded as a follow-up.
 const PlanCache = struct {
     entries: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
 
     const Entry = struct {
         plan: planner.Plan,
-        /// Parallel to `counts`: the predicate each recorded fact count
-        /// belongs to.
-        predicates: []relation_store.PredicateKey,
-        /// The fact count of each of `predicates` when `plan` was chosen.
-        counts: []usize,
+        fingerprints: []StepFingerprint,
 
         fn deinit(self: *Entry, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
             self.plan.deinit();
-            allocator.free(self.predicates);
-            allocator.free(self.counts);
+            allocator.free(self.fingerprints);
             self.* = undefined;
         }
     };
@@ -514,10 +537,10 @@ pub const Evaluator = struct {
     }
 
     /// The plan `applyRule` solves `rule`'s body with, reused from
-    /// `plan_cache` while every predicate the body reads still has the fact
-    /// count planning last saw it with; replanned and re-cached otherwise.
-    /// See `PlanCache`'s own comment for what this staleness check does and
-    /// does not catch.
+    /// `plan_cache` while every lookup the cached plan performs still
+    /// measures the same selectivity it was chosen with; replanned and
+    /// re-cached otherwise. See `PlanCache`'s own comment for what this
+    /// staleness check does and does not catch.
     ///
     /// The returned pointer is borrowed from `plan_cache` and stays valid
     /// until the next call that replans the same rule id, which a caller
@@ -531,8 +554,9 @@ pub const Evaluator = struct {
     ) !*const planner.Plan {
         if (self.plan_cache.entries.getPtr(rule.id)) |entry| {
             var fresh = true;
-            for (entry.predicates, entry.counts) |key, expected| {
-                if ((try facts.selectivity(key, 0)).facts != expected) {
+            for (entry.fingerprints) |expected| {
+                const measured = try facts.selectivity(expected.key, expected.mask);
+                if (measured.facts != expected.facts or measured.groups != expected.groups) {
                     fresh = false;
                     break;
                 }
@@ -548,15 +572,14 @@ pub const Evaluator = struct {
         }
         var fresh_plan = try self.planFor(facts, rule.head, rule.body, initial);
         errdefer fresh_plan.deinit();
-        const predicates = try bodyPredicates(self.allocator, rule.body);
-        errdefer self.allocator.free(predicates);
-        const counts = try self.allocator.alloc(usize, predicates.len);
-        errdefer self.allocator.free(counts);
-        for (predicates, counts) |key, *count| count.* = (try facts.selectivity(key, 0)).facts;
+        var fingerprints: std.ArrayList(StepFingerprint) = .empty;
+        errdefer fingerprints.deinit(self.allocator);
+        try collectStepFingerprints(self.allocator, facts, &fresh_plan, &fingerprints);
+        const owned = try fingerprints.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(owned);
         try self.plan_cache.entries.put(self.allocator, rule.id, .{
             .plan = fresh_plan,
-            .predicates = predicates,
-            .counts = counts,
+            .fingerprints = owned,
         });
         return &self.plan_cache.entries.getPtr(rule.id).?.plan;
     }

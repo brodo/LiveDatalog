@@ -1063,6 +1063,27 @@ is what says this item touched planning and nothing about what is interned.
 `zig build test` passed all 233 existing tests plus two new ones for this
 item, with `zig fmt` and `ziglint` clean, from a clean `.zig-cache` rebuild.
 
+**The fingerprint's own known gap — a pattern index appearing with no
+fact-count change — was closed later the same day.** `PlanCache.Entry` no
+longer records a fact count per distinct predicate; it records, per placed
+step (recursing into a `setof`'s inner plan), the full
+`RelationStore.selectivity` result — `facts` and `groups` — for that step's
+own `(key, mask)`, which is the exact figure `planner.describe` measured to
+cost it, at the mask the step actually runs with rather than a fixed `mask =
+0`. A mismatch on either field invalidates the entry. This is strictly more
+sensitive than the fact-count-only version, so it cannot reuse a plan the
+coarser check would have wrongly kept, only replan in cases the coarser check
+would have missed; the residual gap it does *not* close is recorded in
+Follow-ups. Re-run against the same gate: `benchmark-folding`'s `grouped
+50x40` candidate count stayed at 10646 across three runs,
+`benchmark-aggregation`'s recomputation row stayed at 453475–465820 ns/change,
+`benchmark-materialization` stayed improved at 21956 ns/query, and every other
+named benchmark's maintain/recompute/fallback/group counts and
+`benchmark-interning`'s comparison counts were identical to the prior run —
+the refinement cost nothing measurable on this suite. `zig build test` stayed
+green (235 tests) with `zig fmt` and `ziglint` clean from a clean
+`.zig-cache` rebuild.
+
 # Project M: persistent and incremental view maintenance
 
 Chapter 5 defines differential relations and the CReaM optimization for
@@ -3130,13 +3151,21 @@ Noticed while doing scoped work, deliberately not chased there:
   remains. Closing it wants the reconstruction to derive list functions lazily
   against the query rather than eagerly over the whole extension, which is a
   new design rather than a fix to `applyRule`'s seed branch.
-- P4's fourth item's fingerprint (done 2026-08-26) invalidates a cached plan on
-  any fact-count change in a predicate the rule's body reads, which is coarser
-  than the planner's own cost model in one specific way: a pattern index that
-  appears between two calls with *no* change in fact count — crossing from a
-  first to a second request on the same pattern, P1's own indexing rule — goes
-  unnoticed, and the cached plan is reused even though the planner might now
-  cost that clause differently. No benchmark in this project's suite has hit
-  this gap; it is recorded because the accepted approximation should be
-  reconsidered if one does; the fix would mean also tracking each fingerprinted
-  predicate's `groups` alongside its fact count.
+- P4's fourth item's fingerprint (done 2026-08-26) originally invalidated a
+  cached plan only on a fact-count change in a predicate the rule's body
+  reads, which missed a pattern index appearing between two calls with *no*
+  change in fact count. **Closed the same day**: the fingerprint now records,
+  per placed step (recursing into a `setof`'s inner plan), the exact
+  `RelationStore.selectivity` result for that step's own `(key, mask)` —
+  `facts` and `groups` both, at the mask the step actually runs with, not a
+  fixed `mask = 0` per predicate — and invalidates on any change to either.
+  Every benchmark's maintenance/recompute/fallback/group counts stayed
+  identical, `benchmark-materialization` kept its improvement, and the two
+  benchmarks the original attempt regressed stayed flat, so this closed the
+  gap for free. What remains, unmeasured and left as the accepted
+  approximation: a fingerprint records what each *placed* step's own
+  `(key, mask)` reports, not what every clause the planner passed over in
+  favor of it would report now, so a losing candidate that has since become
+  cheaper than the winner still goes unnoticed. Closing that would mean the
+  planner's own `chooseNext` search re-running at lookup time, which costs
+  what replanning costs and defeats the cache.
