@@ -908,6 +908,73 @@ are its decisions.
   speed up is what is left of that first call, and F7's completed decisions
   say where.
 
+**The fourth item — caching plans per rule and pre-bound variable set — was
+attempted and reverted on 2026-08-26.** Recorded here because the gate this
+whole document runs on is "benchmarks must not regress," and this failed it
+on two of them.
+
+**What was built.** `Evaluator` gained a `PlanCache` keyed by `(rule.id,
+pre-bound variable set)`, populated by `applyRule` and cleared wherever
+`invalidateAnalysis` already is — the lifetime the scope asked for, since a
+cached plan's clauses are borrowed from the rule it was planned from and that
+is exactly what a rule-set change invalidates. Both of `applyRule`'s branches
+were rewired to consult it: the seeded branch, which already planned once and
+reused it for every value in one call, now reuses that plan across calls too;
+the ordinary branch, which used to call `solve` (plan, then execute) on every
+delta round, now looks up or builds once and executes many times. Every
+existing test passed, including the allocation-failure sweeps — the design
+around `PlanCache.insert` mirrors `ValueTable.intern`'s reserve-before-commit
+shape precisely so a failure never leaves a plan belonging to neither the
+caller nor the cache.
+
+**It failed on the benchmarks it was supposed to help.**
+`benchmark-folding`'s `grouped 50x40` first-call candidate count *rose* from
+10646 (F7's second item's number) to 18143, a 70% increase, reproducible
+across repeated clean rebuilds. `benchmark-aggregation`'s recomputation row
+went from 446162 ns/change to 708700 ns/change, a 59% slowdown. Every other
+benchmark was flat or slightly favorable — `benchmark-materialization`
+improved from 25697 to 21891 ns/query, which is the win the scope predicted —
+so this is not a story about the idea being wrong everywhere, only about where
+it costs more than it saves.
+
+**Why: a plan cached early can be worse than one planned late, and this cache
+had no way to tell.** The planner costs a clause by asking the store's current
+selectivity statistics, and those statistics are not static — P1's own rule is
+that an index is built on a relation's *second* request, not its first, because
+a single probe cannot repay a pass over it. A rule solved repeatedly over a
+relation that is *itself growing during that repetition* — a seeded structural
+rule deriving into its own head across `expandLevel`'s rounds, or any
+recursive rule recomputed from scratch across several outer calls — gets
+planned once, early, against a small or empty relation with no index yet
+worth having, and every later call now reuses that choice instead of
+re-asking with the benefit of what has since been learned. Before this item,
+a redundant-looking replan on a later round or a later call was, by accident,
+exactly what let the planner notice a relation had grown enough to index. The
+cache removed the redundancy and the accidental benefit together. This is not
+a defect in the `(rule.id, pre-bound set)` key or in the cache's lifetime — it
+is a property of caching a cost-based decision made against a store that does
+not stay still, which the scope's own phrasing ("invalidated with the
+analysis") did not anticipate because the analysis is not what was going stale.
+
+**Reverted rather than patched.** A narrower version — cache only within one
+`expandLevel` call, or only for rules with no seed argument, or add a
+staleness heuristic keyed on relation growth — might dodge this specific
+regression, but each is a new, unmeasured design rather than the one the scope
+named, and the session boundary this document has followed throughout is to
+stop and record rather than iterate past a failed gate in the same session.
+`src/evaluator.zig` was restored to its last-committed content (verified
+byte-identical by diff) rather than built up with `git checkout`, per this
+run's standing instruction not to use it. No commit was made for this item;
+the attempt and its measurements live only here.
+
+**What this leaves for a later attempt.** The measured shape of the problem —
+a plan chosen when a relation is small getting reused once the relation is
+large — suggests the cache would need to know when a relation it planned
+against has grown by enough to be worth reconsidering, not just when the rule
+set changed. That is a second kind of staleness beside the one this document
+already has a name for (`Database.fact_generation`, added in F7 for a
+different cache), and inventing it was out of scope for a session whose gate
+had already failed.
 
 # Project M: persistent and incremental view maintenance
 
@@ -2892,8 +2959,12 @@ items are independently shippable, and it can be taken whenever the engine's
 speed matters more than its features — including before F1. Three of its four
 items are done — a hash index beside each value table and one transaction per
 run of assertions on **2026-08-25**, a flat pattern index on **2026-08-26** —
-and the fourth, caching plans per rule and pre-bound variable set, is not
-started.
+and the fourth, caching plans per rule and pre-bound variable set, was
+**attempted and reverted on 2026-08-26**: it regressed `benchmark-folding`'s
+worst shape by 70% and `benchmark-aggregation`'s recomputation row by 59%,
+for the reason and with the numbers recorded in P4's own completed-decisions
+section. It remains not done, and a later attempt needs a design this session
+did not have time to invent rather than a repeat of this one.
 
 F7 is in the sequence rather than beside it because it is not constant-factor
 work: it changes what `answerFolded` keeps between calls, which is a contract
@@ -2970,3 +3041,9 @@ Noticed while doing scoped work, deliberately not chased there:
   remains. Closing it wants the reconstruction to derive list functions lazily
   against the query rather than eagerly over the whole extension, which is a
   new design rather than a fix to `applyRule`'s seed branch.
+- P4's fourth item (plan caching, reverted 2026-08-26) would need a plan cache
+  that can tell a stale cost decision from a valid one — invalidated not only
+  when the rule set changes but when a relation it planned against has grown
+  enough that the planner would now choose differently, which P1's own
+  second-request indexing rule says can happen. No such staleness signal
+  exists today; inventing one is the prerequisite for trying this item again.
