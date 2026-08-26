@@ -124,6 +124,21 @@ pub const Database = struct {
     rebuild_fallbacks: usize = 0,
     /// Counts aggregate groups recomputed by incremental maintenance.
     maintained_groups: usize = 0,
+    /// Counts changes to the stored base facts, so that something built from
+    /// them can tell whether they have moved.
+    ///
+    /// Monotone, and conservative in one direction only: it may move when
+    /// nothing a given reader cares about changed — a fact under a name that
+    /// reader is not allowed to see, or an insertion a statement then took
+    /// back out — but it never stands still while the facts change. That is
+    /// the direction a cache can survive being wrong in, since the cost of a
+    /// spurious move is rebuilding something that was still good.
+    ///
+    /// It counts base facts and nothing else. The derived closure is a
+    /// function of the facts and the rules, and the rules have a stamp of
+    /// their own in `evaluator.Evaluator.next_rule_id`, so a reader that
+    /// checks both has checked the closure too.
+    fact_generation: u64 = 0,
     /// Debug mode: verify every maintained closure against a fresh rebuild.
     shadow_verification: bool = false,
 
@@ -167,6 +182,7 @@ pub const Database = struct {
         result.rederived_facts = self.rederived_facts;
         result.rebuild_fallbacks = self.rebuild_fallbacks;
         result.maintained_groups = self.maintained_groups;
+        result.fact_generation = self.fact_generation;
         result.shadow_verification = self.shadow_verification;
         errdefer {
             for (result.auxiliary.items) |*view| view.deinit(self.allocator);
@@ -213,7 +229,21 @@ pub const Database = struct {
         const added = try self.facts.insert(fact, false);
         terms_owned = false;
         if (!added) return null;
+        self.fact_generation += 1;
         return self.facts.factAt(self.facts.len() - 1);
+    }
+
+    /// Takes one ground base fact back out, reporting whether the store held
+    /// it at all.
+    ///
+    /// This exists so that the fact stamp has one place to move: removal is
+    /// the other half of `applyInsertion`, and a caller reaching past this
+    /// into the store would leave something built from the facts believing
+    /// they had not changed.
+    pub fn applyRemoval(self: *Database, fact: relation_store.Fact) !bool {
+        if (!try self.facts.removeFact(fact)) return false;
+        self.fact_generation += 1;
+        return true;
     }
 
     /// Where this database stands now, to undo a statement back to.

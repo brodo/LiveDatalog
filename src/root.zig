@@ -148,8 +148,15 @@ pub const Jatalog = struct {
 
     pub fn query(self: *Jatalog, goals: []const input.Goal) !results.QueryResult {
         try materialization.ensureMaterialized(&self.state);
+        // The copy is discarded and the instrument is not: a query's
+        // candidates are this database's candidates whichever copy examined
+        // them. See `evaluationWork`.
+        const work_before = self.state.eval.cost.work;
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer {
+            self.noteStagedWork(work_before, &staging);
+            staging.deinit();
+        }
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
@@ -158,10 +165,28 @@ pub const Jatalog = struct {
         return statement.queryClauses(&staging, compiled);
     }
 
+    /// Charges this database with what evaluating on a staging copy cost,
+    /// before the copy goes. `baseline` is where the counter stood when the
+    /// copy was taken, so what is charged is what the copy did rather than
+    /// what it inherited — and it is added to wherever the counter stands
+    /// now, which need not be the baseline if the operation also committed
+    /// work of its own.
+    fn noteStagedWork(
+        self: *Jatalog,
+        baseline: u64,
+        staging: *const database.Database,
+    ) void {
+        self.state.eval.cost.work +|= staging.eval.cost.work -| baseline;
+    }
+
     pub fn retract(self: *Jatalog, goals: []const input.Goal) !bool {
         try materialization.ensureMaterialized(&self.state);
+        const work_before = self.state.eval.cost.work;
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer {
+            self.noteStagedWork(work_before, &staging);
+            staging.deinit();
+        }
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
@@ -501,26 +526,97 @@ pub const Jatalog = struct {
     /// running it somewhere that still holds them would let it read exactly
     /// what it was built to do without.
     ///
-    /// The copy is discarded afterwards, so a plan's reconstructed relations
-    /// never join this database. Nothing here changes it.
+    /// The copy never joins this database, so a plan's reconstructed relations
+    /// are not here afterwards. It is *kept* — in the plan cache, beside the
+    /// plan that built it — so that asking the same question again solves the
+    /// goals against a reconstruction that is already derived instead of
+    /// deriving it a second time. Deriving it is 63% to 99% of what a folded
+    /// answer costs, and it is the same derivation every time until the
+    /// database underneath it changes.
+    ///
+    /// What "changes" means is three stamps and not two. The catalog's
+    /// generation and the rule generation are the plan's, and a move in
+    /// either discards the plan itself. A base fact moves neither — the plan
+    /// is still the right plan, and `Fold` handles stay live across an
+    /// insertion on purpose — but it moves the extension the plan reads, so
+    /// `Database.fact_generation` discards the reconstruction without
+    /// touching the plans. Conflating the two would re-fold on every
+    /// insertion and undo the plan cache to fix a problem the plan cache does
+    /// not have.
     pub fn answerFolded(self: *Jatalog, fold: Fold) !results.QueryResult {
-        const entry = try self.planAt(fold);
-        const executable = if (entry.executable) |*value| value else return error.PlanNotExecutable;
-        // A view whose extension the engine derives has to have derived it
-        // before the copy is taken, or the copy keeps a name with nothing
-        // under it.
-        try materialization.ensureMaterialized(&self.state);
-        var staging = try self.viewOnlyCopy();
-        defer staging.deinit();
+        const cached = try self.planAt(fold);
+        if (cached.executable == null) return error.PlanNotExecutable;
+        // Before anything is read from a kept reconstruction, and after the
+        // handle is known to be live: a fact under a readable name is the one
+        // change that gets this far.
+        self.plans.refreshReconstructions(self.state.fact_generation);
+        if (self.plans.entries.items[fold.entry].reconstruction == null) {
+            // A view whose extension the engine derives has to have derived
+            // it before the copy is taken, or the copy keeps a name with
+            // nothing under it.
+            try materialization.ensureMaterialized(&self.state);
+            const baseline = self.state.eval.cost.work;
+            const staged = try self.deriveReconstruction(
+                &self.plans.entries.items[fold.entry].executable.?,
+            );
+            // Past here the cache owns it, and taking it in allocates
+            // nothing, so there is no window where it belongs to neither.
+            self.plans.keep(fold.entry, staged);
+            self.noteStagedWork(
+                baseline,
+                &self.plans.entries.items[fold.entry].reconstruction.?,
+            );
+        } else {
+            self.plans.reconstruction_hits += 1;
+            self.plans.touch(fold.entry);
+        }
+
+        const entry = &self.plans.entries.items[fold.entry];
+        // Solving interns the goals' ground structures into the
+        // reconstruction and can expand its closure, so a failure part-way
+        // leaves a database no later answer may be read from. It goes, and
+        // the next call derives a fresh one.
+        errdefer self.plans.discardReconstruction(fold.entry);
+        // The reconstruction is kept, so its counter is cumulative and only
+        // this call's share of it belongs here.
+        const work_before = entry.reconstruction.?.eval.cost.work;
+        const answers = try statement.queryClauses(
+            &entry.reconstruction.?,
+            entry.executable.?.goals,
+        );
+        self.state.eval.cost.work +|=
+            entry.reconstruction.?.eval.cost.work -| work_before;
+        return answers;
+    }
+
+    /// Builds what a folded plan reads from: a copy of this database holding
+    /// exactly what the catalog admits, the plan's own rules installed in it,
+    /// and the relations those rules reconstruct already derived.
+    ///
+    /// Deriving here rather than leaving it to `queryClauses` is the whole of
+    /// the split. `statement.evaluateClauses` materializes on its way to
+    /// solving, so a caller that lets it do both cannot tell the two phases
+    /// apart, let alone keep one of them; done here, the closure is clean
+    /// before any goal is solved and a later call finds it that way.
+    /// The caller materializes this database first: a view whose extension the
+    /// engine derives has to have derived it before the copy is taken, or the
+    /// copy keeps a name with nothing under it.
+    fn deriveReconstruction(
+        self: *Jatalog,
+        executable: *const folding.Executable,
+    ) !database.Database {
+        var staged = try self.viewOnlyCopy();
+        errdefer staged.deinit();
         for (executable.rules) |rule| {
-            const copy = try syntax.cloneRule(staging.allocator, rule);
-            statement.addRuleClauses(&staging, copy.head, copy.body) catch |err| {
-                syntax.freeRule(staging.allocator, copy);
+            const copy = try syntax.cloneRule(staged.allocator, rule);
+            statement.addRuleClauses(&staged, copy.head, copy.body) catch |err| {
+                syntax.freeRule(staged.allocator, copy);
                 return err;
             };
-            staging.allocator.free(copy.body);
+            staged.allocator.free(copy.body);
         }
-        return statement.queryClauses(&staging, executable.goals);
+        try materialization.ensureMaterialized(&staged);
+        return staged;
     }
 
     /// Renders a fold: its guarantee, then either the plan and every
@@ -595,13 +691,34 @@ pub const Jatalog = struct {
             .plan_hits = self.plans.hits,
             .plan_misses = self.plans.misses,
             .plan_invalidations = self.plans.invalidations,
+            .kept_reconstructions = self.plans.kept,
+            .reconstruction_hits = self.plans.reconstruction_hits,
+            .reconstruction_misses = self.plans.reconstruction_misses,
         };
     }
 
-    /// Discards every folded plan. Folding again reproduces them; this is for
-    /// a caller that would rather have the memory.
+    /// Discards every folded plan, and every reconstruction one of them was
+    /// keeping. Folding and running again reproduces both; this is for a
+    /// caller that would rather have the memory.
+    ///
+    /// It is now the memory control of this interface rather than a
+    /// convenience. A cache entry used to be a plan; it can now be a plan plus
+    /// a copy of every readable extension and its closure, and while the
+    /// number of those is bounded, their size is whatever the database is.
     pub fn clearPlanCache(self: *Jatalog) void {
         self.plans.clear();
+    }
+
+    /// Candidate facts this database's evaluator has examined — the cost
+    /// model's unit, and the same number on every machine, which is what
+    /// makes it worth reporting beside a time.
+    ///
+    /// Counted for work done on this database's behalf, including on the
+    /// staging copies it evaluates on and then discards. A counter that went
+    /// with the copy would report nothing for a query, since a query is
+    /// exactly that: evaluation on a copy nobody keeps.
+    pub fn evaluationWork(self: *const Jatalog) u64 {
+        return self.state.eval.cost.work;
     }
 
     /// The cached plan a handle names, or `StalePlan` when the views or the
@@ -757,10 +874,20 @@ pub const FoldStats = struct {
     /// Times every cached plan was discarded at once because the views or the
     /// rules changed.
     plan_invalidations: usize,
+    /// Reconstructions held right now: databases the cached plans last ran
+    /// against, kept so that running one again only solves goals. Bounded,
+    /// unlike the plans; see `clearPlanCache`.
+    kept_reconstructions: usize,
+    /// How often a folded answer found the reconstruction already derived,
+    /// and how often it had to derive one — the first time a plan is run, and
+    /// after every change to the base facts.
+    reconstruction_hits: usize,
+    reconstruction_misses: usize,
 };
 
 /// One folded plan, kept so that asking the same question again does not fold
-/// it again.
+/// it again — and, once it has been run, what it ran against, kept so that
+/// asking again does not derive that again either.
 const CachedPlan = struct {
     /// The normalized question. Two callers asking it differently — other
     /// variable names, the same relations — key to the same bytes.
@@ -770,12 +897,31 @@ const CachedPlan = struct {
     /// run: an unsupported fold, or a plan still holding a term the evaluator
     /// has no meaning for. The rendering is available either way.
     executable: ?folding.Executable,
+    /// The database this plan last ran against: what the catalog admits, with
+    /// the plan's rules installed and their consequences derived. Null until
+    /// the plan has been run, and again whenever the base facts move.
+    ///
+    /// This is a whole database hanging off a cache entry, which is a
+    /// memory-for-time trade the plan cache has never made before — a plan is
+    /// small and this is a copy of every readable extension plus its closure.
+    /// It is why `PlanCache` bounds how many of these it holds while leaving
+    /// the plans themselves unbounded.
+    reconstruction: ?database.Database = null,
+    /// When this entry's reconstruction was last read, on the cache's own
+    /// clock, so the bound above knows which one to drop.
+    last_used: u64 = 0,
 
     fn deinit(self: *CachedPlan, allocator: std.mem.Allocator) void {
+        self.discardReconstruction();
         if (self.executable) |*value| value.deinit();
         self.outcome.deinit();
         allocator.free(self.key);
         self.* = undefined;
+    }
+
+    fn discardReconstruction(self: *CachedPlan) void {
+        if (self.reconstruction) |*staged| staged.deinit();
+        self.reconstruction = null;
     }
 };
 
@@ -790,6 +936,13 @@ const CachedPlan = struct {
 /// stamp for the same reason: such a definition is the rule's, and a rule
 /// addition can change what the predicate means.
 ///
+/// A plan's *reconstruction* is a function of one more thing — the facts —
+/// and that is a third stamp rather than a third component of the key, for
+/// the same reason: a fact changes what every reconstruction here was derived
+/// from rather than which plan answers a question. It is kept apart from the
+/// other two because it invalidates something else. The catalog and the rules
+/// discard the plans; the facts discard only what the plans ran against.
+///
 /// Cardinalities are deliberately not in the key, and that is what costing
 /// only provably interchangeable plans buys. Sizes move with every fact
 /// inserted, and index availability moves with every query run — P1 builds a
@@ -799,13 +952,34 @@ const CachedPlan = struct {
 /// same, a stale choice is a slower plan and never a different answer, which
 /// is the same licence the join planner runs on.
 const PlanCache = struct {
+    /// How many reconstructions this cache will hold at once.
+    ///
+    /// The plans are unbounded because a plan is small and discarding one
+    /// costs a fold. A reconstruction is a database, so a cache holding one
+    /// per entry would grow with the number of distinct questions ever asked,
+    /// which is not a bound at all. Small, because the workload this exists
+    /// for is a question asked repeatedly and one entry answers it; more than
+    /// one, because an embedder with a handful of standing questions would
+    /// otherwise get nothing from the cache but the cost of filling it.
+    const reconstruction_limit: usize = 4;
+
     allocator: std.mem.Allocator,
     entries: std.ArrayList(CachedPlan) = .empty,
     catalog_generation: u64 = 0,
     rule_generation: u32 = 0,
+    /// The base facts the kept reconstructions were derived from. Separate
+    /// from the two above because it invalidates something else: a fact
+    /// leaves every plan here valid and every reconstruction stale.
+    fact_generation: u64 = 0,
     hits: usize = 0,
     misses: usize = 0,
     invalidations: usize = 0,
+    reconstruction_hits: usize = 0,
+    reconstruction_misses: usize = 0,
+    kept: usize = 0,
+    /// Orders reads of kept reconstructions, so the bound can drop the one
+    /// that has gone longest unread.
+    use_clock: u64 = 0,
 
     fn deinit(self: *PlanCache) void {
         self.clear();
@@ -816,6 +990,54 @@ const PlanCache = struct {
     fn clear(self: *PlanCache) void {
         for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.clearRetainingCapacity();
+        self.kept = 0;
+    }
+
+    /// Discards every kept reconstruction when the facts they were derived
+    /// from have moved, leaving the plans alone.
+    ///
+    /// The stamp is one counter over the whole fact store, so there is no
+    /// such thing as refreshing one of these either: every reconstruction
+    /// here was derived from the facts the database now holds, or none was.
+    fn refreshReconstructions(self: *PlanCache, fact_generation: u64) void {
+        if (self.fact_generation == fact_generation) return;
+        for (self.entries.items) |*entry| entry.discardReconstruction();
+        self.kept = 0;
+        self.fact_generation = fact_generation;
+    }
+
+    /// Takes ownership of a reconstruction, making room for it first. Cannot
+    /// fail, which is what lets the caller hand one over without a window
+    /// where it belongs to neither of them.
+    fn keep(self: *PlanCache, index: usize, staged: database.Database) void {
+        self.reconstruction_misses += 1;
+        if (self.kept >= reconstruction_limit) self.evictLeastRecentlyUsed();
+        self.entries.items[index].reconstruction = staged;
+        self.kept += 1;
+        self.touch(index);
+    }
+
+    fn touch(self: *PlanCache, index: usize) void {
+        self.use_clock += 1;
+        self.entries.items[index].last_used = self.use_clock;
+    }
+
+    fn discardReconstruction(self: *PlanCache, index: usize) void {
+        if (self.entries.items[index].reconstruction == null) return;
+        self.entries.items[index].discardReconstruction();
+        self.kept -= 1;
+    }
+
+    fn evictLeastRecentlyUsed(self: *PlanCache) void {
+        var victim: ?usize = null;
+        for (self.entries.items, 0..) |*entry, index| {
+            if (entry.reconstruction == null) continue;
+            if (victim) |chosen| {
+                if (entry.last_used >= self.entries.items[chosen].last_used) continue;
+            }
+            victim = index;
+        }
+        self.discardReconstruction(victim orelse return);
     }
 
     /// Discards every plan when what they were folded against has changed.
@@ -7806,6 +8028,188 @@ test "a folded plan is reused until the views or the rules it was folded against
     try std.testing.expectEqual(@as(usize, 3), db.foldStats().plan_invalidations);
 }
 
+/// One folded answer, as sorted tuples. The error is passed through rather
+/// than caught, because a change can make a question unanswerable and *which*
+/// error comes back is part of what a kept reconstruction has to reproduce.
+fn foldedTuples(db: *Jatalog, goals: []const input.Goal) ![][]u8 {
+    const fold = try db.foldQuery(goals, &.{});
+    var answers = try db.answerFolded(fold);
+    defer answers.deinit();
+    return answerTuples(&answers);
+}
+
+/// Asks the question twice: once against whatever the database has kept, and
+/// once with the plan cache cleared, which is the reference path — nothing
+/// cached, everything rebuilt from current state. The two must agree.
+///
+/// This is the shared rule the whole engine rests on, applied to folding: a
+/// full rebuild stays available and an incremental path is only ever allowed
+/// to be faster than it.
+fn expectKeptMatchesRebuilt(db: *Jatalog, goals: []const input.Goal) !void {
+    const kept = foldedTuples(db, goals);
+    defer if (kept) |lines| freeLines(lines) else |_| {};
+    db.clearPlanCache();
+    const rebuilt = foldedTuples(db, goals);
+    defer if (rebuilt) |lines| freeLines(lines) else |_| {};
+    if (kept) |kept_lines| {
+        const rebuilt_lines = try rebuilt;
+        try std.testing.expectEqual(rebuilt_lines.len, kept_lines.len);
+        for (kept_lines, rebuilt_lines) |mine, theirs|
+            try std.testing.expectEqualStrings(theirs, mine);
+    } else |kept_error| {
+        try std.testing.expectError(kept_error, rebuilt);
+    }
+}
+
+fn expectFoldedRowCount(db: *Jatalog, goals: []const input.Goal, expected: usize) !void {
+    const lines = try foldedTuples(db, goals);
+    defer freeLines(lines);
+    try std.testing.expectEqual(expected, lines.len);
+}
+
+test "a kept reconstruction answers exactly what a rebuilt one answers, after each kind of change" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const question = [_]input.Goal{input.relation("r", &.{ x, y })};
+
+    // A canonical aggregate view of a relation that is gone, so a plan reading
+    // it gets `r` itself back — Lemma 6.4.2. Beside it, a withheld view of a
+    // relation this question never mentions, which is where a fact can arrive
+    // under a name no plan is allowed to read.
+    const copied = try db.defineView(
+        input.fact("copied", &.{ x, y }),
+        &.{input.relation("r", &.{ x, y })},
+        .materialized,
+    );
+    _ = try db.defineView(
+        input.fact("linked", &.{ x, y }),
+        &.{input.relation("s", &.{ x, y })},
+        .withheld,
+    );
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+
+    const first = try db.foldQuery(&question, &.{});
+    try std.testing.expect(!first.reused);
+    {
+        var answers = try db.answerFolded(first);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
+    }
+
+    // A fact under a name the catalog already admits, which is the one change
+    // nothing a folded plan is stamped against can see. The plan is still the
+    // right plan — it is reused, nothing was invalidated, and the handle from
+    // before the fact still names it — and the extension it reads is one tuple
+    // larger, so the answer is one row larger. Everything kept between two
+    // calls has to notice a change that moves no stamp.
+    try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
+    const again = try db.foldQuery(&question, &.{});
+    try std.testing.expect(again.reused);
+    try std.testing.expectEqual(@as(usize, 0), db.foldStats().plan_invalidations);
+    {
+        var answers = try db.answerFolded(first);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
+    }
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // A fact under a withheld name changes nothing, and has to change nothing
+    // for the same reason the first one had to change something: the boundary
+    // is what the catalog admits, not what the database holds.
+    try db.addFact("linked", &.{ input.atom("z"), input.atom("zed") });
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    try db.addFact("copied", &.{ input.atom("c"), input.atom("three") });
+    try expectFoldedRowCount(&db, &question, 3);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // A retraction, which moves the same nothing an insertion does.
+    try std.testing.expect(try db.retract(&.{input.relation(
+        "copied",
+        &.{ input.atom("c"), input.atom("three") },
+    )}));
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // A view made unreadable. The one extension that remembers `r` is
+    // withdrawn, so there is no plan at all — not a plan answering from what
+    // was readable a moment ago.
+    db.setViewAvailability(copied, .withheld);
+    try std.testing.expectError(error.PlanNotExecutable, foldedTuples(&db, &question));
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // And made readable again, which folds the question afresh rather than
+    // restoring what was discarded.
+    db.setViewAvailability(copied, .materialized);
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // A definition added, over a relation this question never mentions.
+    _ = try db.defineView(
+        input.fact("marked", &.{x}),
+        &.{input.relation("mark", &.{x})},
+        .withheld,
+    );
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // A rule added to the database, which the plan runs without.
+    try db.addRule(
+        input.relation("pair", &.{ x, y }),
+        &.{input.relation("copied", &.{ x, y })},
+    );
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+
+    // And that rule published as a view, which is a definition arriving from
+    // the program rather than from the caller.
+    try db.materialize();
+    _ = try db.publishView("pair", 2, .materialized);
+    try expectFoldedRowCount(&db, &question, 2);
+    try expectKeptMatchesRebuilt(&db, &question);
+}
+
+test "asking a folded question twice grows neither the database nor what it interned" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    const question = [_]input.Goal{input.relation("r", &.{ x, y })};
+
+    _ = try db.defineView(
+        input.fact("copied", &.{ x, y }),
+        &.{input.relation("r", &.{ x, y })},
+        .materialized,
+    );
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+    try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
+
+    const fold = try db.foldQuery(&question, &.{});
+    var warmup = try db.answerFolded(fold);
+    warmup.deinit();
+
+    const facts = db.state.facts.len();
+    const closure = db.maintenanceStats().closure_facts;
+    const interned = db.internStats();
+    for (0..4) |_| {
+        _ = try db.foldQuery(&question, &.{});
+        var answers = try db.answerFolded(fold);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
+    }
+    // A folded plan reconstructs relations this database deliberately does not
+    // have. Whatever it keeps between calls to avoid rebuilding them is kept
+    // somewhere else: the same question asked five times leaves this database
+    // holding exactly what one question left it holding.
+    try std.testing.expectEqual(facts, db.state.facts.len());
+    try std.testing.expectEqual(closure, db.maintenanceStats().closure_facts);
+    try std.testing.expectEqual(interned.value_entries, db.internStats().value_entries);
+    try std.testing.expectEqual(interned.scalar_entries, db.internStats().scalar_entries);
+}
+
 test "a maintained predicate published as a view answers without its own base facts" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -7917,4 +8321,167 @@ fn publicFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
 
 test "declaring a view, folding and running the plan release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(publicFoldingAllocationScenario);
+}
+
+/// One view, one fact, and a question folded against it. Used by the tests
+/// below that care about what a plan keeps rather than about what it answers.
+fn declareCopiedView(db: *Jatalog) !void {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    _ = try db.defineView(
+        input.fact("copied", &.{ x, y }),
+        &.{input.relation("r", &.{ x, y })},
+        .materialized,
+    );
+}
+
+const copied_question = [_]input.Goal{input.relation("r", &.{
+    input.variable("X"),
+    input.variable("Y"),
+})};
+
+test "a folded plan derives its reconstruction once and reuses it until the facts move" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try declareCopiedView(&db);
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+
+    const fold = try db.foldQuery(&copied_question, &.{});
+    // Nothing is kept until a plan is run: folding decides what to read, and
+    // deciding does not read it.
+    try std.testing.expectEqual(@as(usize, 0), db.foldStats().kept_reconstructions);
+
+    for (0..3) |_| {
+        var answers = try db.answerFolded(fold);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
+    }
+    var stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.kept_reconstructions);
+    try std.testing.expectEqual(@as(usize, 1), stats.reconstruction_misses);
+    try std.testing.expectEqual(@as(usize, 2), stats.reconstruction_hits);
+
+    // A fact under a readable name leaves the plan alone and takes the
+    // reconstruction: the handle still names the plan, the plan cache reports
+    // no invalidation, and the next answer is derived again.
+    try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
+    {
+        var answers = try db.answerFolded(fold);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
+    }
+    stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, 0), stats.plan_invalidations);
+    try std.testing.expectEqual(@as(usize, 2), stats.reconstruction_misses);
+    try std.testing.expectEqual(@as(usize, 2), stats.reconstruction_hits);
+
+    // A catalog change takes both, and the handle with them, which is the
+    // distinction the two stamps exist to draw.
+    _ = try db.defineView(
+        input.fact("marked", &.{input.variable("X")}),
+        &.{input.relation("mark", &.{input.variable("X")})},
+        .withheld,
+    );
+    try std.testing.expectError(error.StalePlan, db.answerFolded(fold));
+    _ = try db.foldQuery(&copied_question, &.{});
+    stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.plan_invalidations);
+    try std.testing.expectEqual(@as(usize, 0), stats.kept_reconstructions);
+
+    // And clearing the cache is what gives the memory back, which is the one
+    // control an embedder has over reconstructions it is no longer asking for.
+    var again = try db.answerFolded(try db.foldQuery(&copied_question, &.{}));
+    again.deinit();
+    try std.testing.expectEqual(@as(usize, 1), db.foldStats().kept_reconstructions);
+    db.clearPlanCache();
+    try std.testing.expectEqual(@as(usize, 0), db.foldStats().kept_reconstructions);
+}
+
+test "the cache holds a bounded number of reconstructions and drops the coldest" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const y = input.variable("Y");
+    try declareCopiedView(&db);
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+
+    // Six questions of one plan's shape, each keyed on its own constant, so
+    // each folds to a plan of its own and each plan wants a reconstruction.
+    const constants = [_][]const u8{ "a", "b", "c", "d", "e", "f" };
+    var folds: [constants.len]Fold = undefined;
+    for (constants, &folds) |constant, *slot| {
+        const goals = [_]input.Goal{input.relation("r", &.{ input.atom(constant), y })};
+        slot.* = try db.foldQuery(&goals, &.{});
+        var answers = try db.answerFolded(slot.*);
+        answers.deinit();
+    }
+    const stats = db.foldStats();
+    try std.testing.expectEqual(@as(usize, constants.len), stats.cached_plans);
+    // The plans are all still here — a plan is small and discarding one costs
+    // a fold — and the reconstructions are not, because each is a database.
+    try std.testing.expect(stats.kept_reconstructions < constants.len);
+    try std.testing.expectEqual(@as(usize, 6), stats.reconstruction_misses);
+
+    // Every plan still answers, whether or not its reconstruction survived.
+    for (constants, folds) |constant, fold| {
+        var answers = try db.answerFolded(fold);
+        defer answers.deinit();
+        const expected: usize = if (std.mem.eql(u8, constant, "a")) 1 else 0;
+        try std.testing.expectEqual(expected, answers.answers.items.len);
+    }
+}
+
+/// A fold, an answer, a fact under the name the plan reads, and another
+/// answer: the whole of what F7 added, in the smallest database that has it.
+fn keptReconstructionAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    try declareCopiedView(&db);
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+
+    const fold = try db.foldQuery(&copied_question, &.{});
+    var first = try db.answerFolded(fold);
+    first.deinit();
+
+    try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
+    var refreshed = try db.answerFolded(fold);
+    const rows = refreshed.answers.items.len;
+    refreshed.deinit();
+    if (rows != 2) return error.UnexpectedResult;
+
+    var reused = try db.answerFolded(fold);
+    reused.deinit();
+}
+
+test "refreshing and reusing a kept reconstruction release every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(keptReconstructionAllocationScenario);
+}
+
+test "an allocation failure answering a folded question leaves the next answer correct" {
+    // The sweep above says a failure releases what it allocated. This says
+    // what the database is afterwards, which a sweep cannot: a half-derived
+    // reconstruction must not be the thing a later call answers from.
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var db: Jatalog = .init(failing.allocator());
+    defer db.deinit();
+    try declareCopiedView(&db);
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+    try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
+    const fold = try db.foldQuery(&copied_question, &.{});
+
+    var offset: usize = 0;
+    while (offset < 400) : (offset += 1) {
+        // Fail one allocation of the next answer, wherever in it that lands:
+        // deriving the reconstruction the first time round the loop, solving
+        // against a kept one afterwards.
+        failing.fail_index = failing.alloc_index + offset;
+        if (db.answerFolded(fold)) |result| {
+            var answers = result;
+            answers.deinit();
+        } else |_| {}
+        failing.fail_index = std.math.maxInt(usize);
+
+        var answers = try db.answerFolded(fold);
+        defer answers.deinit();
+        try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
+    }
 }

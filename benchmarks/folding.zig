@@ -9,22 +9,31 @@
 //! remembers less the folded side would be faster by answering less, which is
 //! not a speedup.
 //!
-//! Three numbers per shape, and they measure different things on purpose.
+//! Four numbers per shape, and they measure different things on purpose.
 //! *Planning* is `foldQuery`: inverting the view, eliminating the terms the
 //! inversion invents, and lowering the result into the executable language. It
 //! happens once per question. *Cached planning* is the same call once the plan
-//! is in hand, which is what a repeated question actually costs. *Execution*
-//! is running the plan. Loading the data is setup on both sides and is timed
-//! on neither; what is compared is one call against one call.
+//! is in hand, which is what a repeated question actually costs. Then
+//! execution, split in two: the *first* answer after the database changed,
+//! which has to derive the reconstruction, and the *repeated* answer, which
+//! finds it already derived and only solves goals. Loading the data is setup
+//! on both sides and is timed on neither; what is compared is one call against
+//! one call.
 //!
-//! The two calls are not doing the same amount of work, and the difference is
-//! the point rather than a flaw in the measurement. A direct query reuses the
-//! materialized closure, so after the first one it only solves goals. A folded
-//! plan cannot: its rules live in the plan and not in the database, so
-//! `answerFolded` builds a copy holding what the catalog admits, installs them
-//! there and derives the reconstruction from nothing, every time. That is what
-//! folding costs today, and it is a property of where the plan is kept rather
-//! than of the method.
+//! The split is the measurement. A direct query reuses the materialized
+//! closure, so after the first one it only solves goals. A folded plan's rules
+//! live in the plan and not in the database, so `answerFolded` builds a copy
+//! holding what the catalog admits, installs them there and derives the
+//! reconstruction — and then keeps it, so the next call skips all of that.
+//! What the first column costs is what folding costs on a database that
+//! changes between every question; what the second costs is what it costs on
+//! one that does not.
+//!
+//! Beside each time, candidate facts examined: the cost model's unit, the same
+//! number on every machine, and the only one of these that says *why* a call
+//! got cheaper. A reconstruction that is reused rather than made smaller shows
+//! as a repeated call examining only the query's own candidates while the
+//! first still examines the reconstruction's.
 //!
 //! No list functions appear here, so nothing on either side needs the source
 //! database seeded with the lists a structural rule derives over. That
@@ -55,8 +64,14 @@ const workloads = [_]Workload{
 const Timings = struct {
     planning: u64,
     cached_planning: u64,
-    execution: u64,
+    /// Total nanoseconds over `iterations` calls of each kind.
+    first: u64,
+    repeated: u64,
     direct: u64,
+    /// Candidate facts examined by one call of each kind.
+    first_work: u64,
+    repeated_work: u64,
+    direct_work: u64,
     rows: usize,
 };
 
@@ -67,14 +82,19 @@ pub fn main(init: std.process.Init) !void {
     for (workloads) |workload| {
         const timings = try run(init, workload);
         try writer.print(
-            "{s}: plan {d} ns, cached plan {d} ns, folded run {d} ns/query, " ++
-                "direct run {d} ns/query, {d} rows\n",
+            "{s}: plan {d} ns, cached plan {d} ns, first run {d} ns/query " ++
+                "({d} candidates), repeated run {d} ns/query ({d} candidates), " ++
+                "direct run {d} ns/query ({d} candidates), {d} rows\n",
             .{
                 workload.name,
                 timings.planning,
                 timings.cached_planning,
-                timings.execution / iterations,
+                timings.first / iterations,
+                timings.first_work,
+                timings.repeated / iterations,
+                timings.repeated_work,
                 timings.direct / iterations,
+                timings.direct_work,
                 timings.rows,
             },
         );
@@ -113,13 +133,39 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     warmup.deinit();
     if (rows == 0) return error.UnexpectedResult;
 
-    const execution_start = std.Io.Clock.Timestamp.now(init.io, .awake);
-    for (0..iterations) |_| {
+    // The first answer after a change. The fact goes under a name the plan
+    // reads, so the reconstruction is stale and has to be derived again; it
+    // holds a value the question does not ask for, so the answer does not
+    // move and the two columns stay comparable. Making the change is not
+    // timed — what is timed is one `answerFolded` that has to start from
+    // nothing.
+    var first: u64 = 0;
+    var first_work: u64 = 0;
+    for (0..iterations) |round| {
+        try applyChange(&folded, workload, round);
+        const work_before = folded.evaluationWork();
+        const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         var answers = try folded.answerFolded(plan);
+        first += @intCast(start.untilNow(init.io).raw.nanoseconds);
         defer answers.deinit();
+        first_work = folded.evaluationWork() - work_before;
         if (answers.answers.items.len != rows) return error.UnexpectedResult;
     }
-    const execution: u64 = @intCast(execution_start.untilNow(init.io).raw.nanoseconds);
+
+    // And the same call with nothing changed in between, which finds the
+    // reconstruction already derived.
+    var repeated_warmup = try folded.answerFolded(plan);
+    repeated_warmup.deinit();
+    var repeated_work: u64 = 0;
+    const repeated_start = std.Io.Clock.Timestamp.now(init.io, .awake);
+    for (0..iterations) |_| {
+        const work_before = folded.evaluationWork();
+        var answers = try folded.answerFolded(plan);
+        defer answers.deinit();
+        repeated_work = folded.evaluationWork() - work_before;
+        if (answers.answers.items.len != rows) return error.UnexpectedResult;
+    }
+    const repeated: u64 = @intCast(repeated_start.untilNow(init.io).raw.nanoseconds);
 
     // The same question against a database that still has `r`. Loading is
     // setup on both sides and is not timed on either; what is compared is one
@@ -132,10 +178,13 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     plain_warmup.deinit();
     if (plain_rows != rows) return error.UnexpectedResult;
 
+    var direct_work: u64 = 0;
     const direct_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     for (0..iterations) |_| {
+        const work_before = plain.evaluationWork();
         var answers = try plain.query(&question);
         defer answers.deinit();
+        direct_work = plain.evaluationWork() - work_before;
         if (answers.answers.items.len != rows) return error.UnexpectedResult;
     }
     const direct: u64 = @intCast(direct_start.untilNow(init.io).raw.nanoseconds);
@@ -143,10 +192,42 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     return .{
         .planning = planning,
         .cached_planning = cached_planning,
-        .execution = execution,
+        .first = first,
+        .repeated = repeated,
         .direct = direct,
+        .first_work = first_work,
+        .repeated_work = repeated_work,
+        .direct_work = direct_work,
         .rows = rows,
     };
+}
+
+/// One fact under the name the plan reads, put in and taken back out on
+/// alternate rounds. It moves `Database.fact_generation` either way, and so
+/// discards the kept reconstruction, without moving the answer: it holds a
+/// value the question never asks for.
+///
+/// Alternating rather than adding a fresh fact each round is what keeps the
+/// column measuring one thing. Twenty new keys is a 40% larger extension on
+/// `grouped 50x40`, so a first-call time taken over twenty of them would be
+/// reporting the workload growing under it.
+fn applyChange(database: *LiveDatalog.Jatalog, workload: Workload, round: usize) !void {
+    const terms = [_]input.Term{
+        input.atom("kfresh"),
+        switch (workload.shape) {
+            .copied => input.atom("vfresh"),
+            .grouped => input.list(&.{input.atom("vfresh")}),
+        },
+    };
+    const name = switch (workload.shape) {
+        .copied => "copied",
+        .grouped => "grouped",
+    };
+    if (round % 2 == 0) {
+        try database.addFact(name, &terms);
+    } else if (!try database.retract(&.{input.relation(name, &terms)})) {
+        return error.UnexpectedResult;
+    }
 }
 
 /// The question both sides answer: every key holding the marked value.

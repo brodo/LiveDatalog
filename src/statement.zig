@@ -44,6 +44,10 @@ pub fn addFactExpr(db: *database.Database, value: syntax.Expr) !void {
         // is what lets a run of assertions share one transaction and still be
         // undone one statement at a time: see `Database.rollback`, which has
         // no way to put a fact back.
+        //
+        // The fact stamp stays where the insertion left it, which is the one
+        // direction it is allowed to be wrong in: a reader rebuilds something
+        // that was still good, rather than keeping something that is not.
         db.facts.removeAt(db.facts.len() - 1);
         return err;
     };

@@ -127,7 +127,7 @@ fn removeOne(
     maintain: bool,
     removed: *relation_store.RelationStore,
 ) !bool {
-    if (!try db.facts.removeFact(fact)) return false;
+    if (!try db.applyRemoval(fact)) return false;
     if (maintain) {
         try relation_store.copyFactInto(db.allocator, removed, fact, false);
     } else {

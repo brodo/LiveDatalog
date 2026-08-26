@@ -902,7 +902,11 @@ are its decisions.
 - And the standing observation, unchanged and still not on P4's list: folded
   execution is 7.4x slower than direct on `copied 200x5` and 65x on
   `grouped 50x40`, measured today. That is the largest constant factor anyone
-  has measured here, F6 found it, and nothing in P4 targets it.
+  has measured here, F6 found it, and nothing in P4 targets it. **F7's first
+  item took it on 2026-08-26** and it is now a property of the *first* call
+  after a change rather than of every call; what P4's remaining item would
+  speed up is what is left of that first call, and F7's completed decisions
+  say where.
 
 
 # Project M: persistent and incremental view maintenance
@@ -2392,6 +2396,11 @@ F6 was completed on 2026-08-25:
 
 ## F7: folded execution that reuses its work
 
+**First item done 2026-08-26.** Everything from here to "Completed decisions"
+is the case as it stood before that, kept because the measurements it is built
+from are still the ones the remaining items are aimed at. What changed, and
+what the numbers are now, is at the end of the section.
+
 ### Why this is deferred work
 
 F6 measured folded execution at five to fifty times slower than direct
@@ -2564,6 +2573,155 @@ and the other changes how it is derived, and three levers moving at once on a
   the measurement favours this one first: eliminating a phase dominates
   speeding it up.
 
+### Completed decisions
+
+**Done 2026-08-26**, first item only. Repeated folded execution now reuses its
+reconstruction; the reconstruction's own candidate count and incremental
+maintenance of it are untouched, as the session boundary asks.
+
+**The reconstruction is kept in the plan cache entry, and what discards it is a
+third stamp.** `answerFolded` used to build a `viewOnlyCopy`, install the
+plan's rules, derive, solve, and throw the whole thing away. It now derives
+into a `database.Database` held in the entry beside the plan, and a later call
+finds the closure clean and only solves. `Fold` was never a candidate to hold
+it: a handle is a value the caller copies around, and a database it owned would
+have to be freed by a caller that has no way to know when the plan behind it
+went.
+
+The stamp is `Database.fact_generation`, a monotone counter moved by
+`applyInsertion` and by the new `Database.applyRemoval` — which exists so that
+removal has one place to move it, rather than leaving `facts.removeFact`
+reachable from anywhere. It is deliberately **conservative in one direction
+only**: it moves for a fact under a withheld name, and for an insertion a
+statement then takes back out, because the database does not know the catalog
+and a stamp that guessed would be a stamp that could guess wrong. A spurious
+move costs a rebuild; a missed one costs an answer.
+
+It is kept apart from the two the plan cache already had, and that separation
+is the item's whole correctness argument. `Catalog.generation` and
+`Evaluator.next_rule_id` discard the **plans**; `fact_generation` discards only
+what the plans **ran against**. Conflating them would have re-folded on every
+insertion — undoing F6's cache to fix a problem F6 does not have — and would
+have broken the property the acceptance test below pins: a `Fold` handle stays
+live across an insertion on purpose.
+
+**The acceptance test was written against the unchanged engine and watched to
+pass before anything was touched**, as the pattern-index and transaction
+sessions did. It is "a kept reconstruction answers exactly what a rebuilt one
+answers, after each kind of change": fold a query over a materialized `copied`
+view, answer it, add a fact under the readable name, fold again — `reused`,
+zero invalidations, the original handle still live — and answer 2 rows. Then
+each remaining kind of change, each followed by a comparison against the
+reference path, which is the same question asked again with the plan cache
+cleared. **With the `fact_generation` check removed the test answers 1 and the
+other 232 tests, including all twenty allocation-failure sweeps, pass.** That
+was verified rather than assumed: the suite was run with the check deleted, and
+exactly one test failed.
+
+**The availability boundary is unchanged and was re-proved by breaking it.**
+With the reconstruction kept rather than rebuilt, removing the fact filter in
+`viewOnlyCopy` still answers five where two are right, and keeping the
+database's own rules still answers four — F6's two numbers exactly. Nothing
+about keeping the copy weakens either half, because the copy is still built by
+`viewOnlyCopy` from what the catalog admits at the moment it is built, and any
+change to what the catalog admits discards the plan and the copy together.
+
+**Asking the same question twice still does not grow the database.** `foldQuery`
+commits its staged copy on a miss and drops it on a hit, unchanged; the kept
+reconstruction is a second database that the source database never sees.
+A test asserts that five folded answers leave the source's fact count, closure
+size and both interning tables exactly where one answer left them.
+
+**The cache of reconstructions is bounded and the plans are not.** Four, with
+least-recently-used eviction, and only the reconstruction is evicted — the
+entry and its plan stay, so no cache index ever moves under a live `Fold`. The
+asymmetry is the point: a plan is small and discarding one costs a fold, while
+a reconstruction is a copy of every readable extension plus its closure. This
+is the memory-for-time trade the open question flagged, and it makes
+`clearPlanCache` the memory control of the interface rather than a
+convenience, which its documentation now says. `Jatalog.clone` still does not
+carry the cache, and now for a second reason as well as the first.
+
+**An allocation failure leaves nothing half-built.** The reconstruction is
+derived into a local and handed to the cache by a `keep` that cannot fail, so
+there is no window where it belongs to neither. A failure while *solving*
+against a kept one discards it, because solving interns the goals' structures
+into it and can expand its closure, and a half-expanded closure is not
+something a later answer may be read from. Two tests: a new sweep over the
+whole fold-answer-change-answer path, and a test that forces a failure at each
+of four hundred allocation sites of one `answerFolded` and checks that the
+*next* call still answers correctly.
+
+#### Measurement
+
+`benchmark-folding` reports the two calls apart, with candidate counts beside
+the times. The change it applies between first calls is one fact put in and
+taken back out on alternate rounds rather than a fresh fact each round —
+twenty new keys is a 40% larger extension on `grouped 50x40`, and a first-call
+time taken over twenty of those reports the workload growing under it.
+
+Median of five runs, ns per call, arm64, macOS 26.5.2, Zig 0.16.0,
+`ReleaseFast`. Candidate facts examined are the same on every machine.
+
+| Shape | first | repeated | direct | first cand. | repeated cand. | direct cand. |
+| --- | --- | --- | --- | --- | --- | --- |
+| `copied 200x5` | 587795 | **30714** | 81156 | 3003 | 201 | 1001 |
+| `grouped 200x5` | 471276 | **31225** | 80906 | 6788 | 201 | 1001 |
+| `grouped 50x40` | 6806016 | **7435** | 109595 | 71805 | 51 | 2001 |
+
+**Repeated folded execution is 0.38x, 0.39x and 0.07x of direct**, against a
+bar of 2x and floors of 3.0x/0.86x/0.79x (copy + solve) and 0.68x/0.50x/0.63x
+(solve alone). It beats the lower floor, which the floor did not predict; the
+reason is in the candidate counts and is worth stating because it is not a
+property of folding — see below. Against the same call before this item, on the
+same benchmark shape, repeated execution is **18.6x, 14.6x and 923x** cheaper.
+
+**The candidate counts say the reconstruction was reused and not made
+smaller**, which is what they are there for. The first call still examines
+3003, 6788 and 71805 — F6's 3003, 6759 and 71706, plus the handful of
+structural seeds the change fact's own value contributes. That is F7's second
+item and it is still entirely intact.
+
+**The first call did not get slower.** Measured like for like — the engine as
+it stood before this item, running the same benchmark with the same change
+interleaved — the medians of five runs are 571710, 456045 and 6860997 against
+587795, 471276 and 6806016: +2.8%, +3.3% and −0.8%. The same binary's median
+moved by 5%, 14% and 66% between two batches an hour apart on this machine, so
+none of that is a signal. `benchmark-maintenance`,
+`benchmark-structural-deletion` and `benchmark-interning` are unmoved and their
+comparison counts are identical to the digit.
+
+**A finding this measurement turned up, which belongs to P4 rather than here.**
+The repeated folded call examines 201 candidates where the direct call examines
+1001 — for the same question, over the same 1000 pairs. P1 builds a pattern
+index on the *second* request for a pattern, and a folded plan now has a store
+that lives long enough to make a second request; `Jatalog.query` clones the
+database into a staging copy and drops it, so the request is never remembered
+and **a direct query re-scans every time, however often it is asked**. That is
+why repeated folded execution beats direct rather than merely matching it, and
+it flatters this table. It is not something F7 should fix — the staging copy is
+what keeps a query's interning out of the database — but it is a measured
+reason to think the index-on-second-request rule is worth less than P4 assumed
+on the read path, and it is the kind of thing P4's remaining item should be
+weighed against.
+
+#### Open questions this answered, and what it did not
+
+- *Where does a kept reconstruction live?* In the cache entry, bounded at four
+  with LRU eviction of the reconstruction only.
+- *Is a fact stamp the right answer, or should the staged database be
+  maintained from the source's change stream?* A stamp, here. Maintenance is
+  the difference between "as fast as direct on a static database" and "as fast
+  as direct on a changing one", and the first column of the table above is what
+  it would attack: 588µs, 471µs and 6.8ms are still what a folded question
+  costs on a database that changes between every call. That remains a separate
+  item, along with the reconstruction's own candidate count.
+- *P4's remaining item — caching plans per rule and pre-bound variable set —*
+  now has a measured place to land: it is inside the `first` column and nowhere
+  else, because the `repeated` column no longer plans anything. Eliminating a
+  phase dominated speeding one up, as predicted; what is left of the phase is
+  what P4 would speed up.
+
 ## Suggested session sequence
 
 Use one session and one commit per phase unless a phase proves too large:
@@ -2587,7 +2745,9 @@ Use one session and one commit per phase unless a phase proves too large:
 17. F4 soundness restrictions — **done 2026-08-25**
 18. F5 list functions and dependency chase — **done 2026-08-25**
 19. F6 execution and view selection — **done 2026-08-25**
-20. F7 folded execution that reuses its work — **not started**
+20. F7 folded execution that reuses its work — **first item done
+    2026-08-26**; the reconstruction's own candidate count and incremental
+    maintenance of a kept one remain
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's

@@ -558,7 +558,8 @@ plan's rules are in the plan and not in the database, so every call builds a
 copy holding what the catalog admits, installs them there, and derives the
 reconstruction from nothing. Nothing about a fold requires that; it is what
 `answerFolded` costs today, and it is the obvious thing to fix if folded
-execution ever needs to be fast.
+execution ever needs to be fast. (F7's first item fixed it on 2026-08-26 for
+every call but the first; see the section dated then.)
 
 The 50×40 row is a different effect and a real one. Reading values back out of
 a stored list goes through `$member`, which is defined by seeded structural
@@ -875,3 +876,88 @@ four times the entries it holds however long it is grown, and equals them
 exactly when it is built rather than grown. The `parsed, 2000 facts` row of
 `benchmark-interning`, which is what the batching item bought and what this
 item had to leave alone, is 923083 ns against 921042 before.
+
+## 2026-08-26 after F7's first item (folded execution that reuses its work)
+
+The F6 section above says folded execution is five to fifty times slower than
+direct, and that the reason is where the plan is kept rather than what the
+method does: a folded plan's rules live in the plan and not in the database, so
+`answerFolded` built a copy holding what the catalog admits, installed them
+there, and derived the reconstruction from nothing on every call. **It no
+longer does that on every call.** The reconstruction is kept in the plan cache
+entry beside the plan that built it, and a repeated `answerFolded` finds the
+closure already derived and only solves goals.
+
+`benchmark-folding` therefore reports two execution columns instead of one,
+because they are now two different things. *First* is the answer after the
+database changed, which still derives. *Repeated* is the answer with nothing
+changed in between. Beside each, candidate facts examined — the cost model's
+unit, the same number on every machine, and the only column here that says
+*why* a call got cheaper.
+
+The change applied between first calls is one fact under the name the plan
+reads, put in and taken back out on alternate rounds. It holds a value the
+question never asks for, so the answer does not move; it alternates rather than
+adding a fresh fact each round because twenty new keys is a 40% larger
+extension on `grouped 50x40`, and a first-call time taken over twenty of those
+would be reporting the workload growing under it.
+
+Median of five runs, ns per call.
+
+| Workload | First | Repeated | Direct | First cand. | Repeated cand. | Direct cand. |
+| --- | --- | --- | --- | --- | --- | --- |
+| relation copied, 200 keys × 5 values | 587795 | 30714 | 81156 | 3003 | 201 | 1001 |
+| relation grouped, 200 keys × 5 values | 471276 | 31225 | 80906 | 6788 | 201 | 1001 |
+| relation grouped, 50 keys × 40 values | 6806016 | 7435 | 109595 | 71805 | 51 | 2001 |
+
+**Repeated folded execution is 0.38x, 0.39x and 0.07x of direct**, where before
+this item every folded call was 7.4x, 5.6x and 65x. Against the same call
+before the change, on the same benchmark shape, it is 18.6x, 14.6x and 923x
+cheaper. The 923x is not a typo and it is not a smaller derivation: on
+`grouped 50x40` the derivation was 99% of the call, and what the repeated call
+skips is all of it.
+
+**The candidate counts say the reconstruction was reused and not made
+smaller.** The first call still examines 3003, 6788 and 71805 candidates —
+F6's 3003, 6759 and 71706, plus the handful of structural seeds the change
+fact's own value contributes through its tails. Reducing that number is a
+separate item and is untouched. What the repeated call examines is 201, 201 and
+51: the query's own candidates and nothing else.
+
+**The first call did not get slower**, measured like for like: the engine as it
+stood before the item, running the same benchmark with the same change
+interleaved, gives medians of 571710, 456045 and 6860997 against 587795, 471276
+and 6806016 — +2.8%, +3.3% and −0.8%. That is inside the band this machine
+shows for one unchanged binary: the same build's medians moved 5%, 14% and 66%
+between two batches an hour apart. `benchmark-maintenance`,
+`benchmark-structural-deletion` and `benchmark-interning` are unmoved, and
+their comparison counts are identical to the digit.
+
+### A direct query never keeps a pattern index
+
+The repeated folded call examines 201 candidates where the direct call examines
+1001, for the same question over the same 1000 pairs, on every one of twenty
+iterations. That gap is not folding being clever. P1 builds a pattern index on
+the *second* request for a pattern, because a single probe cannot repay a pass
+over the relation — and a folded plan now has a store that lives long enough to
+make a second request, while `Jatalog.query` clones the database into a staging
+copy and drops it, so the first request is never remembered and **a direct
+query re-scans however often it is asked**.
+
+The staging copy is not a mistake: it is what keeps a query's interning out of
+the database, and the 1001 is the honest cost of the read path as it stands.
+But it means part of the margin in the table above is the direct side paying
+for an index it never gets to use, and it is a measured reason to weigh the
+index-on-second-request rule again on the read path rather than only on the
+maintenance path where P4 measured it.
+
+### What this did not touch
+
+The first column is what a folded question costs on a database that changes
+between every call, and 588µs, 471µs and 6.8ms is still what that is. Two
+separate items remain: maintaining a kept reconstruction from the source
+database's change stream rather than rebuilding it, which is the difference
+between "as fast as direct on a static database" and "as fast as direct on a
+changing one"; and the reconstruction's own candidate count, which F6 traced to
+list length. Neither was taken here, because three levers moving at once on a
+65x gap would make a regression impossible to attribute.
