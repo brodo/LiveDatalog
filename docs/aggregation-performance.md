@@ -743,3 +743,135 @@ caught this.
 The comparison counts go back with the rollback too, so a rolled-back statement
 still takes its own share of what interning cost with it — which is what they
 meant when every statement had a staging copy of its own.
+
+## 2026-08-26 after P4's third item (a flat pattern index)
+
+The third of P4's four items. A pattern index kept one `ArrayList` per group,
+which forced two empirical rules: `clonePatterns` carried an index across a
+clone only when its groups averaged four entries or more, because copying cost
+an allocation per group; and `lookup` deferred building one to the second
+request for a pattern, because building cost an allocation per distinct key.
+The index is now one flat `[]u32` with the groups laid out end to end, an
+insertion-ordered group list beside it, and an `intern_index.Index` of
+positions in that list — the same shape, for the same reason, that P4's first
+item gave the value tables. A copy is three `memcpy`s whatever the shape.
+
+**One rule is retired and one survived**, and both outcomes are measured below.
+Nothing observable changed: every derived-fact, closure, group, policy and
+comparison count in every benchmark is identical, which is also what says plan
+choice did not move.
+
+### What the density gate is worth, before and after
+
+The controlled experiment, run today on this machine: `min_group_size` set to
+zero — carry every index — under each layout, against the same layout with the
+gate in place. `benchmark-materialization`, 20 repeated queries over 14 rules
+on a 25-node chain, whose 666-fact closure holds seven indexes.
+
+| Layout | Gate in place | Gate removed | Cost of removing it |
+| --- | --- | --- | --- |
+| one `ArrayList` per group | 19968 | 29387 | 1.51x |
+| flat `[]u32` | — | 19454 | none |
+
+That is the item. The gate existed because copying every index cost half again
+as much as the lookups it saved; under the flat layout copying every index
+costs nothing measurable and the copy is a hair faster than the gated original
+while doing strictly more work. P3's follow-up recorded the same experiment at
+19% when it installed the gate; it is 51% today on the same workload.
+
+### What the deferred build is worth, still
+
+Reconsidered on the same evidence and **kept**. Building on the first request
+instead of the second, everything else unchanged:
+
+| Workload | Second request | First request | Ratio |
+| --- | --- | --- | --- |
+| `benchmark-join-planning` sparse join, planned | 110870 | 144227 | 0.77x |
+| `benchmark-materialization` per query | 19454 | 20368 | 0.96x |
+
+Nothing else moved. The sparse join is exactly the shape the rule is about: one
+goal binds a single value and the goal after it is looked up *once*, on a
+staging copy the query discards. Two asks is a cheap proxy for a third, because
+the goal inside a join is looked up once per binding the goal outside it
+produced — a lookup that happens twice is about to happen four hundred times.
+So the rule stayed, and with it F6's decision not to cost index availability:
+index availability is still a function of query history, and plan choice is
+unchanged on every workload.
+
+### Times
+
+ns, best of three paired runs alternating between the two trees, arm64,
+macOS 26.5.2, Zig 0.16.0, `ReleaseFast`.
+
+| Workload | Before | After | Ratio |
+| --- | --- | --- | --- |
+| join planning, sparse, planned | 108781 | 110870 | 0.98x |
+| join planning, sparse, stored order | 159283 | 148179 | 1.07x |
+| join planning, dense, planned | 166741 | 153456 | 1.09x |
+| join planning, recursive close, planned | 20762 | 22158 | 0.94x |
+| join planning, empty aggregate, planned | 96252 | 96895 | 0.99x |
+| join planning, large groups, planned | 74347 | 75293 | 0.99x |
+| materialization, per query | 19968 | 19454 | 1.03x |
+| structural deletion, leaf incremental | 155270 | 157368 | 0.99x |
+| structural deletion, base incremental | 4730916 | 4698031 | 1.01x |
+| interning, 2000 facts as source statements | 921042 | 923083 | 1.00x |
+| interning, materialize 120 deep | 3402375 | 3244625 | 1.05x |
+| folding, `grouped 50x40`, folded run | 6328050 | 6316902 | 1.00x |
+| aggregation, incremental maintenance | 944250 | 949541 | 0.99x |
+| projected aggregate, incremental | 11414698 | 10926988 | 1.04x |
+
+**Every row is inside the run-to-run band.** The measurement gate names
+`benchmark-structural-deletion` and a fact-loading workload as the two that
+should move most; **neither moved**, and that is recorded here rather than
+dressed up. Both are dominated by work a pattern index is not part of —
+cloning fact terms, unifying candidates, rebuilding a closure — and the
+allocations this item removes were never their cost. What the item bought is
+the retired rule above and the memory below.
+
+### Memory
+
+`benchmark-maintenance`, live and peak KiB per batch. These are deterministic:
+identical across all three runs of each variant. The third column is the old
+layout with the density gate removed, which is what carrying every index used
+to cost.
+
+| Batch | Before live/peak | After live/peak | Old layout, no gate |
+| --- | --- | --- | --- |
+| insert-only automatic | 53 / 408 | 50 / 405 | 53 / 416 |
+| insert-only incremental | 53 / 408 | 50 / 405 | 53 / 416 |
+| insert-only recompute | 44 / 242 | 43 / 240 | 44 / 244 |
+| delete-only automatic | 12 / 335 | 3 / 337 | 12 / 348 |
+| delete-only incremental | 30 / 361 | 23 / 352 | 30 / 375 |
+| delete-only recompute | 12 / 177 | 3 / 165 | 12 / 184 |
+| mixed automatic | 14 / 342 | 5 / 337 | 14 / 357 |
+| mixed incremental | 35 / 372 | 28 / 360 | 35 / 399 |
+| mixed recompute | 14 / 177 | 5 / 165 | 14 / 185 |
+| negation rebuild automatic | 27 / 417 | 20 / 399 | 27 / 420 |
+| negation rebuild incremental | 27 / 419 | 20 / 400 | 27 / 423 |
+| negation rebuild recompute | 27 / 205 | 20 / 197 | 27 / 210 |
+
+Live bytes fall **4x** on the delete-only and mixed rows — 12 KiB to 3, 14 to
+5 — and 7 KiB on every other row that holds indexes. Peak falls up to 6.8%
+(177 to 165). The direction is the whole point: under the old layout, carrying
+every index *raised* peak on every row; under the flat layout, carrying every
+index *lowers* it. A group used to cost a heap allocation, its rounding, an
+`ArrayList` header and a hash-map entry; it now costs 24 bytes in an array.
+
+### What absorbs an insert
+
+P4 named `noteInserted` as the obstacle to a flat layout — "a layout that
+cannot absorb an insert needs either an overflow list or a rebuild policy" —
+and since the batching item landed that path is hotter than it was, because a
+run of consecutive assertions maintains one store's caches incrementally
+instead of rebuilding them from a fresh clone per statement. This layout needs
+neither an overflow list nor a rebuild policy, because it *can* absorb an
+insert: a group reserves room past its end and takes the insert in place, and
+when the room runs out the group is copied to the end of the array with twice
+as much, exactly as an `ArrayList` grows, leaving its old slots behind.
+
+That bounds the array without compaction. A group at capacity `c` has ever
+occupied `2c - 1` slots and holds more than `c / 2`, so the array stays under
+four times the entries it holds however long it is grown, and equals them
+exactly when it is built rather than grown. The `parsed, 2000 facts` row of
+`benchmark-interning`, which is what the batching item bought and what this
+item had to leave alone, is 923083 ns against 921042 before.

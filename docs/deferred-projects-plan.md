@@ -489,11 +489,22 @@ P3 was completed on 2026-08-07:
     at it. Copying every index unconditionally was measured first and cost 19%
     on the repeated-query workload, whose 666-fact closure holds seven indexes
     over 360 groups. The density gate turned that into a 14% gain.
+  - **This gate was retired by P4's third item on 2026-08-26.** Its premise —
+    that a group is a list of its own — stopped being true when the index
+    became one flat array. The experiment was re-run on both layouts: removing
+    the gate costs 1.51x on that workload under the layout it was written for
+    and nothing at all under the flat one. The reasoning above is exactly right
+    about the layout it was measured on; it is the layout that went.
   - `requested` does not carry over either. It records that a pattern was asked
     for once *here*, and `lookup` defers building an index to the second ask
     precisely so a lookup happening once does not pay for one; a copy that
     inherited the record would build on its own first ask, which for a
     per-statement copy is every ask.
+  - **This one survived P4's third item, re-measured.** Building on the first
+    request costs `benchmark-join-planning`'s sparse join 1.30x and moves
+    nothing else: that shape looks a goal up exactly once, on a staging copy
+    the query discards. Two asks is a proxy for a third, because a goal inside
+    a join is looked up once per binding the goal outside it produced.
 
 ## P4: measured constant-factor work
 
@@ -571,12 +582,14 @@ speed in either direction. The benchmarks are.
   earlier statement and none of the failing one. This touches the transaction
   model and is the riskiest item here; it may reasonably be split out or
   declined.
-- Reconsider the pattern index layout — a flat `[]u32` grouped by key plus a
-  map to ranges is cheap to build and cheap to copy. The obstacle is
-  `noteInserted`, which appends to a group in place; a layout that cannot
-  absorb an insert needs either an overflow list or a rebuild policy, and the
-  candidate slice a caller is iterating must stay valid across nested lookups.
-  Retiring the deferred build and the density gate is the prize.
+- **Done 2026-08-26.** Reconsider the pattern index layout — a flat `[]u32`
+  grouped by key plus a map to ranges is cheap to build and cheap to copy. The
+  obstacle is `noteInserted`, which appends to a group in place; a layout that
+  cannot absorb an insert needs either an overflow list or a rebuild policy,
+  and the candidate slice a caller is iterating must stay valid across nested
+  lookups. Retiring the deferred build and the density gate is the prize. Half
+  the prize was won: the density gate is retired, the deferred build was
+  re-measured and kept.
 - Cache plans per rule and pre-bound variable set, invalidated with the
   analysis, so a body solved once per delta round is planned once.
 
@@ -614,9 +627,10 @@ attribute.
 ### Completed decisions
 
 **The first item — a hash index beside each value table — was completed on
-2026-08-25, and the second — one transaction per run of assertions — on the
-same day.** The remaining two have not been started. The first item's decisions
-come first; the second item's follow, under its own heading.
+2026-08-25, the second — one transaction per run of assertions — on the same
+day, and the third — a flat pattern index — on 2026-08-26.** The fourth, plan
+caching, has not been started. Each item's decisions follow under its own
+heading, in the order the items landed.
 
 - `intern_index.Index` is an open-addressed table of *positions*: a slot holds
   one more than an identifier so that zero means empty, and nothing else is
@@ -771,6 +785,118 @@ the tables.
   incrementally through `noteInserted` instead of rebuilding them from a fresh
   clone per statement, so a layout that cannot absorb an insert has one more
   caller to satisfy than it did.
+
+**The third item — a flat pattern index — was completed on 2026-08-26.** These
+are its decisions.
+
+- **What replaced the group-per-`ArrayList` layout.** A `PatternIndex` is now
+  three plain arrays: a flat `[]u32` with every group laid out end to end, an
+  insertion-ordered `[]Group` giving each group its key and its range in that
+  array, and an `intern_index.Index` of *positions* in the group list. That is
+  the same answer P4's first item gave the value tables, for the same reason —
+  see `intern_index`'s own header, which had already written down why. The
+  point of it is that a copy is three `memcpy`s whatever the shape, where a
+  `std.HashMap` of ranges would have to re-key every group and cost what
+  building one costs.
+- **A middle version was built and measured and is not what landed.** The
+  first flat layout kept a `std.AutoHashMapUnmanaged(u64, Range)` beside the
+  array. It made `benchmark-materialization` **2.6x worse** — the map clone was
+  the whole cost, and it is exactly the cost the density gate had been avoiding
+  all along. Replacing the map with the positional index is what turned that
+  into a 1.03x gain. Recorded because the flat array was never the hard part;
+  the group directory was.
+- **The density gate is retired, on a controlled experiment rather than on the
+  argument.** `min_group_size` was set to zero under *both* layouts and
+  measured today: carrying every index costs 1.51x on the repeated-query
+  workload under the layout the gate was written for, and nothing under the
+  flat one. P3 measured the same thing at 19% when it installed the gate.
+  `clonePatterns` now carries every index unconditionally, and P3's decision is
+  corrected in place above rather than deleted — its reasoning is right about
+  the layout it was measured on.
+- **The deferred build survived, and the measurement that kept it is the
+  sparse join.** Retiring it was the other half of the prize, so it was tried:
+  `lookup` building on the first request cost `benchmark-join-planning`'s
+  sparse join **1.30x** and moved nothing else. That shape is what the rule is
+  about — one goal binds a single value, the goal after it is looked up exactly
+  once, and the store it is looked up in is a staging copy the query discards.
+  Two asks is a cheap proxy for a third, because a goal inside a join is looked
+  up once per binding the goal outside it produced. The conclusion is about the
+  behaviour as it actually runs, `requested` resetting on every clone included:
+  it is the per-query clone that makes "asked once" the common case worth not
+  paying for.
+- **So F6's decision not to cost index availability stands, untouched.** It was
+  binding only while the deferred build was, and the deferred build is still
+  here. Plan choice is unchanged on every workload — every maintenance policy
+  count, group count, derived-fact count and closure size in every benchmark is
+  identical before and after, which is the direct evidence that no join order
+  moved. P1's claim that the insertion-ordered entry list is what keeps answer
+  order deterministic was checked rather than assumed and holds under this
+  layout: a group holds entry indices in insertion order both when it is built
+  and after it has been grown and moved, and the acceptance test below pins
+  that against a scan of the entry list.
+- **`noteInserted` needed neither an overflow list nor a rebuild policy.** A
+  group reserves room past its end and takes an insert in place; when the room
+  runs out the group is copied to the end of the array with twice as much,
+  exactly as an `ArrayList` grows, and its old slots are abandoned. That bounds
+  the array without compaction — a group at capacity `c` has ever occupied
+  `2c - 1` slots and holds more than `c / 2`, so the array stays under four
+  times what it holds however long it is grown, and equals it exactly when the
+  index is built rather than grown. A candidate slice stays valid until the
+  next insert into its own index, which is the promise the per-group lists made
+  too. The batching item's `parsed, 2000 facts` row is 923083 ns against
+  921042 before, so the path that got 268x faster did not give any of it back.
+- **The acceptance test came first, again.** P4's acceptance test for this item
+  — random operation sequences agreeing with an unordered reference set — was
+  already in `relation_store.zig` and passed only because nothing had changed,
+  and it says nothing about a clone. So `relation_store.zig`'s "a clone and its
+  original answer every pattern lookup as each keeps inserting" was written
+  against the unchanged engine, watched to pass, and only then was the layout
+  touched: it spans a dense mask, a near-unique one and every combination, and
+  requires that verified candidates are the entry list's own matches in the
+  entry list's own order on both sides of a clone as each side takes inserts
+  the other never sees.
+- **The two tests that asserted the retired rule.** "A clone keeps the index
+  caches worth copying and rebuilds the rest" became "a clone carries every
+  pattern index whatever its density", which asserts the opposite of what the
+  density gate made true — both indexes come across, the near-unique one
+  answers on the copy's first ask, and the copy can report its selectivity
+  without rediscovering it. "A pattern index is built on the second request,
+  not the first" stayed, because the rule stayed; its comment now says that the
+  flat layout made building cheap enough to reconsider and names what kept it.
+  A third test was added for the layout's one moving part, "a group that
+  outgrows its room moves without disturbing the others". Every other test
+  passes untouched, all nineteen allocation-failure sweeps included, and the
+  suite is 227 tests at about twelve seconds.
+- No new allocation-failure sweep was added and none was needed: the new
+  allocation sites are on paths the nineteen existing sweeps already walk.
+  `PatternIndex.append` is the one that had to be got right — it reserves
+  before it writes, so a failure leaves the index exactly as it was, which is
+  what lets `noteInserted` go on treating a failure as a reason to drop the
+  index rather than as a half-applied insert.
+- **The measurement gate's verdict, in full.** The gate names
+  `benchmark-structural-deletion` and a fact-loading workload as the two that
+  should move most. **Neither moved**, and neither did any other time: every
+  row of every benchmark is inside its run-to-run band, measured best-of-three
+  in paired alternating runs. What moved is memory. `benchmark-maintenance`
+  live bytes fall 4x on the delete-only and mixed rows — 12 KiB to 3, 14 to 5 —
+  and 7 KiB on every other row that holds indexes; peak falls up to 6.8%. The
+  direction is the point: under the old layout carrying every index *raised*
+  peak on every row, and under the flat one it *lowers* it. The item is kept on
+  that plus the retired rule, and the flat verdict on the gate's own two
+  workloads is recorded here rather than dressed up.
+  `docs/aggregation-performance.md` carries the tables.
+- One thing noted for the item still to come. Plan caching is untouched by
+  this: `Selectivity` reports the same numbers it did, planning still never
+  builds an index, and the analysis a cache would be invalidated with is
+  unchanged. The suite-timing evidence its entry rests on has expired — the
+  suite is about twelve seconds and F2's sweep over all 512 three-node graphs
+  is roughly half of it — so it should be measured on `benchmark-folding` as
+  well as on the benchmarks P4 names: a folded plan installs its rules into a
+  fresh copy on every `answerFolded` and re-plans everything, every time.
+- And the standing observation, unchanged and still not on P4's list: folded
+  execution is 7.4x slower than direct on `copied 200x5` and 65x on
+  `grouped 50x40`, measured today. That is the largest constant factor anyone
+  has measured here, F6 found it, and nothing in P4 targets it.
 
 
 # Project M: persistent and incremental view maintenance
