@@ -3163,6 +3163,65 @@ Noticed while doing scoped work, deliberately not chased there:
   remains. Closing it wants the reconstruction to derive list functions lazily
   against the query rather than eagerly over the whole extension, which is a
   new design rather than a fix to `applyRule`'s seed branch.
+
+  **Attempted and reverted on 2026-08-26.** `member(X, L)` with `L` already
+  bound has an exact native equivalent — walk `L`'s own cons chain rather than
+  consult the relation `$member`'s three generated rules derive — since
+  `$member`'s only caller (`inversion.Builder.membership`) always supplies a
+  `setof`-collected, hence always-bound-when-reachable, list. Built as
+  `Evaluator.list_membership: ?relation_store.PredicateKey`, set only by
+  `Jatalog.deriveReconstruction` from a new `folding.Executable.list_membership`
+  field, so no database outside a fold reconstruction is affected. Fell
+  through to the ordinary relational lookup whenever the list argument was
+  unbound.
+
+  A first version unconditionally skipped a call in which a semi-naive delta
+  constraint named `$member`'s own clause, reasoning that `expandLevel`
+  restricts one occurrence per call, so some *other* call always leaves
+  `$member` unrestricted and already covers a binding no native walk missed.
+  That reasoning assumes the clause order is fixed across rounds, and it is
+  not: the planner's own cost model treats an empty relation as free
+  (`estimate() = facts/(groups orelse 1)`, zero over one), so a rule reading
+  both `$member` and a base relation plans `$member` *first* while it is
+  still empty — before `$member`'s own seeded rules have run that round.
+  P4's fourth item's plan cache then notices `$member` grow and replans,
+  moving it second — and the only call that ever has `$member`'s argument
+  bound thereafter is exactly the delta-restricted one the skip discarded,
+  losing real answers. `root.zig`'s "cost picks between views that
+  reconstruct one relation exactly" test caught it (2 expected, 0 found);
+  traced with temporary debug instrumentation dumping each `matchClauses`
+  step and each fold rule's resolved predicate names, which is how the
+  planner's reordering was found at all.
+
+  Falling through to the relational lookup whenever the constraint names
+  `$member`'s own clause (matching what a stale-plan replan already does
+  correctly) fixed the answer but not the performance: with that guard, the
+  native walk *never fires for the external consumer's own read* in this
+  shape — round zero always finds `$member` unbound (planned first, still
+  empty) and falls through, and every later bound call is the one the guard
+  also routes to relational. The only path the native walk ever actually
+  exercises is `$member`'s *own* recursive reads (`first`/`rest`'s body,
+  always unconstrained since seeded rules never receive a delta), and that
+  measured as a wash or a net loss against the pattern-indexed lookup it
+  replaced: `grouped 50x40`'s first-call candidate count dropped from 10646
+  to 7240, but wall-clock time rose from a tight 1300–1333k ns (four baseline
+  runs) to a tight, non-overlapping 1382–1416k ns (four runs with the fix) —
+  about 8%, reproducible, not noise. `zig build test` stayed green (235
+  tests) through every version tried.
+
+  **What this leaves for a later attempt.** The actual blocker is the
+  planner's "an empty relation is free" cost heuristic, which plans `$member`
+  first precisely because it has not been given a chance to be bound yet —
+  backwards for what this optimization needs. Fixing that heuristic is a
+  general cost-model change with consequences well beyond folding (every
+  query in the engine costs through the same `Selectivity.estimate`), and the
+  alternative — deriving `$member` on demand from a specific bound value
+  regardless of clause order, i.e. the demand-driven design this session's
+  own scoping discussion already named and set aside as large — is not
+  smaller. Neither is a follow-up-sized fix; both need their own session.
+  `src/evaluator.zig`, `src/folding.zig`, and `src/root.zig` were restored to
+  their last-committed content (verified byte-identical), and no commit was
+  made for the attempt.
 - P4's fourth item's fingerprint (done 2026-08-26) originally invalidated a
   cached plan only on a fact-count change in a predicate the rule's body
   reads, which missed a pattern index appearing between two calls with *no*
