@@ -3113,10 +3113,22 @@ Each phase ends with:
   enough to be worth an allocation apiece, and a flat index copies with three
   `memcpy`s, so every index is now carried. The surviving rule is in
   `relation_store.zig` with the measurement behind it.
-- Should full rebuild remain public, test-only, or available through a debug
-  policy after incremental maintenance is stable?
+- ~~Should full rebuild remain public, test-only, or available through a debug
+  policy after incremental maintenance is stable?~~ **Answered 2026-08-26: no
+  change.** It stays exactly as it is — a public/test-only reference path per
+  shared correctness rule 1. Nothing measured in this project argues for
+  restricting it: it costs nothing to keep (it is only ever called, never
+  built eagerly), it is the differential-testing oracle every maintenance
+  phase compares against, and it is an embedder's escape hatch when a policy
+  decision (e.g. `plan_policy`, `MaintenancePolicy`) goes wrong for their
+  workload. Restricting it would be a public-API change with no problem
+  behind it to justify one.
 - Is delete-and-rederive sufficient for the expected recursive workloads, or
   should a later design adopt a differential-dataflow-style timestamp model?
+  **Left open 2026-08-26.** Unlike everything else resolved in this document,
+  nothing has measured a workload where delete-and-rederive actually strains —
+  this stays open pending one turning up, rather than speculatively designing
+  a timestamp model against no measured deficiency.
 - Should folded plans be returned only as an internal executable IR, or also as
   printable Datalog extended with internal function terms? **F1 answered half
   of it**: a plan renders as Datalog extended with generated function terms,
