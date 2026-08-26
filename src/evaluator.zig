@@ -443,6 +443,20 @@ pub const Evaluator = struct {
             // succeeds binds the whole seed term, so every iteration that gets
             // as far as solving the body starts from the same bound variables;
             // planning on the first of them is planning for all of them.
+            //
+            // Values are interned in dependency order: a cons cell's head and
+            // tail must already have an identifier before the cons itself can
+            // get one, so nothing a recursive occurrence in the body reads
+            // (the tail bound by `unifyValueTerm`'s `.cons` case) ever has a
+            // higher identifier than the seed value being tried. Walking
+            // `0..value_count` in order and committing each value's answers
+            // before moving to the next therefore reaches the whole closure of
+            // a structurally recursive rule in one pass, where committing only
+            // after the full range needs one pass per list position — the
+            // rest of `expandLevel`'s rounds exist for other rules, and this
+            // is safe beside them because a fact committed earlier than
+            // before is a fact Datalog's monotone fixpoint would have derived
+            // anyway, so the set of facts is the one it already was.
             var chosen: ?planner.Plan = null;
             defer if (chosen) |*value| value.deinit();
             const value_count = self.values.values.items.len;
@@ -468,6 +482,15 @@ pub const Evaluator = struct {
                         errors.Error.NumericType, errors.Error.NumericOverflow => continue,
                         else => return err,
                     };
+                    for (answers.items) |*answer| {
+                        const derived = try self.deriveFact(rule.head, answer);
+                        _ = facts.insert(derived, true) catch |err| {
+                            self.allocator.free(derived.terms);
+                            return err;
+                        };
+                    }
+                    for (answers.items) |*answer| answer.deinit(self.allocator);
+                    answers.clearRetainingCapacity();
                 }
             }
         } else {

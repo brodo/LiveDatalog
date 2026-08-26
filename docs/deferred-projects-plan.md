@@ -2396,7 +2396,7 @@ F6 was completed on 2026-08-25:
 
 ## F7: folded execution that reuses its work
 
-**First item done 2026-08-26.** Everything from here to "Completed decisions"
+**First and second items done 2026-08-26.** Everything from here to "Completed decisions"
 is the case as it stood before that, kept because the measurements it is built
 from are still the ones the remaining items are aimed at. What changed, and
 what the numbers are now, is at the end of the section.
@@ -2722,6 +2722,90 @@ weighed against.
   phase dominated speeding one up, as predicted; what is left of the phase is
   what P4 would speed up.
 
+### F7's second item: the reconstruction's own candidate count
+
+**Done 2026-08-26**, in its own session as the boundary above asks — this does
+not touch what invalidates a kept reconstruction, only how much work deriving
+one does the first time.
+
+**The cause was generic, not particular to `$member`.** F6 traced the 3x–36x
+overshoot to list length and to `$member` specifically, but the mechanism
+lives in `Evaluator.applyRule`'s seed branch and applies to every seeded
+structural rule the same way: `sum`, `length`, and any user-written rule of
+the same shape were all paying it, `$member` just paid the most because a
+fold's reconstruction defines it over every list the plan reads. The seed
+branch tries each of the value table's entries against the rule's structural
+head position and, on a match, solves the body — but it used to collect every
+round's derivations into one `answers` list and commit them to `facts` only
+after the whole `0..value_count` sweep finished. A value bound to a list's
+tail is a fact the *next* round's sweep could use, not this one's, so deriving
+one more list position needed one more full sweep of the value table —
+`expandLevel`'s outer fixpoint loop already runs seeded rules once per round
+with no delta restriction, exactly because their seed set is the value table
+rather than a fact relation. For a list of length `L` that is `L` sweeps of a
+table that itself grows with the list, which is the quadratic-in-length shape
+F6 measured and did not yet explain down to the mechanism.
+
+**The fix uses an invariant the value table already had.** `ValueTable.intern`
+is append-only and a `.cons` value's `head` and `tail` are `ValueId`s that must
+already exist to be interned into it, so a cons cell's components always have
+a strictly smaller identifier than the cons cell itself — the table is stored
+in a topological order for free, without anything having to compute one.
+Walking `0..value_count` in that order and committing each value's derived
+facts *before* moving to the next value means that by the time a longer list's
+cons cell is tried, its tail's facts — derived from a smaller identifier
+earlier in the very same sweep — are already visible to the body. One sweep
+now does what used to take one sweep per list position.
+
+**This could not have produced a wrong answer, only a slower right one.**
+Committing a fact earlier within a sweep than the old code would have is still
+committing it no earlier than a monotone Datalog fixpoint allows, since
+nothing about *which* facts are eventually derivable depends on the order
+seed values are tried in — `expandLevel`'s outer loop still runs until nothing
+grows, so a fact this change makes visible mid-sweep is a fact the old code
+would have derived on the next sweep regardless. That is also why this did
+not need new tests: the shared correctness rule is that a full rebuild stays
+right, and every existing test — including the seeded-rule tests for `sum`,
+`length`, over-deletion through a seeded head, and mutual seeded recursion —
+passed unchanged, which is what a change with no semantic content should do.
+
+**Measured.** Median of five runs, ns per call, arm64, macOS 26.5.2, Zig
+0.16.0, `ReleaseFast`. Only the `first` column and its candidate count are
+this item's target; `repeated` and `direct` are reported to show they did not
+move.
+
+| Shape | first (before) | first (after) | first cand. (before → after) | repeated | direct |
+| --- | --- | --- | --- | --- | --- |
+| `copied 200x5` | 587795 | 571297 | 3003 → 3003 | 28814 (201) | 78937 (1001) |
+| `grouped 200x5` | 471276 | 412764 | 6788 → 5013 | 28279 (201) | 80102 (1001) |
+| `grouped 50x40` | 6806016 | 1285325 | 71805 → 10646 | 7735 (51) | 124627 (2001) |
+
+**`copied 200x5` does not move, and that is consistent rather than a miss.**
+Its shared structure across groups already kept the value table small (3003
+candidates before this item, against 6788 and 71805 for the grouped shapes at
+the same list lengths), so there was little quadratic overshoot there to
+remove — the fix collapses a sweep-per-position cost, and a table that was
+already close to its floor has no positions' worth of sweeps to collapse.
+
+**`grouped 50x40` is 5.3x faster and still 5.3x direct's candidate count, not
+1x.** The remaining gap is the `71706`-candidate finding F6 already recorded
+as intact and out of this item's scope: the reconstruction still derives
+`$member` (and any other list function) as a general relation over every list
+position rather than answering only the query's own goal, which is a
+different overshoot from the one this item removed. Closing it further would
+mean deriving list functions lazily against what the query actually asks
+rather than eagerly over the whole extension, which is a new design rather
+than a fix to this mechanism and is left as a follow-up.
+
+**Every other benchmark's fact and derivation counts are unchanged.**
+`benchmark-maintenance`, `benchmark-structural-deletion` and
+`benchmark-interning` report the same over-deleted, rederived, fallback,
+expansion and closure-fact counts as before this item — only timings moved,
+and by amounts the plan's own noise note already covers. `benchmark-join-planning`,
+`benchmark-aggregation`, `benchmark-materialization` and
+`benchmark-projected-aggregate` likewise report unchanged maintain/recompute/
+fallback counts.
+
 ## Suggested session sequence
 
 Use one session and one commit per phase unless a phase proves too large:
@@ -2745,9 +2829,9 @@ Use one session and one commit per phase unless a phase proves too large:
 17. F4 soundness restrictions — **done 2026-08-25**
 18. F5 list functions and dependency chase — **done 2026-08-25**
 19. F6 execution and view selection — **done 2026-08-25**
-20. F7 folded execution that reuses its work — **first item done
-    2026-08-26**; the reconstruction's own candidate count and incremental
-    maintenance of a kept one remain
+20. F7 folded execution that reuses its work — **first and second items done
+    2026-08-26**; incremental maintenance of a kept reconstruction remains
+    (and may reasonably be declined, per the phase's own scope note)
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
@@ -2817,3 +2901,18 @@ Each phase ends with:
   reads and whether it derives all of it, from the transformations F4 and F5
   record. The guarantee bounds the answers; only the per-relation account says
   where one could have gone.
+
+## Follow-ups
+
+Noticed while doing scoped work, deliberately not chased there:
+
+- F7's second item removed the sweep-per-list-position cost from seeded
+  structural evaluation but left intact the overshoot F6 already recorded: a
+  folded reconstruction still derives a list function like `$member` as a
+  general relation over every position of every list the plan reads, rather
+  than answering only the positions the query's own goal asks about.
+  `grouped 50x40`'s repeated-call candidate count (51) already matches direct
+  well; it is the *first* call, at 10646 against direct's 2001, where this
+  remains. Closing it wants the reconstruction to derive list functions lazily
+  against the query rather than eagerly over the whole extension, which is a
+  new design rather than a fix to `applyRule`'s seed branch.
