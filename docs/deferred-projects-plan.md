@@ -70,11 +70,17 @@ S1 finite-f64 policy and syntax
                 │         └─> P4 measured constant-factor work
                 └─> F1–F5 query folding
                      └─> F6 planner/materialization integration
+                          └─> F7 folded execution that reuses its work
 ```
 
 Query-folding transformations can be developed independently after P1, but
 automatic reuse of LiveDatalog materialized views belongs after the maintenance
 project is stable.
+
+F7 sits on the diagram under F6 because that is where its contract is, but its
+optional second half — maintaining a kept reconstruction rather than rebuilding
+it — reads M2 and M3, so it belongs after the maintenance project for the same
+reason. Its first half does not.
 
 ## Shared correctness rules
 
@@ -2384,6 +2390,180 @@ F6 was completed on 2026-08-25:
   interface over machinery those sweeps already cover, and the containment
   claims are theirs.
 
+## F7: folded execution that reuses its work
+
+### Why this is deferred work
+
+F6 measured folded execution at five to fifty times slower than direct
+execution and named the reason in one sentence: a direct query reuses the
+materialized closure, a folded plan's rules live in the plan rather than in the
+database, so `answerFolded` builds a restricted copy and derives the
+reconstruction from nothing on every call. It recorded that as a property of
+this implementation rather than of the method, and as the obvious thing to fix
+if folded execution ever needs to be fast.
+
+**It is still intact, and it is the largest constant factor still standing in
+this engine.** Measured on 2026-08-26 at `ReleaseFast`, folded
+against direct is 7.4x on `copied 200x5`, 5.6x on `grouped 200x5` and 65x on
+`grouped 50x40`. Nothing in P4 targets it: P4's four items are about interning,
+transactions, index layout and plan caching, and three of them have landed
+without moving these rows at all.
+
+Before proposing a fix, `answerFolded` was taken apart and each phase timed
+separately, so that the item is aimed at a measurement rather than at the
+sentence above. Mean of ten calls after a warm-up, arena allocator as the
+benchmark uses, ns, arm64, macOS 26.5.2, Zig 0.16.0, `ReleaseFast`:
+
+| Shape | copy | install rules | **derive** | solve goals | folded total | direct total |
+| --- | --- | --- | --- | --- | --- | --- |
+| `copied 200x5` | 175783 | 612 | **390700** | 50650 | 617745 | 74928 |
+| `grouped 200x5` | 31383 | 1970 | **366637** | 45483 | 445473 | 89462 |
+| `grouped 50x40` | 14733 | 4858 | **9347116** | 62400 | 9429107 | 98020 |
+
+Four things that settles, and they are what the scope below is built from.
+
+**Deriving the reconstruction is 63%, 82% and 99% of it.** Everything else is
+noise by comparison. In particular *installing the plan's rules costs
+nothing* — 612 to 4858 ns, under 0.1% — so caching the compiled or lowered
+rules, the first thing the shape of the code suggests, would buy nothing.
+
+**Solving the goals is not the problem and never was.** It is 45–62µs on the
+folded side against 58–69µs on the direct side: the folded side is *faster*
+at the part both sides do, because it solves against a small fresh store.
+A folded plan that did not have to re-derive would beat direct execution on all
+three shapes.
+
+**The copy is the second lever, and only on one shape.** `viewOnlyCopy` clones
+the database, walks the closure copying every readable fact into a list, clears
+the store and copies them back — three passes over the extension — costing
+176µs where the extension is 1000 flat facts and 15µs where it is 50 facts
+holding lists. It is 28% of `copied 200x5` and 0.2% of `grouped 50x40`.
+
+**The derivation also does much more work than the query it answers**, which
+is a separate lever from doing it repeatedly. Candidate facts examined, the
+machine-independent unit the cost model already counts: 3003 against 1001 on
+`copied 200x5`, 6759 against 1001 on `grouped 200x5`, and 71706 against 2001
+on `grouped 50x40`. The last is 36x. These three shapes differ in key count as
+well as in list length, so they do not isolate the cause on their own — but F6
+already did, on a comparison that holds the pairs fixed: reading a 40-element
+list back through `$member` costs sixteen times what the same 1000 pairs cost
+in five-element lists, because membership is seeded structurally and a list
+contributes work in its tails.
+
+### Scope
+
+- Keep a folded plan's reconstruction between calls instead of rebuilding it,
+  so that repeated `answerFolded` solves goals against a database that is
+  already derived. This is the item; the phase table says it is 63–99% of the
+  cost and the two floors below say what it can be worth.
+- Decide what invalidates a kept reconstruction, and add whatever stamp that
+  needs. **The two the plan cache already has are not enough**: `Catalog`
+  generation and `Evaluator.next_rule_id` are unmoved by adding or retracting a
+  fact, and a fact under a readable name changes the extension the plan reads.
+  There is no monotone fact stamp on `Database` today — `Materialization` is a
+  clean/dirty pivot rather than a counter — so one has to be introduced or the
+  reconstruction has to be maintained rather than stamped.
+- Preserve the availability boundary exactly. F6 made `answerFolded` run
+  against a copy holding what the catalog admits and nothing else, with the
+  database's own rules dropped, and recorded that both halves are load-bearing:
+  five answers instead of two without the fact filter, four instead of two
+  without dropping the rules. A kept reconstruction must not let a fact that
+  was withheld when it was built become visible later, nor keep answering from
+  one that has stopped being readable.
+- Consider maintaining the kept reconstruction incrementally rather than
+  rebuilding it when it goes stale. The staged database *is* a `Database`, so
+  M2 and M3 already know how to maintain its closure; a change to the source
+  database's readable extensions is a batch against the staged one. This may
+  reasonably be split out or declined — it is the difference between "as fast
+  as direct on a static database" and "as fast as direct on a changing one".
+- Reduce the reconstruction's own work, which the candidate counts say is 3x
+  to 36x what the query examines and which F6 traced to list length. The
+  instrument already exists and the counts are machine-independent; this is a
+  second item and is independent of the first.
+- **Explicitly out of scope: installing a plan's rules into the source database
+  as maintained views.** It would make folded execution ordinary execution and
+  is the obvious third design, but it puts the question's rules into the
+  program — which F6 deliberately refused, since a plan's rules are only
+  meaningful against the database they were interned in — and it would defeat
+  the availability boundary rather than preserve it.
+
+### Acceptance tests
+
+- Every existing test passes unchanged, including the nineteen
+  allocation-failure sweeps and every F-phase containment sweep: none of this
+  has observable semantics.
+- **A kept reconstruction answers exactly what a rebuilt one answers**, after
+  each kind of change taken separately: a fact added under a readable name, a
+  fact added under a withheld name, a fact retracted, a view made readable,
+  a view made unreadable, a definition added, a rule added, and a view
+  published from a database rule. This is the shared correctness rule that a
+  full rebuild stays available as a reference path, applied to this cache.
+- F6's two boundary probes still fail when their guard is removed — five
+  answers where two are right without the fact filter, four without dropping
+  the database's rules — with the reconstruction kept rather than rebuilt.
+- A `Fold` handle that outlived a change still reports `StalePlan` rather than
+  answering from a kept reconstruction made under the old stamp.
+- Asking the same question twice does not grow the database, which is what
+  `foldQuery` already promises on a cache hit and what a kept staging copy is
+  the natural way to break.
+- An allocation failure while refreshing or discarding a kept reconstruction
+  leaves the database and the plan cache exactly as they were, and a later call
+  still answers correctly rather than from a half-built copy.
+
+### Measurement gate
+
+`benchmark-folding` is the instrument and it already reports the right four
+numbers; it needs one split. **Report the first `answerFolded` after a change
+separately from the repeated one**, because the first must still derive and the
+item is entirely about the rest. Report candidate counts beside the times, as
+the table above does, since they are the same on every machine and are what say
+whether the reconstruction got smaller or merely got reused.
+
+The bar, from the floors the phase table gives:
+
+- Repeated folded execution should reach **copy + solve** — 226µs, 77µs and
+  77µs on the three shapes, against direct's 75µs, 89µs and 98µs — if the
+  reconstruction is kept and the copy is not. That is 3.0x, 0.86x and 0.79x.
+- It should reach **solve alone** — 51µs, 45µs and 62µs — if the staged
+  database is kept whole, which would make folded execution faster than direct
+  on all three shapes.
+- A result outside **2x of direct on the repeated call** means the item has not
+  done what it claims, and should be recorded as such rather than kept.
+- The first call must not get slower, and `benchmark-maintenance`,
+  `benchmark-structural-deletion` and `benchmark-interning` must not move.
+
+If only the copy is addressed and not the derivation, the ceiling is 1.40x on
+`copied 200x5`, 1.08x on `grouped 200x5` and 1.00x on `grouped 50x40` — which
+is why the derivation is the item and the copy is a follow-up.
+
+### Session boundary
+
+Stop when repeated folded execution reuses its reconstruction and the benchmark
+reports the two calls apart. Incremental maintenance of a kept reconstruction,
+and the reconstruction's own candidate count, are separate items and should not
+be taken in the same session: one changes when the reconstruction is refreshed
+and the other changes how it is derived, and three levers moving at once on a
+65x gap would make a regression impossible to attribute.
+
+### Open questions for the phase
+
+- Where does a kept reconstruction live — in the plan cache entry, or in the
+  `Fold`? The cache is discarded whole on a generation change, which is the
+  natural place; but the cache is unbounded today, and this turns each entry
+  from a plan into a full copy of the readable extensions plus their closure.
+  That is a memory-for-time trade the plan cache has never made before and it
+  probably needs a bound.
+- Is a fact stamp the right answer, or should the staged database be maintained
+  from the source database's own change stream? A stamp is simpler and
+  rebuilds on any change; maintenance is the thing that would make a folded
+  plan cheap on a database that is actually being updated.
+- P4's fourth item — caching plans per rule and pre-bound variable set —
+  lands inside the `derive` column above, since a folded plan re-plans
+  every rule on every delta round of every call. It would make the first call
+  cheaper; this project makes the later calls free. They do not conflict, and
+  the measurement favours this one first: eliminating a phase dominates
+  speeding it up.
+
 ## Suggested session sequence
 
 Use one session and one commit per phase unless a phase proves too large:
@@ -2407,12 +2587,21 @@ Use one session and one commit per phase unless a phase proves too large:
 17. F4 soundness restrictions — **done 2026-08-25**
 18. F5 list functions and dependency chase — **done 2026-08-25**
 19. F6 execution and view selection — **done 2026-08-25**
+20. F7 folded execution that reuses its work — **not started**
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
-speed matters more than its features — including before F1. Its first item, a
-hash index beside each value table, is **done 2026-08-25**; the other three are
-not started.
+speed matters more than its features — including before F1. Three of its four
+items are done — a hash index beside each value table and one transaction per
+run of assertions on **2026-08-25**, a flat pattern index on **2026-08-26** —
+and the fourth, caching plans per rule and pre-bound variable set, is not
+started.
+
+F7 is in the sequence rather than beside it because it is not constant-factor
+work: it changes what `answerFolded` keeps between calls, which is a contract
+other phases could come to rest on. It is also the largest measured constant
+factor in the engine, so a session choosing between it and P4's remaining item
+should take this one — the numbers are in F7's own section.
 
 F1–F5 may run in parallel with the rest in separate branches because they share
 only the stable P1 storage interface.
@@ -2437,12 +2626,14 @@ Each phase ends with:
   trigger. An update marks the affected strata and the next evaluation repairs
   them; both paths stage and commit atomically.
 - ~~Which bound-position indexes justify their memory cost on typical embedded
-  workloads?~~ **Answered empirically rather than by policy.** An index is
-  built on the *second* request for a pattern, not the first, because a single
-  probe cannot repay a pass over the relation; and it survives a clone only
-  when its groups average more than a handful of entries, because copying costs
-  an allocation per group while rebuilding costs a hash per entry. Both rules
-  are in `relation_store.zig` with the measurements behind them.
+  workloads?~~ **Answered empirically rather than by policy**, and re-answered
+  once. An index is built on the *second* request for a pattern, not the first,
+  because a single probe cannot repay a pass over the relation — re-measured
+  under P4's flat layout and kept, at 1.30x on the sparse join. The second rule
+  is gone: an index used to survive a clone only when its groups were dense
+  enough to be worth an allocation apiece, and a flat index copies with three
+  `memcpy`s, so every index is now carried. The surviving rule is in
+  `relation_store.zig` with the measurement behind it.
 - Should full rebuild remain public, test-only, or available through a debug
   policy after incremental maintenance is stable?
 - Is delete-and-rederive sufficient for the expected recursive workloads, or
