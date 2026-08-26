@@ -3123,12 +3123,13 @@ Each phase ends with:
   decision (e.g. `plan_policy`, `MaintenancePolicy`) goes wrong for their
   workload. Restricting it would be a public-API change with no problem
   behind it to justify one.
-- Is delete-and-rederive sufficient for the expected recursive workloads, or
-  should a later design adopt a differential-dataflow-style timestamp model?
-  **Left open 2026-08-26.** Unlike everything else resolved in this document,
-  nothing has measured a workload where delete-and-rederive actually strains —
-  this stays open pending one turning up, rather than speculatively designing
-  a timestamp model against no measured deficiency.
+- ~~Is delete-and-rederive sufficient for the expected recursive workloads, or
+  should a later design adopt a differential-dataflow-style timestamp model?~~
+  **Declined 2026-08-26: not pursuing.** Nothing has ever measured a workload
+  where delete-and-rederive actually strains, and speculatively designing a
+  timestamp model against no measured deficiency is exactly the kind of
+  unmotivated redesign this document otherwise avoids. Closed rather than left
+  open; revisit only if a real workload surfaces the strain.
 - Should folded plans be returned only as an internal executable IR, or also as
   printable Datalog extended with internal function terms? **F1 answered half
   of it**: a plan renders as Datalog extended with generated function terms,
@@ -3233,10 +3234,10 @@ Noticed while doing scoped work, deliberately not chased there:
   Every benchmark's maintenance/recompute/fallback/group counts stayed
   identical, `benchmark-materialization` kept its improvement, and the two
   benchmarks the original attempt regressed stayed flat, so this closed the
-  gap for free. What remains, unmeasured and left as the accepted
-  approximation: a fingerprint records what each *placed* step's own
-  `(key, mask)` reports, not what every clause the planner passed over in
+  gap for free. What remains: a fingerprint records what each *placed* step's
+  own `(key, mask)` reports, not what every clause the planner passed over in
   favor of it would report now, so a losing candidate that has since become
-  cheaper than the winner still goes unnoticed. Closing that would mean the
-  planner's own `chooseNext` search re-running at lookup time, which costs
-  what replanning costs and defeats the cache.
+  cheaper than the winner still goes unnoticed. **Declined 2026-08-26: not
+  pursuing.** Closing it would mean the planner's own `chooseNext` search
+  re-running at lookup time, which costs what replanning costs and defeats
+  the cache — accepted permanently as an approximation, not left open.
