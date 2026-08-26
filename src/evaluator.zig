@@ -180,6 +180,81 @@ pub fn ruleStratum(
     return levels.get(syntax.predicateKey(rule.head)) orelse 0;
 }
 
+/// Every distinct predicate `body` reads, positively or negatively, anywhere
+/// including inside a `setof` — what a `PlanCache` entry's fingerprint tracks
+/// for change. Reuses `noteBodyDependencies`'s walk rather than repeating it;
+/// the per-predicate values it records are not needed here, only the keys.
+fn bodyPredicates(
+    allocator: std.mem.Allocator,
+    body: []const syntax.Clause,
+) ![]relation_store.PredicateKey {
+    var set: std.array_hash_map.Auto(relation_store.PredicateKey, usize) = .empty;
+    defer set.deinit(allocator);
+    try syntax.noteBodyDependencies(allocator, body, 0, &set);
+    const result = try allocator.dupe(relation_store.PredicateKey, set.keys());
+    return result;
+}
+
+/// A plan `applyRule` already chose for a rule, kept until the fact count of
+/// some predicate the rule's body reads changes.
+///
+/// Keyed by rule id alone: `applyRule` always plans a rule with the same
+/// pre-bound variable set every time it is called — empty for an ordinary
+/// rule, exactly the seed term's variables for a seeded one, since that term
+/// is fixed by the rule itself — so `(rule id, pre-bound set)` collapses to
+/// the rule id at this call site.
+///
+/// The staleness check is deliberately coarser than the planner's own cost
+/// model: a relation that grew by one fact invalidates the same as one that
+/// doubled, and a pattern index appearing with no change in fact count goes
+/// unnoticed. Both are accepted approximations. What this exists to avoid is
+/// a plan chosen while a relation is small and reused once that relation has
+/// grown large enough to change the planner's choice — a seeded rule
+/// deriving into its own head across `expandLevel`'s rounds, or a rule
+/// recomputed from scratch across several outer calls — and that failure
+/// always shows up as a fact-count change in some predicate the plan's own
+/// body reads. See P4's fourth item in `docs/deferred-projects-plan.md` for
+/// the attempt this replaces, which had no staleness check at all and
+/// regressed two benchmarks by reusing exactly such a plan.
+const PlanCache = struct {
+    entries: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+
+    const Entry = struct {
+        plan: planner.Plan,
+        /// Parallel to `counts`: the predicate each recorded fact count
+        /// belongs to.
+        predicates: []relation_store.PredicateKey,
+        /// The fact count of each of `predicates` when `plan` was chosen.
+        counts: []usize,
+
+        fn deinit(self: *Entry, allocator: std.mem.Allocator) void { // ziglint-ignore: Z023
+            self.plan.deinit();
+            allocator.free(self.predicates);
+            allocator.free(self.counts);
+            self.* = undefined;
+        }
+    };
+
+    fn deinitEntries(self: *PlanCache, allocator: std.mem.Allocator) void {
+        var iterator = self.entries.valueIterator();
+        while (iterator.next()) |entry| entry.deinit(allocator);
+    }
+
+    fn deinit(self: *PlanCache, allocator: std.mem.Allocator) void {
+        self.deinitEntries(allocator);
+        self.entries.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Discards every cached plan and the table itself: a rule-set change
+    /// invalidates all of them at once, so there is no reason to keep
+    /// capacity sized for the rule set that just changed.
+    fn clear(self: *PlanCache, allocator: std.mem.Allocator) void {
+        self.deinitEntries(allocator);
+        self.entries.clearAndFree(allocator);
+    }
+};
+
 /// The program a database evaluates: interned ground values, the rule set,
 /// its stratification, and the machinery that matches rules against a fact
 /// store.
@@ -205,6 +280,12 @@ pub const Evaluator = struct {
     cost: cost_model.CostModel = .{},
     /// How a body's clause order is chosen before it is solved.
     plan_policy: planner.PlanPolicy = .cost_based,
+    /// Plans `applyRule` has already chosen, reused while `fingerprintFresh`
+    /// still holds. Never carried by `clone`: a cached plan's clauses borrow
+    /// slices from `self.rules`, and a clone deep-copies rules into new
+    /// allocations, so an entry that crossed the clone would borrow from
+    /// memory the clone does not own.
+    plan_cache: PlanCache = .{},
 
     pub fn init(allocator: std.mem.Allocator) Evaluator {
         return .{
@@ -215,6 +296,7 @@ pub const Evaluator = struct {
     }
 
     pub fn deinit(self: *Evaluator) void {
+        self.plan_cache.deinit(self.allocator);
         if (self.analysis) |*analysis| analysis.deinit(self.allocator);
         for (self.rules.items) |rule| syntax.freeRule(self.allocator, rule);
         self.rules.deinit(self.allocator);
@@ -250,10 +332,14 @@ pub const Evaluator = struct {
         return result;
     }
 
-    /// Discards the cached stratification after a rule-set change.
+    /// Discards the cached stratification after a rule-set change, along with
+    /// every cached plan: a plan's clauses are borrowed from the rule it was
+    /// planned from, which is exactly what a rule-set change may have moved
+    /// or freed.
     pub fn invalidateAnalysis(self: *Evaluator) void {
         if (self.analysis) |*analysis| analysis.deinit(self.allocator);
         self.analysis = null;
+        self.plan_cache.clear(self.allocator);
     }
 
     pub fn ensureAnalysis(self: *Evaluator) !*const Analysis {
@@ -427,6 +513,54 @@ pub const Evaluator = struct {
         );
     }
 
+    /// The plan `applyRule` solves `rule`'s body with, reused from
+    /// `plan_cache` while every predicate the body reads still has the fact
+    /// count planning last saw it with; replanned and re-cached otherwise.
+    /// See `PlanCache`'s own comment for what this staleness check does and
+    /// does not catch.
+    ///
+    /// The returned pointer is borrowed from `plan_cache` and stays valid
+    /// until the next call that replans the same rule id, which a caller
+    /// must not do while still holding it — `applyRule` calls this at most
+    /// once per rule per invocation, before using the result.
+    fn plannedRule(
+        self: *Evaluator,
+        facts: *relation_store.RelationStore,
+        rule: syntax.Rule,
+        initial: *const syntax.Binding,
+    ) !*const planner.Plan {
+        if (self.plan_cache.entries.getPtr(rule.id)) |entry| {
+            var fresh = true;
+            for (entry.predicates, entry.counts) |key, expected| {
+                if ((try facts.selectivity(key, 0)).facts != expected) {
+                    fresh = false;
+                    break;
+                }
+            }
+            if (fresh) return &entry.plan;
+        }
+        // Stale or absent: drop whatever is there before building the
+        // replacement, so a failure partway through leaves no entry rather
+        // than a half-updated one a later call might read.
+        if (self.plan_cache.entries.fetchRemove(rule.id)) |removed| {
+            var stale = removed.value;
+            stale.deinit(self.allocator);
+        }
+        var fresh_plan = try self.planFor(facts, rule.head, rule.body, initial);
+        errdefer fresh_plan.deinit();
+        const predicates = try bodyPredicates(self.allocator, rule.body);
+        errdefer self.allocator.free(predicates);
+        const counts = try self.allocator.alloc(usize, predicates.len);
+        errdefer self.allocator.free(counts);
+        for (predicates, counts) |key, *count| count.* = (try facts.selectivity(key, 0)).facts;
+        try self.plan_cache.entries.put(self.allocator, rule.id, .{
+            .plan = fresh_plan,
+            .predicates = predicates,
+            .counts = counts,
+        });
+        return &self.plan_cache.entries.getPtr(rule.id).?.plan;
+    }
+
     pub fn applyRule(
         self: *Evaluator,
         facts: *relation_store.RelationStore,
@@ -457,8 +591,17 @@ pub const Evaluator = struct {
             // is safe beside them because a fact committed earlier than
             // before is a fact Datalog's monotone fixpoint would have derived
             // anyway, so the set of facts is the one it already was.
-            var chosen: ?planner.Plan = null;
-            defer if (chosen) |*value| value.deinit();
+            //
+            // The plan itself may also outlive this call now, borrowed from
+            // `plan_cache` through `plannedRule` rather than owned here. A
+            // seed rule that derives into its own head — `member` calling
+            // `member` is the case this project has measured — keeps that
+            // predicate's fact count moving every round, so its own
+            // fingerprint stays stale and it keeps replanning exactly as
+            // before; the reuse this buys is for a seeded rule whose body
+            // reads predicates that are not themselves growing round to
+            // round.
+            var chosen: ?*const planner.Plan = null;
             const value_count = self.values.values.items.len;
             for (0..value_count) |value| {
                 var initial: syntax.Binding = .{};
@@ -470,9 +613,9 @@ pub const Evaluator = struct {
                 );
                 if (seeded) {
                     if (chosen == null)
-                        chosen = try self.planFor(facts, rule.head, rule.body, &initial);
+                        chosen = try self.plannedRule(facts, rule, &initial);
                     self.matchClauses(
-                        &chosen.?,
+                        chosen.?,
                         facts,
                         0,
                         &initial,
@@ -496,7 +639,12 @@ pub const Evaluator = struct {
         } else {
             var initial: syntax.Binding = .{};
             defer initial.deinit(self.allocator);
-            try self.solve(facts, rule.head, rule.body, &initial, &answers, constraint);
+            // Bypasses `solve` to reach `plannedRule` instead of `planFor`:
+            // an ordinary rule always starts from an empty binding, so every
+            // semi-naive delta round for this rule is a candidate to reuse
+            // the same plan rather than build it again.
+            const chosen = try self.plannedRule(facts, rule, &initial);
+            try self.matchClauses(chosen, facts, 0, &initial, &answers, chosen.constrain(constraint));
         }
         for (answers.items) |*answer| {
             const derived = try self.deriveFact(rule.head, answer);
@@ -868,6 +1016,96 @@ pub const Evaluator = struct {
 };
 
 const testing = std.testing;
+
+test "a plan is reused while the predicates its body reads have not changed size, and replanned once one has" {
+    var evaluator: Evaluator = .init(testing.allocator);
+    defer evaluator.deinit();
+    var facts: relation_store.RelationStore = .init(testing.allocator);
+    defer facts.deinit();
+
+    const q: syntax.Id = 100;
+    const p: syntax.Id = 101;
+    const x: syntax.Id = 1;
+
+    _ = try facts.insert(.{
+        .predicate = q,
+        .terms = try testing.allocator.dupe(syntax.ValueId, &.{1}),
+    }, false);
+
+    var body_terms = [_]syntax.Term{.{ .variable = x }};
+    var body = [_]syntax.Clause{.{ .relational = .{ .predicate = q, .terms = &body_terms } }};
+    var head_terms = [_]syntax.Term{.{ .variable = x }};
+    const rule: syntax.Rule = .{
+        .id = 1,
+        .head = .{ .predicate = p, .terms = &head_terms },
+        .body = &body,
+    };
+
+    var initial: syntax.Binding = .{};
+    defer initial.deinit(testing.allocator);
+
+    // Nothing about `q` changes between these two calls, so the second must
+    // be the very allocation the first built, not merely an equal plan — no
+    // `deinit` ran in between to free it, so identical addresses here can
+    // only mean the same object, never a coincidental reallocation.
+    const first = try evaluator.plannedRule(&facts, rule, &initial);
+    try testing.expectEqual(@as(usize, 1), first.steps[0].estimate);
+    const second = try evaluator.plannedRule(&facts, rule, &initial);
+    try testing.expectEqual(first.clauses.ptr, second.clauses.ptr);
+
+    // `q` is what this rule's body reads, so growing it must be noticed even
+    // though the rule itself was never touched. A stale reuse would still
+    // carry the estimate the first plan recorded when `q` had one fact;
+    // freshly planning against two recomputes it, which is what the estimate
+    // recorded on the *step* (not the cache's own bookkeeping) proves — a
+    // reallocated `Plan` could in principle land back on the address `first`
+    // freed, but it cannot also recompute the same estimate `describe`
+    // measures fresh every time it is not reused.
+    _ = try facts.insert(.{
+        .predicate = q,
+        .terms = try testing.allocator.dupe(syntax.ValueId, &.{2}),
+    }, false);
+    const third = try evaluator.plannedRule(&facts, rule, &initial);
+    try testing.expectEqual(@as(usize, 2), third.steps[0].estimate);
+
+    // The replacement is itself cached until something changes again.
+    const fourth = try evaluator.plannedRule(&facts, rule, &initial);
+    try testing.expectEqual(third.clauses.ptr, fourth.clauses.ptr);
+
+    // A rule-set change (`invalidateAnalysis`'s contract) drops it too, even
+    // with nothing about `q` different.
+    evaluator.invalidateAnalysis();
+    try testing.expectEqual(@as(usize, 0), evaluator.plan_cache.entries.count());
+}
+
+test "a cloned evaluator starts with an empty plan cache" {
+    var evaluator: Evaluator = .init(testing.allocator);
+    defer evaluator.deinit();
+    var facts: relation_store.RelationStore = .init(testing.allocator);
+    defer facts.deinit();
+
+    _ = try facts.insert(.{
+        .predicate = 100,
+        .terms = try testing.allocator.dupe(syntax.ValueId, &.{1}),
+    }, false);
+
+    var body_terms = [_]syntax.Term{.{ .variable = 1 }};
+    var body = [_]syntax.Clause{.{ .relational = .{ .predicate = 100, .terms = &body_terms } }};
+    var head_terms = [_]syntax.Term{.{ .variable = 1 }};
+    const rule: syntax.Rule = .{
+        .id = 1,
+        .head = .{ .predicate = 101, .terms = &head_terms },
+        .body = &body,
+    };
+    var initial: syntax.Binding = .{};
+    defer initial.deinit(testing.allocator);
+    _ = try evaluator.plannedRule(&facts, rule, &initial);
+    try testing.expectEqual(@as(usize, 1), evaluator.plan_cache.entries.count());
+
+    var copy = try evaluator.clone();
+    defer copy.deinit();
+    try testing.expectEqual(@as(usize, 0), copy.plan_cache.entries.count());
+}
 
 /// What the table answered before it had an index: the scan `intern` used to
 /// make over the ordered values.

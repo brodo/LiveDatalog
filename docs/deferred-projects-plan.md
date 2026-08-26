@@ -976,6 +976,93 @@ already has a name for (`Database.fact_generation`, added in F7 for a
 different cache), and inventing it was out of scope for a session whose gate
 had already failed.
 
+**The fourth item was retried, with a staleness signal, and completed on
+2026-08-26.** Same session boundary as the rest of this document: a design
+was proposed, measured against the two benchmarks the first attempt broke,
+and kept because it passed.
+
+**What the staleness signal is.** Each `PlanCache` entry records, alongside
+the plan, every distinct predicate the rule's body reads anywhere — including
+inside a `setof`, via the existing `noteBodyDependencies` walk rather than a
+new one — and the fact count `RelationStore.selectivity(key, 0).facts`
+reported for each at the moment the plan was chosen. A lookup recomputes those
+counts and compares; any difference discards the entry and replans, which
+also refreshes the recorded counts. This is keyed by rule id alone rather than
+by `(rule.id, pre-bound set)`: at `applyRule`'s two call sites the pre-bound
+set is fixed by the rule's own shape — empty for an ordinary rule, exactly the
+seed term's variables for a seeded one — so the pair the scope named collapses
+to the rule id there, and tracking the pair would have added a key with
+exactly one value ever observed for it.
+
+**Why fact count, and not the planner's own cost model.** The failure the
+first attempt measured was always a fact-count change: a seeded rule deriving
+into its own head across `expandLevel`'s rounds, or a recursive rule
+recomputed from scratch across outer calls, both grow some relation the body
+reads between the calls that share a cached plan. Checking fact count catches
+exactly that, cheaply — a bucket-length read per distinct predicate, no
+allocation, no index lookup. What it does not catch is P1's own case, a
+pattern index appearing between calls with no change in the relation's fact
+count (crossing from a first to a second request on the same pattern) — the
+gap the previous attempt's writeup named as the prerequisite. A fully rigorous
+check would need, at every position a clause could have been placed, the
+selectivity every other ready-but-unplaced clause was compared against there —
+which is exactly what `chooseNext`'s own search computes, so checking it
+costs what replanning costs and buys nothing. Rule bodies here are small
+enough that the *rigorous* version would have been affordable too, but there
+was no way to build only the affordable half of it: the moment a losing
+candidate's selectivity is being tracked, the check has become the planner
+walking its own search again. Fact count is the coarser thing that is still
+cheap. It is an accepted approximation, not a proof, and it is being kept on
+the measurement below rather than on the argument, matching how the
+second-request indexing rule itself was decided.
+
+**Never carried by `clone`.** A cached plan's `clauses` slice borrows from the
+rule it was planned from, and `Evaluator.clone` deep-copies rules into new
+allocations via `syntax.cloneRule` — an entry that crossed the clone would
+borrow from memory the clone does not own. `plan_cache` is simply omitted from
+`clone`'s result literal, so it takes its declared default of empty; a test
+confirms a clone starts with `plan_cache.entries.count() == 0` after the
+original has populated one.
+
+**A pointer-identity pitfall the test caught before it shipped.** The first
+version of the reuse test compared `&entry.plan`'s address across calls —
+the address of the *slot in the hash map* — to prove reuse, and compared it
+again after growing the tracked relation to prove a replan had happened. It
+passed the reuse half and failed the replan half: `PlanCache`'s stale-entry
+path removes the old entry and inserts a fresh one under the same key, and an
+unmanaged hash map with one live entry reliably reuses the same slot for a
+reinsertion under the same key, so the slot address is identical whether or
+not the *contents* changed. The test was rewritten to check content instead:
+`Plan.clauses.ptr` (a real heap allocation, never coincidentally reused
+because nothing was freed on the no-replan path) proves reuse, and
+`Plan.steps[0].estimate` — the candidate count `describe` measures fresh
+every time it is not reused — proves a replan happened, since a stale reuse
+would still carry the estimate the superseded plan recorded. Recorded because
+the same pitfall would have looked identical either way if only the address
+had been checked, and a green test proving nothing is worse than no test.
+
+**The measurement gate's verdict, in full.** Median of two or three runs,
+ReleaseFast, from a clean `.zig-cache` rebuild, arm64, macOS 26.5.2, Zig
+0.16.0, against the same commit's benchmarks run without this item (via a
+saved diff, not a second checkout). `benchmark-folding`'s `grouped 50x40`
+first-call candidate count is **10646**, unchanged from F7's second item and
+nowhere near the reverted attempt's 18143 — candidate counts are
+machine-independent, so this alone settles that specific regression.
+`benchmark-aggregation`'s recomputation row is 454241–466116 ns/change across
+three runs without this item and 454241–459654 ns/change (after discarding one
+visibly cold first run at 637854, the same kind of noise this document has
+flagged before) across three runs with it — flat to a percent, not the 59%
+regression the first attempt measured. `benchmark-materialization` improved to
+20414 ns/query, in the same range as the first attempt's predicted win
+(25697 to 21891). Every other benchmark named in this run's gate —
+`benchmark-maintenance`, `benchmark-structural-deletion`, `benchmark-interning`,
+`benchmark-join-planning`, `benchmark-projected-aggregate` — reported counts
+and timings inside the ranges this document already has on record for them,
+with `benchmark-interning`'s comparison counts identical to the digit, which
+is what says this item touched planning and nothing about what is interned.
+`zig build test` passed all 233 existing tests plus two new ones for this
+item, with `zig fmt` and `ziglint` clean, from a clean `.zig-cache` rebuild.
+
 # Project M: persistent and incremental view maintenance
 
 Chapter 5 defines differential relations and the CReaM optimization for
@@ -2956,15 +3043,17 @@ Use one session and one commit per phase unless a phase proves too large:
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
-speed matters more than its features — including before F1. Three of its four
-items are done — a hash index beside each value table and one transaction per
-run of assertions on **2026-08-25**, a flat pattern index on **2026-08-26** —
-and the fourth, caching plans per rule and pre-bound variable set, was
-**attempted and reverted on 2026-08-26**: it regressed `benchmark-folding`'s
-worst shape by 70% and `benchmark-aggregation`'s recomputation row by 59%,
-for the reason and with the numbers recorded in P4's own completed-decisions
-section. It remains not done, and a later attempt needs a design this session
-did not have time to invent rather than a repeat of this one.
+speed matters more than its features — including before F1. All four items
+are now done: a hash index beside each value table and one transaction per
+run of assertions on **2026-08-25**, a flat pattern index on **2026-08-26**,
+and plan caching per rule on **2026-08-26** in a second session after a first
+attempt the same day was reverted for regressing `benchmark-folding`'s worst
+shape by 70% and `benchmark-aggregation`'s recomputation row by 59%. The
+second attempt added the staleness signal the first one lacked — a
+fact-count fingerprint over the predicates a rule's body reads — and passed
+the same two benchmarks it had previously failed; both attempts and the
+signal's own accepted limitations are recorded in P4's completed-decisions
+section.
 
 F7 is in the sequence rather than beside it because it is not constant-factor
 work: it changes what `answerFolded` keeps between calls, which is a contract
@@ -3041,9 +3130,13 @@ Noticed while doing scoped work, deliberately not chased there:
   remains. Closing it wants the reconstruction to derive list functions lazily
   against the query rather than eagerly over the whole extension, which is a
   new design rather than a fix to `applyRule`'s seed branch.
-- P4's fourth item (plan caching, reverted 2026-08-26) would need a plan cache
-  that can tell a stale cost decision from a valid one — invalidated not only
-  when the rule set changes but when a relation it planned against has grown
-  enough that the planner would now choose differently, which P1's own
-  second-request indexing rule says can happen. No such staleness signal
-  exists today; inventing one is the prerequisite for trying this item again.
+- P4's fourth item's fingerprint (done 2026-08-26) invalidates a cached plan on
+  any fact-count change in a predicate the rule's body reads, which is coarser
+  than the planner's own cost model in one specific way: a pattern index that
+  appears between two calls with *no* change in fact count — crossing from a
+  first to a second request on the same pattern, P1's own indexing rule — goes
+  unnoticed, and the cached plan is reused even though the planner might now
+  cost that clause differently. No benchmark in this project's suite has hit
+  this gap; it is recorded because the accepted approximation should be
+  reconsidered if one does; the fix would mean also tracking each fingerprinted
+  predicate's `groups` alongside its fact count.
