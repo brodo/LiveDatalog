@@ -2396,7 +2396,8 @@ F6 was completed on 2026-08-25:
 
 ## F7: folded execution that reuses its work
 
-**First and second items done 2026-08-26.** Everything from here to "Completed decisions"
+**Done 2026-08-26: first and second items implemented, third declined.**
+Everything from here to "Completed decisions"
 is the case as it stood before that, kept because the measurements it is built
 from are still the ones the remaining items are aimed at. What changed, and
 what the numbers are now, is at the end of the section.
@@ -2806,6 +2807,59 @@ and by amounts the plan's own noise note already covers. `benchmark-join-plannin
 `benchmark-projected-aggregate` likewise report unchanged maintain/recompute/
 fallback counts.
 
+### F7's third item: incremental maintenance of a kept reconstruction — declined
+
+**Declined 2026-08-26**, in its own session as the boundary above asks, rather
+than implemented. The scope explicitly allowed this: "this may reasonably be
+split out or declined." Recorded here with the alternative and why it loses,
+since the hard rule for this run is to record a decision rather than skip it
+silently.
+
+**The alternative was maintaining the cache entry's staged database from the
+source database's own change stream, instead of discarding it on any
+`fact_generation` move.** The staged database already is a `database.Database`,
+and M2/M3 already know how to run an insertion or removal batch against one —
+the plan's own open question named this directly. What it does not have is a
+*source* for such a batch: `fact_generation` is a single counter that moves on
+any insertion or removal reachable from `applyInsertion`/`applyRemoval`, with
+no record of which fact or which readable name, because F7's first item chose
+that counter for exactly the reason a richer stamp was rejected — "the
+database does not know the catalog and a stamp that guessed would be a stamp
+that could guess wrong." Turning it into maintenance would mean threading an
+actual per-change record (fact, readable name, insertion or removal) out of
+every call site that can move the counter, then, for every live cache entry —
+up to four, each keyed to a different plan and each admitting a different
+subset of readable names — deciding whether that change is inside the
+catalog it was built against and replaying it if so. That is a second
+plumbed path through the update code for a feature only the cache uses,
+maintained beside the first item's stamp rather than instead of it, since a
+change to what the catalog itself admits (a view made readable or
+unreadable, a rule added) still has to discard the entry outright.
+
+**It loses on what it would buy against what F7's second item already
+bought.** The case incremental maintenance targets is a folded question asked
+repeatedly against a database that keeps changing between calls — the `first`
+column of F7's own measurement table, which a fact-stamp cache cannot help
+because every call sees a new stamp. The second item just cut that column's
+worst case from 6.8ms to 1.3ms (5.3x) by removing the sweep-per-list-position
+cost, which was the larger share of it on every shape measured. What
+incremental maintenance would still recover on top of that is bounded by the
+`copy` and `solve` floors from F7's own measurement gate — a few hundred
+microseconds on these shapes — against a design that touches every fact-change
+call site in the engine and adds a second variety of cache-entry invalidation
+next to the one that already works. The plan's own words on the parallel
+question in P4 apply here too: eliminating a phase dominates speeding it up,
+and the phase left to eliminate is now small enough that the architecture cost
+of eliminating it is not obviously worth paying.
+
+**This is a decision to defer, not to close.** If a workload turns up where
+folded questions are asked at a rate that makes even the reduced `first`
+column dominate, the design sketched above — a per-change record threaded out
+of `applyInsertion`/`applyRemoval`, replayed against a cache entry whose
+catalog still admits it — is the one to build, and F7's first item already
+put the pieces it would need (a `database.Database` kept per cache entry, a
+monotone stamp that tells a caller when it is stale) in place for it.
+
 ## Suggested session sequence
 
 Use one session and one commit per phase unless a phase proves too large:
@@ -2829,9 +2883,9 @@ Use one session and one commit per phase unless a phase proves too large:
 17. F4 soundness restrictions — **done 2026-08-25**
 18. F5 list functions and dependency chase — **done 2026-08-25**
 19. F6 execution and view selection — **done 2026-08-25**
-20. F7 folded execution that reuses its work — **first and second items done
-    2026-08-26**; incremental maintenance of a kept reconstruction remains
-    (and may reasonably be declined, per the phase's own scope note)
+20. F7 folded execution that reuses its work — **done 2026-08-26**: first and
+    second items implemented, third item (incremental maintenance of a kept
+    reconstruction) explicitly declined per the phase's own scope note
 
 P4 is not in this sequence. It is constant-factor work with no semantics, its
 items are independently shippable, and it can be taken whenever the engine's
