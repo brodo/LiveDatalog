@@ -72,7 +72,7 @@ pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const s
     // `Database.rollback` has no way to put a rule back. The identifier is
     // spent only once the rule is certain to stay.
     errdefer _ = db.eval.rules.pop();
-    try validation.validateRecursiveArithmetic(db);
+    try validation.validateRecursiveGeneration(db);
     try validation.validateStratification(db);
     materialization.invalidateAnalysis(db);
     if (db.closure != null) {

@@ -2022,6 +2022,50 @@ test "recursive arithmetic rejection is allocation safe" {
     try test_support.expectEveryAllocationFailureReleased(recursiveArithmeticAllocationScenario);
 }
 
+test "recursive list construction outside a proven self-call is not admissible" {
+    // Each program here used to be admitted; the first three then never
+    // finished a query, because the cycle builds a longer list every round.
+    const rejected = [_][]const u8{
+        // A head that builds a list, reached back through another predicate.
+        \\q([]).
+        \\p(a!L) :- q(L).
+        \\q(L) :- p(L).
+        ,
+        // The same growth, built by an equality instead of the head.
+        \\q([]).
+        \\p(X) :- q(L), X = a!L.
+        \\q(L) :- p(L).
+        ,
+        // A direct self-call the decrease proof does not cover.
+        \\p([]).
+        \\p(X) :- p(L), X = a!L.
+        ,
+        // Mutual recursion that consumes tails would terminate, but nothing
+        // proves a decrease across two predicates, so it is refused too.
+        \\even([]).
+        \\even(H!T) :- odd(T).
+        \\odd(H!T) :- even(T).
+    };
+    for (rejected) |program| {
+        var db: Jatalog = .init(std.testing.allocator);
+        defer db.deinit();
+        try std.testing.expectError(errors.Error.NotAdmissible, db.execute(program));
+    }
+
+    // Mutual recursion that builds nothing is ordinary Datalog and stays.
+    var plain: Jatalog = .init(std.testing.allocator);
+    defer plain.deinit();
+    var result = try plain.execute(
+        \\start(n0). step(n0, n1). step(n1, n2).
+        \\even(X) :- start(X).
+        \\even(X) :- odd(Y), step(Y, X).
+        \\odd(X) :- even(Y), step(Y, X).
+        \\even(X)?
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
+}
+
 test "embedding API constructs structural aggregate rules and queries" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
@@ -3468,7 +3512,7 @@ test "a chain fact with an alternative proof survives its support's deletion" {
     try test_support.expectClosureMatchesRebuild(&db.state);
 }
 
-test "several seeded occurrences and mutual seeded recursion over-delete each head once" {
+test "several seeded occurrences over-delete each head once" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     db.setMaintenancePolicy(.incremental);
@@ -3477,15 +3521,10 @@ test "several seeded occurrences and mutual seeded recursion over-delete each he
         \\list([a, b, c]).
         \\twice([], 0).
         \\twice(H!T, N) :- twice(T, M), twice(T, K), N = M + K.
-        \\even([]).
-        \\even(H!T) :- odd(T).
-        \\odd(H!T) :- even(T).
     );
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "twice(L, N)?", 4);
-    try expectAnswerCount(&db, "even(L)?", 2);
-    try expectAnswerCount(&db, "odd(L)?", 2);
 
     // Both occurrences of `twice(T, _)` reach the same heads. `deleted` is a
     // set, so the second pinning finds each head already queued; a head taken
@@ -3500,22 +3539,6 @@ test "several seeded occurrences and mutual seeded recursion over-delete each he
         db.maintenanceStats().removed_facts,
     );
     try expectAnswerCount(&db, "twice(L, N)?", 0);
-    try test_support.expectClosureMatchesRebuild(&db.state);
-
-    // The mutually recursive pair shares one base case, and deleting it must
-    // unwind both predicates. Their alternation crosses no stratum: mutual
-    // recursion is one strongly connected component, so both rules are
-    // over-deleted in the same level.
-    const mutual_before = db.maintenanceStats();
-    try std.testing.expect(try db.applyChanges(&.{}, &.{
-        input.fact("even", &.{input.list(&.{})}),
-    }));
-    try std.testing.expectEqual(
-        mutual_before.rebuild_fallbacks,
-        db.maintenanceStats().rebuild_fallbacks,
-    );
-    try expectAnswerCount(&db, "even(L)?", 0);
-    try expectAnswerCount(&db, "odd(L)?", 0);
     try test_support.expectClosureMatchesRebuild(&db.state);
 }
 

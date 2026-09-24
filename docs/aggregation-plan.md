@@ -308,6 +308,14 @@ scalars; floating-point parsing and comparison remain deferred.
   inconsistent across recursive calls, and it does not attempt a mutual-
   recursion or semantic-size proof. These are conservative false rejections at
   the enforceable termination boundary.
+
+  *Corrected 2026-09-24:* the checker only ever compared a head with its own
+  calls, so mutual recursion was not rejected — it was never examined. A cycle
+  through two predicates was admitted whatever it did, and one that built a
+  list (`p(a!L) :- q(L). q(L) :- p(L).`, or the same growth through
+  `X = a!L`) loaded cleanly and then never finished a query. The same was true
+  of a direct self-call that built its list in an equality rather than its
+  head. See the open design question below for the rule that replaced it.
 - A recursive dependency cycle containing value-producing arithmetic is
   rejected unless it is a direct recursive list call covered by the structural
   decrease proof. This prevents unbounded generators such as
@@ -400,5 +408,17 @@ Each implementation session should end with:
 
 ## Open design questions
 
-- Whether admissibility should eventually prove mutual recursion or support
-  multiple decreasing input modes instead of conservatively rejecting them.
+- ~~Whether admissibility should eventually prove mutual recursion or support
+  multiple decreasing input modes instead of conservatively rejecting them.~~
+  **Answered 2026-09-24: reject mutual recursion.** A recursive cycle is
+  rejected with `NotAdmissible` if any rule on it builds a list — in its head
+  or in an equality — exactly as a cycle with value-producing arithmetic
+  already was; `validateRecursiveGeneration` in `validation.zig` checks both.
+  The one cycle admitted is a rule's direct call to itself that the structural
+  decrease proof covers. This refuses tail-consuming mutual recursion such as
+  `even(H!T) :- odd(T). odd(H!T) :- even(T).`, which terminates: a false
+  rejection accepted on purpose, since proving a decrease across predicates is
+  the proof this question declines to build. A cons matched in a relational
+  body clause only takes a list apart and does not count, and mutual recursion
+  that builds nothing is unaffected. Multiple decreasing input modes stay
+  rejected for the same reason.

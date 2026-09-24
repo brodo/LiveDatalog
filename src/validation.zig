@@ -86,9 +86,16 @@ fn firstStructuralArgument(head: syntax.Expr) ?usize {
         if (syntax.termContainsCons(term)) return index;
     return null;
 }
-pub fn validateRecursiveArithmetic(db: *database.Database) !void {
+/// Rejects a recursive dependency cycle that can generate new values: one
+/// containing value-producing arithmetic or list construction. The only cycle
+/// admitted is a rule's direct call to itself that the structural decrease
+/// proof already covers. Mutual recursion through a generating rule is always
+/// rejected, even where it would terminate: `admissibleSeedArgument` proves a
+/// decrease only between a head and its own calls, and nothing proves one
+/// across two predicates.
+pub fn validateRecursiveGeneration(db: *database.Database) !void {
     for (db.eval.rules.items) |rule| {
-        if (!syntax.ruleContainsArithmetic(rule)) continue;
+        if (!syntax.ruleContainsArithmetic(rule) and !syntax.ruleConstructsLists(rule)) continue;
         const head = syntax.predicateKey(rule.head);
         for (rule.body) |clause| {
             const expression = switch (clause) {

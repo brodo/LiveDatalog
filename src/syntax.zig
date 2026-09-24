@@ -419,6 +419,18 @@ pub fn ruleContainsArithmetic(rule: Rule) bool {
     return false;
 }
 
+/// Whether a rule can produce a list no fact holds yet: a head argument built
+/// with a cons, or an equality that builds one. A cons in a relational body
+/// clause only takes an existing list apart, so it is not counted.
+pub fn ruleConstructsLists(rule: Rule) bool {
+    for (rule.head.terms) |term| if (termContainsCons(term)) return true;
+    for (rule.body) |clause| switch (clause) {
+        .builtin => |expression| for (expression.terms) |term| if (termContainsCons(term)) return true,
+        else => {},
+    };
+    return false;
+}
+
 pub fn isBuiltin(value: Expr) bool {
     return value.kind != .relation;
 }

@@ -181,6 +181,20 @@ LiveDatalog rejects recursive rules that can grow forever. Structural list
 recursion is allowed when a recursive call consumes a list tail; unrestricted
 arithmetic generators and structurally growing recursion are rejected.
 
+A rule that builds a list or computes a number may only recurse by calling
+itself directly. Mutual recursion through such a rule is rejected with
+`NotAdmissible`, even when it would terminate:
+
+```datalog
+even([]).
+even(H!T) :- odd(T).  % rejected: odd/1 calls back into even/1
+odd(H!T) :- even(T).
+```
+
+Mutual recursion between rules that build nothing, such as two relations
+defined in terms of each other over a graph, is ordinary Datalog and is
+accepted.
+
 ## Equality and comparisons
 
 LiveDatalog provides these built-in operators:
