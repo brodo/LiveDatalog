@@ -38,8 +38,9 @@ pub const help_text =
     \\  p(X, N) order by N desc?    list the answers in a chosen order
     \\  .predicates                 every predicate: name, arity, kind, facts, typed
     \\  .schema NAME                a predicate's schema: position, name, type
-    \\  .rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc|desc] ...]
-    \\                              a predicate's facts, headed by its schema
+    \\  .rows NAME/ARITY [OFFSET [LIMIT]] [origin] [by POSITION [asc|desc] ...]
+    \\                              a predicate's facts, headed by its schema;
+    \\                              'origin' adds a $origin column: base or derived
     \\  .explain path(a, X)         show the join plan for the goals
     \\  .status                     directory, generation and counts
     \\  .errors                     what went wrong loading the files
@@ -253,14 +254,18 @@ pub const RowsRequest = struct {
     limit: usize = std.math.maxInt(usize),
     /// Positions to order by, 0-based, in precedence order.
     order: []const SortPosition = &.{},
+    /// Whether to add a last column saying whether each fact is base or
+    /// derived.
+    origin: bool = false,
 
     pub const SortPosition = struct {
         position: usize,
         direction: input.Direction = .ascending,
     };
 
-    /// Parses `NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc|desc] ...]`,
-    /// with 1-based positions. `order` is allocated in `arena`.
+    /// Parses `NAME/ARITY [OFFSET [LIMIT]] [origin] [by POSITION [asc|desc] ...]`,
+    /// with 1-based positions; `origin` may also come last. `order` is
+    /// allocated in `arena`.
     pub fn parse(arena: std.mem.Allocator, argument: []const u8) !RowsRequest {
         var words = std.mem.tokenizeAny(u8, argument, &std.ascii.whitespace);
         const predicate = words.next() orelse return error.MissingArgument;
@@ -274,6 +279,10 @@ pub const RowsRequest = struct {
         var order: std.ArrayList(SortPosition) = .empty;
         while (words.next()) |word| {
             if (std.mem.eql(u8, word, "by")) break;
+            if (std.mem.eql(u8, word, "origin")) {
+                request.origin = true;
+                continue;
+            }
             const number = std.fmt.parseInt(usize, word, 10) catch return error.InvalidArgument;
             switch (numbers) {
                 0 => request.offset = number,
@@ -283,6 +292,10 @@ pub const RowsRequest = struct {
             numbers += 1;
         } else return request;
         while (words.next()) |word| {
+            if (std.mem.eql(u8, word, "origin")) {
+                request.origin = true;
+                continue;
+            }
             if (std.mem.eql(u8, word, "asc") or std.mem.eql(u8, word, "desc")) {
                 if (order.items.len == 0) return error.InvalidArgument;
                 order.items[order.items.len - 1].direction =
@@ -306,7 +319,7 @@ fn rows(engine: *Engine, argument: []const u8, writer: *std.Io.Writer) !void {
     const request = RowsRequest.parse(arena, argument) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         else => return writer.print(
-            "error {s} .rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc|desc] ...]\n",
+            "error {s} .rows NAME/ARITY [OFFSET [LIMIT]] [origin] [by POSITION [asc|desc] ...]\n",
             .{@errorName(err)},
         ),
     };
@@ -342,8 +355,44 @@ fn rows(engine: *Engine, argument: []const u8, writer: *std.Io.Writer) !void {
     const total = result.answers.items.len;
     const from = @min(request.offset, total);
     const to = from + @min(request.limit, total - from);
-    try writeAnswers(&table, result, from, to);
+    if (!request.origin) {
+        try writeAnswers(&table, result, from, to);
+        return table.write(writer);
+    }
+
+    // A fact is base when it is asserted, whether or not a rule derives it
+    // too: the rows it is written as tell the two apart.
+    try table.column("$origin");
+    var base = engine.db.baseFacts(request.name, request.arity) catch |err|
+        return writer.print("error {s}\n", .{@errorName(err)});
+    defer base.deinit();
+    var asserted: std.StringHashMapUnmanaged(void) = .empty;
+    for (base.answers.items) |answer| {
+        var row: std.Io.Writer.Allocating = .init(arena);
+        try writeRow(&row.writer, base, answer);
+        try asserted.put(arena, row.written(), {});
+    }
+    for (result.answers.items[from..to]) |answer| {
+        var row: std.Io.Writer.Allocating = .init(arena);
+        try writeRow(&row.writer, result, answer);
+        for (result.variables.items) |name| {
+            const cell = try table.cell();
+            const value = answer.getValue(name) catch continue;
+            try value.write(cell);
+        }
+        try (try table.cell()).writeAll(if (asserted.contains(row.written())) "base" else "derived");
+        try table.endRow();
+    }
     try table.write(writer);
+}
+
+/// Writes one answer's values, tab-separated, as a key to compare rows by.
+fn writeRow(writer: *std.Io.Writer, result: LiveDatalog.QueryResult, answer: LiveDatalog.Answer) !void {
+    for (result.variables.items, 0..) |name, index| {
+        if (index != 0) try writer.writeByte('\t');
+        const value = answer.getValue(name) catch continue;
+        try value.write(writer);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +529,10 @@ test "rows requests parse paging and ordering" {
     try std.testing.expectEqual(@as(usize, 2), paged.order[0].position);
     try std.testing.expectEqual(input.Direction.descending, paged.order[0].direction);
     try std.testing.expectEqual(input.Direction.ascending, paged.order[1].direction);
+
+    try std.testing.expect(!paged.origin);
+    try std.testing.expect((try RowsRequest.parse(arena, "edge/2 0 10 origin")).origin);
+    try std.testing.expect((try RowsRequest.parse(arena, "edge/2 by 1 desc origin")).origin);
 
     try std.testing.expectError(error.InvalidArgument, RowsRequest.parse(arena, "edge"));
     try std.testing.expectError(error.InvalidArgument, RowsRequest.parse(arena, "edge/2 by 3"));

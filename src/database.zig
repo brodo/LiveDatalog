@@ -526,6 +526,28 @@ pub const Database = struct {
         return result;
     }
 
+    /// Copies out every fact `store` holds of `key` as an answer that lists
+    /// its arguments under `names`, one name per position, in the order the
+    /// facts were added.
+    pub fn copyFactsResult(
+        self: *const Database,
+        store: *relation_store.RelationStore,
+        key: relation_store.PredicateKey,
+        names: []const []const u8,
+    ) !results.QueryResult {
+        std.debug.assert(names.len == key.arity);
+        var result: results.QueryResult = .{ .allocator = self.allocator };
+        errdefer result.deinit();
+        for (names) |name| try result.appendVariable(name);
+        for (try store.predicateEntries(key)) |index| {
+            var answer: results.Answer = .{ .allocator = self.allocator };
+            errdefer answer.deinit();
+            for (store.factAt(index).terms, names) |value, name| try self.appendAnswerBinding(&answer, name, value);
+            try result.answers.append(self.allocator, answer);
+        }
+        return result;
+    }
+
     fn appendAnswerBinding(
         self: *const Database,
         answer: *results.Answer,

@@ -590,6 +590,25 @@ pub const Jatalog = struct {
         return listed;
     }
 
+    /// The facts of `predicate` of `arity` asserted rather than only derived,
+    /// in the order they were asserted, each listing its arguments under its
+    /// 1-based position: `1`, `2`, ... A fact a rule also derives is listed,
+    /// since it is asserted all the same.
+    pub fn baseFacts(self: *Jatalog, predicate: []const u8, arity: usize) !results.QueryResult {
+        var names_arena: std.heap.ArenaAllocator = .init(self.state.allocator);
+        defer names_arena.deinit();
+        const names = try names_arena.allocator().alloc([]const u8, arity);
+        for (names, 1..) |*name, position|
+            name.* = try std.fmt.allocPrint(names_arena.allocator(), "{d}", .{position});
+        const name = self.state.strings.get(predicate) orelse {
+            var empty: results.QueryResult = .{ .allocator = self.state.allocator };
+            errdefer empty.deinit();
+            for (names) |position| try empty.appendVariable(position);
+            return empty;
+        };
+        return self.state.copyFactsResult(&self.state.facts, .{ .name = name, .arity = arity }, names);
+    }
+
     /// The columns of `predicate`'s schema, or null when it has none. The
     /// caller frees the slice; the names are the database's.
     pub fn schemaColumns(
@@ -5231,4 +5250,25 @@ test "quoted atoms escape line breaks and tabs, and reparse to themselves" {
     var retracted = try db.execute(source, null);
     retracted.deinit();
     try std.testing.expectEqual(FactCount{}, try db.countFacts("p", 1));
+}
+
+test "baseFacts lists what was asserted, including facts a rule derives too" {
+    var db = Jatalog.init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\edge(a, b). edge(b, c). path(a, b).
+        \\path(X, Y) :- edge(X, Y).
+    , null);
+    result.deinit();
+
+    var base = try db.baseFacts("path", 2);
+    defer base.deinit();
+    try std.testing.expectEqual(@as(usize, 1), base.answers.items.len);
+    try std.testing.expectEqualStrings("a", try base.answers.items[0].getAtom("1"));
+    try std.testing.expectEqualStrings("b", try base.answers.items[0].getAtom("2"));
+
+    var none = try db.baseFacts("unknown", 2);
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.answers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), none.variables.items.len);
 }

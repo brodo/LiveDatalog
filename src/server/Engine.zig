@@ -899,11 +899,19 @@ test "the protocol lists predicates, schemas and rows" {
     try expectAnswer(&engine, ".rows born/2 1 1 by 2 desc", "ok table 1\nWho\tYear\n'Grace Hopper'\t1906\n");
     try expectAnswer(&engine, ".rows born/2 5", "ok table 0\nWho\tYear\n");
     try expectAnswer(&engine, ".rows edge/2 0 1", "ok table 1\n1\t2\na\tb\n");
+    // path(a, b) is asserted and derived, so it is base; path(b, c) is only derived.
+    try expectTable(&engine, ".rows path/2 origin",
+        \\ok table 2
+        \\1|2|$origin
+        \\a|b|base
+        \\b|c|derived
+        \\
+    );
     try expectAnswer(&engine, ".rows note/1", "ok table 1\n1\n'two\\nlines'\n");
     try expectAnswer(
         &engine,
         ".rows edge/2 by 3",
-        "error InvalidArgument .rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc|desc] ...]\n",
+        "error InvalidArgument .rows NAME/ARITY [OFFSET [LIMIT]] [origin] [by POSITION [asc|desc] ...]\n",
     );
 
     // A query without variables: an empty header, and one empty row if it holds.
