@@ -145,12 +145,42 @@ one store per evaluation but stay distinguishable through a per-entry flag.
 The engine's state: the interned program, the base facts, the derived closure,
 the auxiliary views, and the materialization tri-state (`database.zig`). Every
 layer between the state and the public interface — compilation, validation,
-materialization, maintenance, aggregate views, statements, parsing — operates
-on a `Database` and does not name the interface above it.
+materialization, maintenance, aggregate views, transactions, running
+statements — operates on a `Database` and does not name the interface above
+it. Parsing is not among them: it needs no database at all.
 
 `Jatalog` is what an embedder holds: it owns one `Database` and exposes the
 operations that change it. The split is what makes the engine's imports
 acyclic; see [ADR 0002](docs/adr/0002-acyclic-module-layering.md).
+
+### Statement
+
+One top-level item of a program's source: a fact (`p(a).`), a rule
+(`h :- b.`), a query (`b?`) or a retraction (`b~`). Parsing a program yields
+its statements as the same borrowed descriptors (`input`) an embedder builds
+by hand, so a parsed statement and a hand-built one are one thing and every
+operation that takes one takes the other. Parsing needs no database and
+interns nothing; a statement's names become identifiers only when it runs.
+
+A program is parsed whole before any statement of it runs, so a syntax error
+anywhere means nothing ran. What a statement does when it runs — including
+failing semantically, as `NotStratified` or `UnboundVariable` — is still its
+own: the statements before it stay, and none of it does. Parsing judges only
+what the text alone decides — shape, and whether a numeric literal fits its
+type — and everything needing the program's meaning waits for the run.
+
+Everything the source can say, a statement can hold. A parse that had to drop
+or rewrite something would make the text and the descriptor two programs, so
+where the source is richer than the descriptors — a negated built-in such as
+`not X < Y` — the descriptors grow rather than the parser normalizing.
+
+### Transaction
+
+The unit a statement runs in (`transaction.zig`): a staging copy of the
+database that the statement changes and that is committed only once the
+statement has succeeded. Consecutive assertions share one transaction, each
+with its own savepoint, because a copy per fact is what loading a program
+from source cannot afford.
 
 ### Query fold
 

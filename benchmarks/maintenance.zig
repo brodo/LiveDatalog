@@ -105,7 +105,7 @@ fn buildDatabase(allocator: std.mem.Allocator) !LiveDatalog.Jatalog {
             try database.addFact("member", &.{ input.atom(name), input.atom(member_name) });
         }
     }
-    var setup = try database.execute(program);
+    var setup = try database.execute(program, null);
     setup.deinit();
     try database.materialize();
     return database;
@@ -166,7 +166,7 @@ fn runPhase(
         }
         // Query after every batch so work a recompute decision defers is
         // paid inside the measured region rather than escaping it.
-        var result = try database.execute("size(G, N)?");
+        var result = try database.execute("size(G, N)?", null);
         result.deinit();
     }
     const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);

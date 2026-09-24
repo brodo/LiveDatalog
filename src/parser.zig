@@ -1,419 +1,433 @@
-//! The source syntax: tokenizer, term and clause parsing, and the statement
-//! loop that drives a program's transactions.
+//! The source syntax: text in, borrowed `input` descriptors out.
 //!
-//! Parsing interns into whichever database it is pointed at, which is how a
-//! statement's query-local symbols, scalars and structures stay out of the
-//! committed database: the loop points each statement at a `Statement`'s
-//! staging copy and commits only what the statement turned out to be.
+//! Parsing needs no database and interns nothing. A parsed statement is the
+//! same descriptor an embedder would build by hand, so everything that takes
+//! one takes the other, and a statement's names become identifiers only when
+//! it runs (`program.zig`). That is also what puts this module at the bottom
+//! of the engine: it imports the descriptors and the literal classifier and
+//! nothing that holds state.
 //!
-//! This module holds syntax only. It reaches the database through four
-//! compiled-statement operations and the statement transaction, never through
-//! the transaction primitives those are built from.
+//! Parsing judges only what the text alone decides — the shape of a
+//! statement, and whether a numeric literal fits its type. Anything needing
+//! the program's meaning (a fact's groundness, a rule's safety, stratification)
+//! is reported when the statement runs.
 
 const std = @import("std");
-const database = @import("database.zig");
-const statement = @import("statement.zig");
-const results = @import("results.zig");
-const syntax = @import("syntax.zig");
-const errors = @import("errors.zig");
-const test_support = @import("test_support.zig");
+const input = @import("input.zig");
+const scalar = @import("scalar.zig");
 
-/// The transaction a run of consecutive assertions shares.
+pub const Error = error{
+    InvalidSyntax,
+    InvalidFact,
+    InvalidRule,
+    NumericOverflow,
+    OutOfMemory,
+};
+
+/// A byte range of the source, `end` exclusive.
+pub const Span = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Where a parse or a program run failed. Filling one never allocates.
 ///
-/// `staged` is whether any of them has landed in it. A run whose very first
-/// statement fails has staged nothing and is discarded rather than committed:
-/// installing a copy holding exactly what the database already holds would
-/// leave the database equal to itself but not identical, since the lazily
-/// built caches it would come away with are the copy's rather than its own.
-const Run = struct {
-    transaction: statement.Statement,
-    staged: bool = false,
+/// Passed as an optional out-parameter and written only when the operation
+/// fails; on success it is left as it was.
+pub const Diagnostic = struct {
+    /// The index of the statement that failed, when one was reached. Set for
+    /// syntax errors inside a program and for every error a run reports.
+    statement: ?usize = null,
+    /// The offending bytes: the token a parse stopped at, or the whole
+    /// statement a run failed in. Null when there is no source to point into,
+    /// as for statements built by hand.
+    span: ?Span = null,
+    /// 1-based line and byte column of `span.start`; 0 when `span` is null.
+    line: u32 = 0,
+    column: u32 = 0,
+    /// What the parser was looking for, such as `"')'"`. Parse errors only.
+    expected: ?[]const u8 = null,
 
-    /// Commits what the run has staged, if anything, and ends it.
-    fn close(run: *?Run) void {
-        if (run.*) |*open| {
-            if (open.staged) open.transaction.commitAssertions();
-            open.transaction.deinit();
-            run.* = null;
-        }
+    /// A diagnostic pointing at `span` of `source`.
+    pub fn at(source: []const u8, span: Span, statement: ?usize, expected: ?[]const u8) Diagnostic {
+        const location = locate(source, span.start);
+        return .{
+            .statement = statement,
+            .span = span,
+            .line = location.line,
+            .column = location.column,
+            .expected = expected,
+        };
     }
 };
 
-pub const Parser = struct {
-    jatalog: *database.Database,
+pub const Location = struct {
+    line: u32,
+    column: u32,
+};
+
+/// The 1-based line and byte column of `offset` in `source`.
+pub fn locate(source: []const u8, offset: usize) Location {
+    const clamped = @min(offset, source.len);
+    const line_start = if (std.mem.findScalarLast(u8, source[0..clamped], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    return .{
+        .line = @intCast(std.mem.count(u8, source[0..clamped], "\n") + 1),
+        .column = @intCast(clamped - line_start + 1),
+    };
+}
+
+/// A parse result and the memory its borrowed descriptors point into.
+///
+/// Everything `value` reaches — names, atoms, nested goals — lives in the
+/// arena, including a copy of the source, so the caller's source may be freed
+/// as soon as the parse returns.
+pub fn Parsed(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        arena: *std.heap.ArenaAllocator,
+        value: T,
+
+        pub fn deinit(self: Self) void {
+            const allocator = self.arena.child_allocator;
+            self.arena.deinit();
+            allocator.destroy(self.arena);
+        }
+    };
+}
+
+/// A parsed program: its statements, and where in the source each one was.
+pub const Program = struct {
+    statements: []const input.Statement,
+    /// `spans[i]` covers `statements[i]`, terminator included.
+    spans: []const Span,
+};
+
+/// Parses every statement of `source`. A syntax error anywhere fails the
+/// whole parse, which is what lets a program be checked before any of it runs.
+pub fn parseProgram(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diagnostic: ?*Diagnostic,
+) Error!Parsed(Program) {
+    return parseWith(Program, Parser.program, allocator, source, diagnostic);
+}
+
+/// Parses one rule, `head :- body`, with an optional trailing `.`.
+pub fn parseRule(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diagnostic: ?*Diagnostic,
+) Error!Parsed(input.Rule) {
+    return parseWith(input.Rule, Parser.wholeRule, allocator, source, diagnostic);
+}
+
+/// Parses a comma-separated list of goals — a query's body — with an optional
+/// trailing `?`.
+pub fn parseGoals(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diagnostic: ?*Diagnostic,
+) Error!Parsed([]const input.Goal) {
+    return parseWith([]const input.Goal, Parser.wholeGoals, allocator, source, diagnostic);
+}
+
+fn parseWith(
+    comptime T: type,
+    comptime parse: fn (*Parser) Error!T,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diagnostic: ?*Diagnostic,
+) Error!Parsed(T) {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    var parser: Parser = .{
+        .arena = arena.allocator(),
+        .source = try arena.allocator().dupe(u8, source),
+        .diagnostic = diagnostic,
+    };
+    const value = try parse(&parser);
+    return .{ .arena = arena, .value = value };
+}
+
+/// A goal and the source it was written as, which is what a shape error
+/// points at.
+const Clause = struct {
+    goal: input.Goal,
+    span: Span,
+};
+
+const Parser = struct {
+    arena: std.mem.Allocator,
+    /// The arena's copy of the caller's source, so every name a descriptor
+    /// borrows is a slice of memory the parse result owns.
     source: []const u8,
     index: usize = 0,
+    diagnostic: ?*Diagnostic,
+    /// The statement being parsed, when parsing a program.
+    statement: ?usize = null,
 
-    /// Runs the program, one statement at a time, with a run of consecutive
-    /// assertions sharing one transaction.
-    ///
-    /// Sharing is what makes loading facts from source affordable: a
-    /// transaction clones the database, and 2000 assertions with a transaction
-    /// each copy 1,999,000 fact entries between them. It changes nothing about
-    /// what a statement promises. A statement that fails inside a run is
-    /// rolled back to its own savepoint and the run it was in is committed
-    /// without it, so a failure still leaves every earlier statement and none
-    /// of the failing one — including what the failing one interned, which is
-    /// observable rather than merely untidy, since a novel ground structure
-    /// joins the seed set of admissible structural recursion.
-    pub fn executeAll(self: *Parser) !results.ExecutionResult {
-        var last: ?results.ExecutionResult = null;
-        errdefer if (last) |*result| result.deinit();
-        var run: ?Run = null;
-        errdefer if (run) |*open| open.transaction.deinit();
+    fn program(self: *Parser) Error!Program {
+        var statements: std.ArrayList(input.Statement) = .empty;
+        var spans: std.ArrayList(Span) = .empty;
         while (true) {
             self.skipSpace();
-            if (self.index == self.source.len) {
-                Run.close(&run);
-                return last orelse .none;
-            }
-            if (last) |*result| result.deinit();
-            last = null;
-            const kind = self.peekStatementKind();
-            if (kind == .assertion) {
-                if (run == null) run = .{
-                    .transaction = try statement.Statement.begin(self.jatalog, .assertion),
-                };
-                last = self.executeInRun(&run.?.transaction) catch |err| {
-                    // The statements before this one are staged on the copy it
-                    // has just been rolled back out of, so committing is what
-                    // keeps them and drops it.
-                    Run.close(&run);
-                    return err;
-                };
-                run.?.staged = true;
-                continue;
-            }
-            Run.close(&run);
-            var transaction = try statement.Statement.begin(self.jatalog, kind);
-            defer transaction.deinit();
-            var statement_parser = self.*;
-            statement_parser.jatalog = transaction.target();
-            const statement_result = try statement_parser.executeStatement(&transaction);
-            self.index = statement_parser.index;
-            try transaction.commit(statement_result);
-            last = statement_result;
+            if (self.index == self.source.len) break;
+            self.statement = statements.items.len;
+            const start = self.index;
+            try statements.append(self.arena, try self.parseStatement());
+            try spans.append(self.arena, .{ .start = start, .end = self.index });
         }
+        return .{ .statements = statements.items, .spans = spans.items };
     }
 
-    /// Runs one assertion inside the transaction it shares with the assertions
-    /// around it, undoing what it interned if it fails.
-    fn executeInRun(self: *Parser, transaction: *statement.Statement) !results.ExecutionResult {
-        const mark = transaction.savepoint();
-        var statement_parser = self.*;
-        statement_parser.jatalog = transaction.target();
-        const statement_result = statement_parser.executeStatement(transaction) catch |err| {
-            transaction.rollback(mark);
-            return err;
+    fn wholeRule(self: *Parser) Error!input.Rule {
+        const head = try self.parseClause();
+        const relation = switch (head.goal) {
+            .relation => |relation| relation,
+            else => return self.fail(error.InvalidRule, head.span, "a relation"),
         };
-        self.index = statement_parser.index;
-        return statement_result;
+        if (!self.consume(":-")) return self.failHere(error.InvalidRule, "':-'");
+        const body = try self.parseClauseList();
+        _ = self.consume(".");
+        try self.expectEnd();
+        return .{ .head = relation, .body = body };
     }
 
-    /// Classifies the next statement by scanning for its terminator without
-    /// interning anything, mirroring the tokenizer's comment, quote, and
-    /// digit-dot-digit rules.
-    fn peekStatementKind(self: *const Parser) statement.Statement.Kind {
-        var index = self.index;
-        while (index < self.source.len) : (index += 1) {
-            const byte = self.source[index];
-            if (byte == '%' or (byte == '/' and index + 1 < self.source.len and
-                self.source[index + 1] == '/'))
-            {
-                while (index < self.source.len and self.source[index] != '\n') index += 1;
-                continue;
-            }
-            if (byte == '/' and index + 1 < self.source.len and self.source[index + 1] == '*') {
-                const end = std.mem.indexOfPos(u8, self.source, index + 2, "*/") orelse
-                    return .end;
-                index = end + 1;
-                continue;
-            }
-            if (byte == '\'' or byte == '"') {
-                index += 1;
-                while (index < self.source.len and self.source[index] != byte) {
-                    if (self.source[index] == '\\') index += 1;
-                    index += 1;
-                }
-                if (index == self.source.len) return .end;
-                continue;
-            }
-            if (byte == '?') return .query;
-            if (byte == '~') return .retraction;
-            if (byte == '.') {
-                const digit_before = index > self.index and
-                    std.ascii.isDigit(self.source[index - 1]);
-                const digit_after = index + 1 < self.source.len and
-                    std.ascii.isDigit(self.source[index + 1]);
-                if (!(digit_before and digit_after)) return .assertion;
-            }
-        }
-        return .end;
+    fn wholeGoals(self: *Parser) Error![]const input.Goal {
+        const goals = try self.parseClauseList();
+        _ = self.consume("?");
+        try self.expectEnd();
+        return goals;
     }
 
-    /// Runs one statement against `self.jatalog`, which is `transaction`'s
-    /// staging copy. The transaction is named here only for the retraction,
-    /// whose commit needs the facts its goals resolved to; every other
-    /// statement is committed from the staging copy alone.
-    fn executeStatement(self: *Parser, transaction: *statement.Statement) !results.ExecutionResult {
+    fn parseStatement(self: *Parser) Error!input.Statement {
         const first = try self.parseClause();
-        var first_owned = true;
-        errdefer if (first_owned) syntax.freeClauseTree(self.jatalog.allocator, first);
-        self.skipSpace();
         if (self.consume(":-")) {
-            const head = switch (first) {
-                .relational => |expression| expression,
-                else => return error.InvalidRule,
+            const head = switch (first.goal) {
+                .relation => |relation| relation,
+                else => return self.fail(error.InvalidRule, first.span, "a relation"),
             };
-            var body: std.ArrayList(syntax.Clause) = .empty;
-            defer body.deinit(self.jatalog.allocator);
-            errdefer for (body.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
-            while (true) {
-                const clause = try self.parseClause();
-                body.append(self.jatalog.allocator, clause) catch |err| {
-                    syntax.freeClauseTree(self.jatalog.allocator, clause);
-                    return err;
-                };
-                self.skipSpace();
-                if (!self.consume(",")) break;
-            }
+            const body = try self.parseClauseList();
             try self.expect(".");
-            try statement.addRuleClauses(self.jatalog, head, body.items);
-            first_owned = false;
-            return .none;
+            return .{ .rule = .{ .head = head, .body = body } };
         }
-        self.skipSpace();
         if (self.consume(".")) {
-            const fact = switch (first) {
-                .relational => |expression| expression,
-                else => return error.InvalidFact,
-            };
-            try statement.addFactExpr(self.jatalog, fact);
-            syntax.freeClauseTree(self.jatalog.allocator, first);
-            first_owned = false;
-            return .none;
-        }
-
-        var goals: std.ArrayList(syntax.Clause) = .empty;
-        defer {
-            for (goals.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
-            goals.deinit(self.jatalog.allocator);
-        }
-        try goals.append(self.jatalog.allocator, first);
-        first_owned = false;
-        while (self.consume(",")) {
-            const goal = try self.parseClause();
-            goals.append(self.jatalog.allocator, goal) catch |err| {
-                syntax.freeClauseTree(self.jatalog.allocator, goal);
-                return err;
+            return switch (first.goal) {
+                .relation => |relation| .{ .fact = relation },
+                else => self.fail(error.InvalidFact, first.span, "a relation"),
             };
         }
-        if (self.consume("?")) return .{ .query = try statement.queryClauses(self.jatalog, goals.items) };
-        if (self.consume("~")) return .{ .changed = try transaction.retract(goals.items) };
-        return error.InvalidSyntax;
+        var goals: std.ArrayList(input.Goal) = .empty;
+        try goals.append(self.arena, first.goal);
+        const expected = if (self.consume(",")) blk: {
+            try self.appendClauses(&goals);
+            break :blk "',', '?' or '~'";
+        } else "':-', '.', ',', '?' or '~'";
+        if (self.consume("?")) return .{ .query = goals.items };
+        if (self.consume("~")) return .{ .retraction = goals.items };
+        return self.failHere(error.InvalidSyntax, expected);
     }
 
-    fn parseClause(self: *Parser) anyerror!syntax.Clause {
+    /// One or more clauses separated by commas.
+    fn parseClauseList(self: *Parser) Error![]const input.Goal {
+        var goals: std.ArrayList(input.Goal) = .empty;
+        try self.appendClauses(&goals);
+        return goals.items;
+    }
+
+    fn appendClauses(self: *Parser, goals: *std.ArrayList(input.Goal)) Error!void {
+        while (true) {
+            try goals.append(self.arena, (try self.parseClause()).goal);
+            if (!self.consume(",")) return;
+        }
+    }
+
+    fn parseClause(self: *Parser) Error!Clause {
         self.skipSpace();
-        if (self.peekKeyword("setof")) return .{ .aggregate = try self.parseAggregate() };
-        const expression = try self.parseExpr();
-        return syntax.classifyExpr(expression);
+        const start = self.index;
+        const goal = if (self.peekKeyword("setof"))
+            try self.parseAggregate()
+        else
+            try self.parseExpr();
+        return .{ .goal = goal, .span = .{ .start = start, .end = self.index } };
     }
 
-    fn parseAggregate(self: *Parser) anyerror!syntax.Aggregate {
-        const keyword = try self.parseBare();
-        if (!std.mem.eql(u8, keyword, "setof")) return error.InvalidSyntax;
+    fn parseAggregate(self: *Parser) Error!input.Goal {
+        _ = try self.parseBare();
         try self.expect("(");
         const template = try self.parseTerm();
-        var template_owned = true;
-        errdefer if (template_owned) syntax.freeTerm(self.jatalog.allocator, template);
         try self.expect(",");
-
-        var body: std.ArrayList(syntax.Clause) = .empty;
-        errdefer {
-            for (body.items) |clause| syntax.freeClauseTree(self.jatalog.allocator, clause);
-            body.deinit(self.jatalog.allocator);
-        }
+        var body: std.ArrayList(input.Goal) = .empty;
         if (self.consume("(")) {
             while (true) {
-                const clause = try self.parseClause();
-                body.append(self.jatalog.allocator, clause) catch |err| {
-                    syntax.freeClauseTree(self.jatalog.allocator, clause);
-                    return err;
-                };
+                try body.append(self.arena, (try self.parseClause()).goal);
                 if (self.consume(")")) break;
                 try self.expect(",");
             }
         } else {
-            const clause = try self.parseClause();
-            body.append(self.jatalog.allocator, clause) catch |err| {
-                syntax.freeClauseTree(self.jatalog.allocator, clause);
-                return err;
-            };
+            try body.append(self.arena, (try self.parseClause()).goal);
         }
         try self.expect(",");
         const output = try self.parseTerm();
-        errdefer syntax.freeTerm(self.jatalog.allocator, output);
         try self.expect(")");
-        const owned_body = try body.toOwnedSlice(self.jatalog.allocator);
-        template_owned = false;
-        return .{
-            .template = template,
-            .body = owned_body,
-            .output = output,
-        };
+        return input.setof(template, body.items, output);
     }
 
-    fn parseExpr(self: *Parser) !syntax.Expr {
+    fn parseExpr(self: *Parser) Error!input.Goal {
         self.skipSpace();
+        const start = self.index;
         var negated = false;
         if (self.peekKeyword("not")) {
             _ = try self.parseBare();
             negated = true;
         }
-        const first = try self.parseTerm();
-        var first_owned = true;
-        errdefer if (first_owned) syntax.freeTerm(self.jatalog.allocator, first);
         self.skipSpace();
+        const first_start = self.index;
+        const first = try self.parseTerm();
+        const first_span: Span = .{ .start = first_start, .end = self.index };
         if (self.parseOperator()) |operator| {
             const second = try self.parseTerm();
-            errdefer syntax.freeTerm(self.jatalog.allocator, second);
             if (std.mem.eql(u8, operator, "=")) {
-                const arithmetic: ?syntax.GoalKind = if (self.consume("+"))
+                const arithmetic: ?input.Arithmetic = if (self.consume("+"))
                     .add
                 else if (self.consume("-"))
                     .subtract
                 else
                     null;
-                if (arithmetic) |arithmetic_kind| {
-                    if (negated) return error.InvalidSyntax;
+                if (arithmetic) |kind| {
+                    if (negated) return self.fail(
+                        error.InvalidSyntax,
+                        .{ .start = start, .end = self.index },
+                        "a test after 'not'",
+                    );
                     const third = try self.parseTerm();
-                    errdefer syntax.freeTerm(self.jatalog.allocator, third);
-                    const predicate = try self.jatalog.strings.intern(syntax.goalOperator(arithmetic_kind));
-                    const terms = try self.jatalog.allocator.alloc(syntax.Term, 3);
-                    terms[0] = first;
-                    terms[1] = second;
-                    terms[2] = third;
-                    first_owned = false;
-                    return .{ .predicate = predicate, .terms = terms, .kind = arithmetic_kind };
+                    return .{ .arithmetic = .{ .kind = kind, .output = first, .left = second, .right = third } };
                 }
             }
-            const kind = syntax.goalKind(operator) orelse return error.UnknownOperator;
-            const predicate = try self.jatalog.strings.intern(syntax.goalOperator(kind));
-            const terms = try self.jatalog.allocator.alloc(syntax.Term, 2);
-            terms[0] = first;
-            terms[1] = second;
-            first_owned = false;
-            return .{
-                .predicate = predicate,
-                .terms = terms,
-                .negated = negated,
-                .kind = kind,
+            const operands: input.Binary = .{ .left = first, .right = second };
+            const builtin: input.NegatedBuiltin = if (std.mem.eql(u8, operator, "="))
+                .{ .equality = operands }
+            else if (std.mem.eql(u8, operator, "!=") or std.mem.eql(u8, operator, "<>"))
+                .{ .inequality = operands }
+            else
+                .{ .comparison = .{ .kind = comparisonKind(operator), .operands = operands } };
+            if (negated) return input.notBuiltin(builtin);
+            return switch (builtin) {
+                .equality => |binary| .{ .equality = binary },
+                .inequality => |binary| .{ .inequality = binary },
+                .comparison => |comparison| .{ .comparison = comparison },
             };
         }
-        if (!self.consume("(")) return error.InvalidSyntax;
+        if (!self.consume("(")) return self.failHere(error.InvalidSyntax, "'(' or an operator");
         const predicate = switch (first) {
-            .scalar => |scalar_id| switch (self.jatalog.eval.scalars.get(scalar_id)) {
-                .atom => |atom| try self.jatalog.strings.intern(atom),
-                .integer, .float => return error.InvalidSyntax,
-            },
-            else => return error.InvalidSyntax,
+            .atom => |atom| atom,
+            else => return self.fail(error.InvalidSyntax, first_span, "a predicate name"),
         };
-        first_owned = false;
-        var terms: std.ArrayList(syntax.Term) = .empty;
-        errdefer {
-            for (terms.items) |term| syntax.freeTerm(self.jatalog.allocator, term);
-            terms.deinit(self.jatalog.allocator);
-        }
+        var terms: std.ArrayList(input.Term) = .empty;
         self.skipSpace();
         if (!self.consume(")")) {
             while (true) {
-                const term = try self.parseTerm();
-                terms.append(self.jatalog.allocator, term) catch |err| {
-                    syntax.freeTerm(self.jatalog.allocator, term);
-                    return err;
-                };
-                self.skipSpace();
+                try terms.append(self.arena, try self.parseTerm());
                 if (self.consume(")")) break;
                 try self.expect(",");
             }
         }
-        return .{ .predicate = predicate, .terms = try terms.toOwnedSlice(self.jatalog.allocator), .negated = negated };
+        return if (negated)
+            input.not(predicate, terms.items)
+        else
+            input.relation(predicate, terms.items);
     }
 
-    fn parseTerm(self: *Parser) anyerror!syntax.Term {
-        var head = try self.parseTermPrimary();
-        errdefer syntax.freeTerm(self.jatalog.allocator, head);
-        if (self.consumeConsBang()) {
-            const tail = try self.parseTerm();
-            errdefer syntax.freeTerm(self.jatalog.allocator, tail);
-            head = try self.makeCons(head, tail);
-        }
+    fn parseTerm(self: *Parser) Error!input.Term {
+        const head = try self.parseTermPrimary();
+        if (self.consumeConsBang()) return self.makeCons(head, try self.parseTerm());
         return head;
     }
 
-    fn parseTermPrimary(self: *Parser) anyerror!syntax.Term {
+    fn parseTermPrimary(self: *Parser) Error!input.Term {
         self.skipSpace();
-        if (self.index == self.source.len) return error.InvalidSyntax;
+        if (self.index == self.source.len) return self.failHere(error.InvalidSyntax, "a term");
         if (self.consume("[")) return self.parseListTail();
-        if (self.source[self.index] == '"' or self.source[self.index] == '\'') {
-            const quote = self.source[self.index];
-            self.index += 1;
-            var string: std.ArrayList(u8) = .empty;
-            defer string.deinit(self.jatalog.allocator);
-            while (self.index < self.source.len and self.source[self.index] != quote) {
-                if (self.source[self.index] == '\\' and self.index + 1 < self.source.len) self.index += 1;
-                try string.append(self.jatalog.allocator, self.source[self.index]);
-                self.index += 1;
-            }
-            if (self.index == self.source.len) return error.InvalidSyntax;
-            self.index += 1;
-            return .{ .scalar = try self.jatalog.eval.scalars.internAtom(string.items) };
-        }
+        const quote = self.source[self.index];
+        if (quote == '"' or quote == '\'') return self.parseQuoted();
+        const start = self.index;
         const value = try self.parseBare();
         if (std.mem.eql(u8, value, "cons") and self.consume("(")) {
             const head = try self.parseTerm();
-            errdefer syntax.freeTerm(self.jatalog.allocator, head);
             try self.expect(",");
             const tail = try self.parseTerm();
-            errdefer syntax.freeTerm(self.jatalog.allocator, tail);
             try self.expect(")");
             return self.makeCons(head, tail);
         }
-        if (syntax.isVariable(value)) return .{ .variable = try self.jatalog.strings.intern(value) };
-        return .{ .scalar = try self.jatalog.eval.scalars.parseBare(value) };
+        if (std.ascii.isUpper(value[0])) return input.variable(value);
+        const literal = scalar.classifyBare(value) catch |err|
+            return self.fail(err, .{ .start = start, .end = self.index }, null);
+        return switch (literal) {
+            .integer => |integer| input.integer(integer),
+            .float => |float| input.float(float),
+            .atom => |atom| input.atom(atom),
+        };
     }
 
-    fn parseListTail(self: *Parser) anyerror!syntax.Term {
-        if (self.consume("]")) return .nil;
-        const head = try self.parseTerm();
-        errdefer syntax.freeTerm(self.jatalog.allocator, head);
-        var tail: syntax.Term = undefined;
-        if (self.consume("]")) {
-            tail = .nil;
-        } else if (self.consume(",")) {
-            tail = try self.parseListTail();
-        } else if (self.consumeConsBang()) {
-            tail = try self.parseImproperListTail();
-        } else return error.InvalidSyntax;
-        errdefer syntax.freeTerm(self.jatalog.allocator, tail);
-        return self.makeCons(head, tail);
+    fn parseQuoted(self: *Parser) Error!input.Term {
+        const start = self.index;
+        const quote = self.source[start];
+        self.index += 1;
+        const content_start = self.index;
+        var escaped = false;
+        while (self.index < self.source.len and self.source[self.index] != quote) {
+            if (self.source[self.index] == '\\' and self.index + 1 < self.source.len) {
+                escaped = true;
+                self.index += 1;
+            }
+            self.index += 1;
+        }
+        if (self.index == self.source.len) return self.fail(
+            error.InvalidSyntax,
+            .{ .start = start, .end = self.index },
+            "a closing quote",
+        );
+        const raw = self.source[content_start..self.index];
+        self.index += 1;
+        if (!escaped) return input.atom(raw);
+        var text: std.ArrayList(u8) = .empty;
+        var cursor: usize = 0;
+        while (cursor < raw.len) : (cursor += 1) {
+            if (raw[cursor] == '\\' and cursor + 1 < raw.len) cursor += 1;
+            try text.append(self.arena, raw[cursor]);
+        }
+        return input.atom(text.items);
     }
 
-    fn parseImproperListTail(self: *Parser) anyerror!syntax.Term {
-        const tail = try self.parseTerm();
-        errdefer syntax.freeTerm(self.jatalog.allocator, tail);
-        try self.expect("]");
-        return tail;
+    /// The rest of a list after its `[`. An element may itself be a pair —
+    /// `[a, H!T]` is a two-element list whose second element is `H!T` —
+    /// because `!` binds within a term, as it does everywhere else.
+    fn parseListTail(self: *Parser) Error!input.Term {
+        var items: std.ArrayList(input.Term) = .empty;
+        while (!self.consume("]")) {
+            try items.append(self.arena, try self.parseTerm());
+            if (self.consume("]")) break;
+            if (!self.consume(",")) return self.failHere(error.InvalidSyntax, "',' or ']'");
+        }
+        return input.list(items.items);
     }
 
-    fn makeCons(self: *Parser, head: syntax.Term, tail: syntax.Term) !syntax.Term {
-        const pair = try self.jatalog.allocator.create(syntax.Term.Cons);
-        pair.* = .{ .head = head, .tail = tail };
-        return .{ .cons = pair };
+    fn makeCons(self: *Parser, head: input.Term, tail: input.Term) Error!input.Term {
+        const halves = try self.arena.alloc(input.Term, 2);
+        halves[0] = head;
+        halves[1] = tail;
+        const pair = try self.arena.create(input.Term.Cons);
+        pair.* = .{ .head = &halves[0], .tail = &halves[1] };
+        return input.cons(pair);
     }
 
-    fn parseBare(self: *Parser) ![]const u8 {
+    fn parseBare(self: *Parser) Error![]const u8 {
         self.skipSpace();
         const start = self.index;
         while (self.index < self.source.len) : (self.index += 1) {
@@ -427,7 +441,7 @@ pub const Parser = struct {
                     self.source[self.index - 1] == 'E')))) continue;
             break;
         }
-        if (self.index == start) return error.InvalidSyntax;
+        if (self.index == start) return self.failHere(error.InvalidSyntax, "a term");
         return self.source[start..self.index];
     }
 
@@ -471,8 +485,13 @@ pub const Parser = struct {
         return true;
     }
 
-    fn expect(self: *Parser, token: []const u8) !void {
-        if (!self.consume(token)) return error.InvalidSyntax;
+    fn expect(self: *Parser, comptime token: []const u8) Error!void {
+        if (!self.consume(token)) return self.failHere(error.InvalidSyntax, "'" ++ token ++ "'");
+    }
+
+    fn expectEnd(self: *Parser) Error!void {
+        self.skipSpace();
+        if (self.index != self.source.len) return self.failHere(error.InvalidSyntax, "the end of input");
     }
 
     fn peekKeyword(self: *Parser, keyword: []const u8) bool {
@@ -481,201 +500,268 @@ pub const Parser = struct {
         const end = self.index + keyword.len;
         return end == self.source.len or !(std.ascii.isAlphanumeric(self.source[end]) or self.source[end] == '_');
     }
+
+    /// Fails at whatever comes next: the word there, or the one byte.
+    fn failHere(self: *Parser, err: Error, expected: ?[]const u8) Error {
+        self.skipSpace();
+        var end = self.index;
+        while (end < self.source.len and (std.ascii.isAlphanumeric(self.source[end]) or
+            self.source[end] == '_')) end += 1;
+        if (end == self.index and end < self.source.len) end += 1;
+        return self.fail(err, .{ .start = self.index, .end = end }, expected);
+    }
+
+    fn fail(self: *Parser, err: Error, span: Span, expected: ?[]const u8) Error {
+        if (self.diagnostic) |diagnostic|
+            diagnostic.* = .at(self.source, span, self.statement, expected);
+        return err;
+    }
 };
 
-/// Runs a source program against `db`, which is what `Jatalog.execute` does one
-/// layer up. Spelled out here so the parser's own tests need nothing above the
-/// parser to build the database they parse into.
-fn execute(db: *database.Database, source: []const u8) !results.ExecutionResult {
-    var statement_parser: Parser = .{ .jatalog = db, .source = source };
-    return statement_parser.executeAll();
+fn comparisonKind(operator: []const u8) input.Comparison {
+    if (std.mem.eql(u8, operator, "<")) return .less_than;
+    if (std.mem.eql(u8, operator, "<=")) return .less_or_equal;
+    if (std.mem.eql(u8, operator, ">")) return .greater_than;
+    std.debug.assert(std.mem.eql(u8, operator, ">="));
+    return .greater_or_equal;
 }
 
-test "a parse error after a query releases the previous result" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db,
-        \\p(a). p(X)?
-        \\bad(X) :- q(X), X <>.
-    ));
+const testing = std.testing;
+
+fn expectStatements(source: []const u8, expected: []const input.Statement) !void {
+    const parsed = try parseProgram(testing.allocator, source, null);
+    defer parsed.deinit();
+    try testing.expectEqualDeep(expected, parsed.value.statements);
 }
 
-test "head tail patterns work in rules and cons syntax is equivalent" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try execute(&db,
-        \\items(cons(a, cons(b, []))).
-        \\tail(T) :- items(H!T).
-        \\tail(X)?
+fn expectFailure(source: []const u8, err: Error, line: u32, column: u32, expected: ?[]const u8) !void {
+    var diagnostic: Diagnostic = .{};
+    try testing.expectError(err, parseProgram(testing.allocator, source, &diagnostic));
+    try testing.expectEqual(line, diagnostic.line);
+    try testing.expectEqual(column, diagnostic.column);
+    if (expected) |text| {
+        try testing.expectEqualStrings(text, diagnostic.expected.?);
+    } else {
+        try testing.expectEqual(@as(?[]const u8, null), diagnostic.expected);
+    }
+}
+
+test "every kind of statement parses to the descriptors it names" {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    try expectStatements(
+        \\parent(alice, bob).
+        \\grandparent(X, Z) :- parent(X, Y), parent(Y, Z).
+        \\parent(alice, X)?
+        \\parent(X, bob)~
+    , &.{
+        .{ .fact = input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }) },
+        .{ .rule = input.rule(
+            input.fact("grandparent", &.{ x, input.variable("Z") }),
+            &.{
+                input.relation("parent", &.{ x, y }),
+                input.relation("parent", &.{ y, input.variable("Z") }),
+            },
+        ) },
+        .{ .query = &.{input.relation("parent", &.{ input.atom("alice"), x })} },
+        .{ .retraction = &.{input.relation("parent", &.{ x, input.atom("bob") })} },
+    });
+}
+
+test "built-ins, negation and arithmetic parse without normalizing" {
+    const x = input.variable("X");
+    const y = input.variable("Y");
+    try expectStatements(
+        \\p(X), not q(X), X = Y, X != Y, X <> Y, X < Y, X >= Y, Z = X + Y, W = X - 1?
+        \\p(X), not X < Y, not X = Y, not X != Y?
+    , &.{
+        .{ .query = &.{
+            input.relation("p", &.{x}),
+            input.not("q", &.{x}),
+            input.equal(x, y),
+            input.notEqual(x, y),
+            input.notEqual(x, y),
+            input.lessThan(x, y),
+            input.greaterOrEqual(x, y),
+            input.add(input.variable("Z"), x, y),
+            input.subtract(input.variable("W"), x, input.integer(1)),
+        } },
+        .{ .query = &.{
+            input.relation("p", &.{x}),
+            input.notBuiltin(.{ .comparison = .{
+                .kind = .less_than,
+                .operands = .{ .left = x, .right = y },
+            } }),
+            input.notBuiltin(.{ .equality = .{ .left = x, .right = y } }),
+            input.notBuiltin(.{ .inequality = .{ .left = x, .right = y } }),
+        } },
+    });
+}
+
+test "terms parse to atoms, numbers, lists and cons pairs" {
+    const h = input.variable("H");
+    const t = input.variable("T");
+    const a = input.atom("a");
+    const b = input.atom("b");
+    const head_tail: input.Term.Cons = .{ .head = &h, .tail = &t };
+    const b_tail: input.Term.Cons = .{ .head = &b, .tail = &t };
+    try expectStatements(
+        \\v(abc, 'quoted \' atom', "1", 42, -7, 2.5, 1e3, _x).
+        \\v([], [a, b], [a,], H!T, cons(H, T), [a, b!T]).
+    , &.{
+        .{ .fact = input.fact("v", &.{
+            input.atom("abc"),
+            input.atom("quoted ' atom"),
+            input.atom("1"),
+            input.integer(42),
+            input.integer(-7),
+            input.float(2.5),
+            input.float(1000),
+            input.atom("_x"),
+        }) },
+        .{ .fact = input.fact("v", &.{
+            input.list(&.{}),
+            input.list(&.{ a, b }),
+            input.list(&.{a}),
+            input.cons(&head_tail),
+            input.cons(&head_tail),
+            input.list(&.{ a, input.cons(&b_tail) }),
+        }) },
+    });
+}
+
+test "aggregates parse with single and parenthesized bodies, and nest" {
+    const g = input.variable("G");
+    const y = input.variable("Y");
+    try expectStatements(
+        \\s(S) :- setof(Y, p(Y), S).
+        \\n(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
+    , &.{
+        .{ .rule = input.rule(input.fact("s", &.{input.variable("S")}), &.{
+            input.setof(y, &.{input.relation("p", &.{y})}, input.variable("S")),
+        }) },
+        .{ .rule = input.rule(input.fact("n", &.{input.variable("S")}), &.{
+            input.relation("seed", &.{input.atom("k")}),
+            input.setof(input.variable("T"), &.{
+                input.relation("group", &.{g}),
+                input.setof(
+                    input.list(&.{ y, g }),
+                    &.{input.relation("parent", &.{ g, y })},
+                    input.variable("T"),
+                ),
+            }, input.variable("S")),
+        }) },
+    });
+}
+
+test "comments and spans cover each statement" {
+    const parsed = try parseProgram(testing.allocator,
+        \\% a comment
+        \\p(a). /* block */ p(X)?
+        \\// trailing
+    , null);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.statements.len);
+    try testing.expectEqualDeep(&[_]Span{
+        .{ .start = 12, .end = 17 },
+        .{ .start = 30, .end = 35 },
+    }, parsed.value.spans);
+}
+
+test "the parse owns everything it returns" {
+    const source = try testing.allocator.dupe(u8, "rule(X, 'y') :- body(X, [z]).");
+    const parsed = try parseProgram(testing.allocator, source, null);
+    defer parsed.deinit();
+    @memset(source, 'q');
+    testing.allocator.free(source);
+    const rule = parsed.value.statements[0].rule;
+    try testing.expectEqualStrings("rule", rule.head.predicate);
+    try testing.expectEqualStrings("y", rule.head.terms[1].atom);
+    try testing.expectEqualStrings("z", rule.body[0].relation.terms[1].list[0].atom);
+}
+
+test "syntax errors report where they are and what was expected" {
+    try expectFailure("p(a)", error.InvalidSyntax, 1, 5, "':-', '.', ',', '?' or '~'");
+    try expectFailure("p(a), q(b)", error.InvalidSyntax, 1, 11, "',', '?' or '~'");
+    try expectFailure("p(a).\nq(a b).", error.InvalidSyntax, 2, 5, "','");
+    try expectFailure("p(a) :- q(a)", error.InvalidSyntax, 1, 13, "'.'");
+    try expectFailure("p([a b]).", error.InvalidSyntax, 1, 6, "',' or ']'");
+    try expectFailure("p('open).", error.InvalidSyntax, 1, 3, "a closing quote");
+    try expectFailure("p(X), X <>.", error.InvalidSyntax, 1, 11, "a term");
+    try expectFailure("p(X), foo?", error.InvalidSyntax, 1, 10, "'(' or an operator");
+    try expectFailure("X(a).", error.InvalidSyntax, 1, 1, "a predicate name");
+    try expectFailure("p(12abc).", error.InvalidSyntax, 1, 3, null);
+    try expectFailure("q(X) :- not X = Y + 1.", error.InvalidSyntax, 1, 9, "a test after 'not'");
+}
+
+test "shape errors are the statement's kind, located at the offending goal" {
+    try expectFailure("p(a).\nX = a.", error.InvalidFact, 2, 1, "a relation");
+    try expectFailure("not p(a).", error.InvalidFact, 1, 1, "a relation");
+    try expectFailure("setof(X, p(X), S).", error.InvalidFact, 1, 1, "a relation");
+    try expectFailure("not h(X) :- p(X).", error.InvalidRule, 1, 1, "a relation");
+    try expectFailure("X < 1 :- p(X).", error.InvalidRule, 1, 1, "a relation");
+}
+
+test "numeric literals that do not fit are located" {
+    try expectFailure("big(99999999999999999999).", error.NumericOverflow, 1, 5, null);
+    try expectFailure("p(a).\nhuge(1e400).", error.NumericOverflow, 2, 6, null);
+    var diagnostic: Diagnostic = .{};
+    try testing.expectError(
+        error.NumericOverflow,
+        parseProgram(testing.allocator, "p(a). q(-2e308).", &diagnostic),
     );
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try test_support.expectBindingValue(&result.query.answers.items[0], "X", "[b]");
+    try testing.expectEqual(@as(?usize, 1), diagnostic.statement);
+    try testing.expectEqualDeep(@as(?Span, .{ .start = 8, .end = 14 }), diagnostic.span);
 }
 
-test "structural equality binds variables recursively and parse errors clean up" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try execute(&db, "seed(a). seed(X), [X] = [a]?");
-    defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
-    try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
+test "a single rule or goal list parses on its own" {
+    const x = input.variable("X");
+    const rule = try parseRule(testing.allocator, "h(X) :- p(X), not q(X)", null);
+    defer rule.deinit();
+    try testing.expectEqualDeep(input.rule(input.fact("h", &.{x}), &.{
+        input.relation("p", &.{x}),
+        input.not("q", &.{x}),
+    }), rule.value);
 
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "broken([a, [b])."));
+    const dotted = try parseRule(testing.allocator, "h(X) :- p(X).", null);
+    dotted.deinit();
+
+    const goals = try parseGoals(testing.allocator, "p(X), X > 1?", null);
+    defer goals.deinit();
+    try testing.expectEqualDeep(@as([]const input.Goal, &.{
+        input.relation("p", &.{x}),
+        input.greaterThan(x, input.integer(1)),
+    }), goals.value);
+
+    var diagnostic: Diagnostic = .{};
+    try testing.expectError(error.InvalidRule, parseRule(testing.allocator, "p(a).", &diagnostic));
+    try testing.expectEqualStrings("':-'", diagnostic.expected.?);
+    try testing.expectError(error.InvalidSyntax, parseGoals(testing.allocator, "p(X)? q(X)?", &diagnostic));
+    try testing.expectEqualStrings("the end of input", diagnostic.expected.?);
+    try testing.expectEqual(@as(u32, 7), diagnostic.column);
+    try testing.expectEqual(@as(?usize, null), diagnostic.statement);
 }
 
-fn structuralAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: database.Database = .init(allocator);
-    defer db.deinit();
-    var result = try execute(&db,
-        \\items([a, [b], c]).
-        \\tail(T) :- items(H!T).
-        \\tail([X, c])?
-    );
-    defer result.deinit();
-    const value = try result.query.answers.items[0].getValue("X");
-    const formatted = try value.formatAlloc(allocator);
-    defer allocator.free(formatted);
-    try std.testing.expectEqualStrings("[b]", formatted);
+test "an empty program has no statements" {
+    const parsed = try parseProgram(testing.allocator, "  % nothing\n", null);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 0), parsed.value.statements.len);
 }
 
-test "structural parsing and evaluation release every allocation on failure" {
-    try test_support.expectEveryAllocationFailureReleased(structuralAllocationScenario);
-}
-
-fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
-    var db: database.Database = .init(allocator);
-    defer db.deinit();
-    var result = try execute(&db,
-        \\seed(k).
-        \\nested(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
-    );
-    result.deinit();
-    const malformed_source = "broken(S) :- seed(k), setof(X, (parent(X, Y), bad([Y])), S.";
-    var malformed = execute(&db, malformed_source) catch |err| switch (err) {
-        errors.Error.InvalidSyntax => return,
+fn allocationScenario(allocator: std.mem.Allocator) !void {
+    const parsed = try parseProgram(allocator,
+        \\items([a, [b], c!T]).
+        \\n(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
+        \\'q\'x'(X), not X < 2?
+    , null);
+    parsed.deinit();
+    _ = parseProgram(allocator, "broken(S) :- setof(X, (p(X), bad([Y])), S.", null) catch |err| switch (err) {
+        error.InvalidSyntax => return,
         else => return err,
     };
-    malformed.deinit();
     return error.ExpectedInvalidSyntax;
 }
 
-test "aggregate parser errors release all partial clause trees" {
-    try test_support.expectEveryAllocationFailureReleased(aggregateAllocationScenario);
-}
-
-test "quoted numeric atoms remain distinct from numeric scalars" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try execute(&db, "value(1). value('1'). value('1.0'). setof(X, value(X), S)?");
-    defer result.deinit();
-    try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[1, '1', '1.0']");
-
-    var inequality = try execute(&db, "1 = '1'?");
-    defer inequality.deinit();
-    try std.testing.expectEqual(@as(usize, 0), inequality.query.answers.items.len);
-
-    var quoted_float = try execute(&db, "1000 = '1e3'?");
-    defer quoted_float.deinit();
-    try std.testing.expectEqual(@as(usize, 0), quoted_float.query.answers.items.len);
-
-    var nested = try execute(&db, "nested([1]). nested(['1']). nested([1.0]). nested([1])?");
-    defer nested.deinit();
-    try std.testing.expectEqual(@as(usize, 1), nested.query.answers.items.len);
-
-    var quoted_setof = try execute(&db, "text('2.5'). text(2.5). setof(X, text(X), S)?");
-    defer quoted_setof.deinit();
-    try test_support.expectBindingValue(&quoted_setof.query.answers.items[0], "S", "[2.5, '2.5']");
-
-    var arithmetic = try execute(&db, "01 = +0 + 1?");
-    defer arithmetic.deinit();
-    try std.testing.expectEqual(@as(usize, 1), arithmetic.query.answers.items.len);
-
-    try std.testing.expectError(errors.Error.NumericType, execute(&db, "value(X), X < 2?"));
-}
-
-test "non-finite and malformed numeric source reports stable errors" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(1e400)."));
-    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(-1e400)."));
-    try std.testing.expectError(errors.Error.NumericOverflow, execute(&db, "value(2e308)."));
-
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1e)."));
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1e+)."));
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1.2.3)."));
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(12abc)."));
-    try std.testing.expectError(errors.Error.InvalidSyntax, execute(&db, "value(1.)."));
-
-    var absent = try execute(&db, "value(X)?");
-    defer absent.deinit();
-    try std.testing.expectEqual(@as(usize, 0), absent.query.answers.items.len);
-}
-
-test "float literals parse and integral values canonicalize to integers" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try execute(&db,
-        \\value(2.5). value(0.5). value(-0.025). value(1.0).
-        \\value(1). value(1e0). value(1e3). value(-0.0).
-        \\value(0). value(1e-999).
-        \\setof(X, value(X), S)?
-    );
-    defer result.deinit();
-    try test_support.expectBindingValue(
-        &result.query.answers.items[0],
-        "S",
-        "[-0.025, 0, 0.5, 1, 2.5, 1000]",
-    );
-
-    var canonical = try execute(&db, "nested([1.0]). nested([1])?");
-    defer canonical.deinit();
-    try std.testing.expectEqual(@as(usize, 1), canonical.query.answers.items.len);
-
-    var integral = try execute(&db, "value(X), X = 1e0?");
-    defer integral.deinit();
-    try std.testing.expectEqual(@as(usize, 1), integral.query.answers.items.len);
-    try std.testing.expectEqual(
-        @as(i64, 1),
-        try integral.query.answers.items[0].getInteger("X"),
-    );
-}
-
-test "float extremes format deterministically and round-trip" {
-    var db: database.Database = .init(std.testing.allocator);
-    defer db.deinit();
-    var result = try execute(&db,
-        \\extreme(5e-324). extreme(2.2250738585072014e-308).
-        \\extreme(1.7976931348623157e308). extreme(-1.7976931348623157e308).
-        \\extreme(1e300).
-        \\setof(X, extreme(X), S)?
-    );
-    defer result.deinit();
-    try test_support.expectBindingValue(
-        &result.query.answers.items[0],
-        "S",
-        "[-1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 1e300, " ++
-            "1.7976931348623157e308]",
-    );
-
-    for ([_][]const u8{
-        "extreme(5e-324)?",
-        "extreme(2.2250738585072014e-308)?",
-        "extreme(1.7976931348623157e308)?",
-        "extreme(-1.7976931348623157e308)?",
-        "extreme(1e300)?",
-    }) |query| {
-        var ground = try execute(&db, query);
-        defer ground.deinit();
-        try std.testing.expectEqual(@as(usize, 1), ground.query.answers.items.len);
-    }
-
-    var formatted = try execute(&db, "half(0.5). half(X)?");
-    defer formatted.deinit();
-    const value = try formatted.query.answers.items[0].getValue("X");
-    const spelled = try value.formatAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(spelled);
-    try std.testing.expectEqualStrings("0.5", spelled);
-    try std.testing.expectEqual(results.ResultValue.Kind.float, value.kind());
-    try std.testing.expectError(errors.Error.TypeMismatch, value.getInteger());
+test "parsing releases every allocation on failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
 }

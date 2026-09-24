@@ -191,22 +191,6 @@ pub const Store = struct {
         return self.noteInterned(hash);
     }
 
-    pub fn parseBare(self: *Store, literal: []const u8) !Id {
-        if (isIntegerSyntax(literal)) {
-            const number = std.fmt.parseInt(i64, literal, 10) catch |err| switch (err) {
-                error.Overflow => return error.NumericOverflow,
-                else => unreachable,
-            };
-            return self.internInteger(number);
-        }
-        if (isFloatSyntax(literal)) {
-            const number = std.fmt.parseFloat(f64, literal) catch unreachable;
-            return self.internFloat(number);
-        }
-        if (isNumericLeading(literal)) return error.InvalidSyntax;
-        return self.internAtom(literal);
-    }
-
     pub fn get(self: *const Store, id: Id) Value {
         return self.values.items[@intFromEnum(id)];
     }
@@ -302,6 +286,36 @@ fn orderIntegerFloat(integer: i64, float: f64) std.math.Order {
     const floored_integer: i64 = @intFromFloat(floored);
     if (integer != floored_integer) return std.math.order(integer, floored_integer);
     return if (float == floored) .eq else .lt;
+}
+
+/// What a bare source token denotes, decided from its text alone.
+pub const Literal = union(enum) {
+    integer: i64,
+    float: f64,
+    atom: []const u8,
+};
+
+/// Classifies a bare token without interning it, which is what lets source
+/// be parsed with no database in view. Integer-shaped tokens outside the
+/// signed 64-bit range and float-shaped ones beyond the finite range report
+/// `NumericOverflow`; any other numeric-leading token is `InvalidSyntax`.
+/// A float that happens to be integral stays a float here — canonicalizing it
+/// is interning's job, so that a literal and a descriptor built by hand agree.
+pub fn classifyBare(literal: []const u8) error{ InvalidSyntax, NumericOverflow }!Literal {
+    if (isIntegerSyntax(literal)) {
+        const number = std.fmt.parseInt(i64, literal, 10) catch |err| switch (err) {
+            error.Overflow => return error.NumericOverflow,
+            else => unreachable,
+        };
+        return .{ .integer = number };
+    }
+    if (isFloatSyntax(literal)) {
+        const number = std.fmt.parseFloat(f64, literal) catch unreachable;
+        if (std.math.isInf(number)) return error.NumericOverflow;
+        return .{ .float = number };
+    }
+    if (isNumericLeading(literal)) return error.InvalidSyntax;
+    return .{ .atom = literal };
 }
 
 fn isIntegerSyntax(literal: []const u8) bool {

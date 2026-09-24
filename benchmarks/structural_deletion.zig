@@ -47,7 +47,7 @@ fn buildDatabase(allocator: std.mem.Allocator, names: *const Names) !LiveDatalog
     try database.addFact("chain", &.{input.list(&elements)});
     for (names.slices) |name| try database.addFact("allowed", &.{input.atom(name)});
 
-    var setup = try database.execute(program);
+    var setup = try database.execute(program, null);
     setup.deinit();
     try database.materialize();
     return database;
@@ -86,13 +86,13 @@ fn runShape(
         _ = try database.applyChanges(&.{}, &.{victim});
         // Query inside the timed region so a recompute decision cannot defer
         // its work past the measurement.
-        var deleted = try database.execute("deep(N)?");
+        var deleted = try database.execute("deep(N)?", null);
         deleted.deinit();
         delete_ns += @intCast(deletion_start.untilNow(io).raw.nanoseconds);
 
         const restore_start = std.Io.Clock.Timestamp.now(io, .awake);
         _ = try database.applyChanges(&.{victim}, &.{});
-        var restored = try database.execute("deep(N)?");
+        var restored = try database.execute("deep(N)?", null);
         restored.deinit();
         restore_ns += @intCast(restore_start.untilNow(io).raw.nanoseconds);
     }

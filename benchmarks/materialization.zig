@@ -34,15 +34,15 @@ pub fn main(init: std.process.Init) !void {
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\fanout(X, N) :- span(X, S), length(S, N).
         \\summary(S) :- seed(k), setof([X, N], fanout(X, N), S).
-    );
+    , null);
     setup.deinit();
 
-    var warmup = try database.execute("summary(S)?");
+    var warmup = try database.execute("summary(S)?", null);
     warmup.deinit();
 
     const start = std.Io.Clock.Timestamp.now(init.io, .awake);
     for (0..iterations) |_| {
-        var result = try database.execute("summary(S)?");
+        var result = try database.execute("summary(S)?", null);
         defer result.deinit();
         if (result.query.answers.items.len != 1) return error.UnexpectedResult;
     }

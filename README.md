@@ -91,7 +91,36 @@ pub fn main() !void {
 }
 ```
 
-Use `execute` to parse and run Datalog source directly. The `input` helpers
+Use `execute` to parse and run Datalog source directly. The whole program is
+parsed before any of it runs, so a syntax error leaves the database untouched;
+a statement that fails when it runs keeps every statement before it. Pass a
+`Diagnostic` to learn where a failure was:
+
+```zig
+var diagnostic: LiveDatalog.Diagnostic = .{};
+var result = database.execute(source, &diagnostic) catch |err| {
+    std.debug.print("{s} at {d}:{d}\n", .{ @errorName(err), diagnostic.line, diagnostic.column });
+    return err;
+};
+defer result.deinit();
+```
+
+The parser is also available on its own, needing no database. `parseProgram`,
+`parseRule` and `parseGoals` return the same `input` descriptors the helpers
+below build, owned by the returned `Parsed` value:
+
+```zig
+const rule = try LiveDatalog.parseRule(allocator, "reach(X, Z) :- edge(X, Y), reach(Y, Z)", null);
+defer rule.deinit();
+try database.addRule(.{ .relation = rule.value.head }, rule.value.body);
+
+const parsed = try LiveDatalog.parseProgram(allocator, "p(a). p(b). p(X)?", null);
+defer parsed.deinit();
+var answers = try database.executeStatements(parsed.value.statements, null);
+defer answers.deinit();
+```
+
+The `input` helpers
 construct typed atoms, integers, floats, variables, proper lists, cons cells,
 relations, negation, equality, comparisons, checked arithmetic, and `setof`.
 They allocate nothing and cannot fail. Database operations synchronously

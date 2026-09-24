@@ -21,9 +21,9 @@ fn buildDatabase(allocator: std.mem.Allocator) !LiveDatalog.Jatalog {
         const right = try std.fmt.bufPrint(&right_buffer, "n{d}", .{index + 1});
         try database.addFact("edge", &.{ LiveDatalog.input.atom(left), LiveDatalog.input.atom(right) });
     }
-    var setup = try database.execute(program);
+    var setup = try database.execute(program, null);
     setup.deinit();
-    var warmup = try database.execute("summary(S)?");
+    var warmup = try database.execute("summary(S)?", null);
     warmup.deinit();
     return database;
 }
@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
         defer database.deinit();
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
         for (0..iterations) |_| {
-            var result = try database.execute("summary(S)?");
+            var result = try database.execute("summary(S)?", null);
             defer result.deinit();
             if (result.query.answers.items.len != 1) return error.UnexpectedResult;
         }
@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
             const to = try std.fmt.bufPrint(&shortcut_to, "n{d}", .{index + 10});
             const shortcut: [2]LiveDatalog.input.Term = .{ input.atom(from), input.atom(to) };
             _ = try database.applyChanges(&.{input.fact("edge", &shortcut)}, &.{});
-            var result = try database.execute("summary(S)?");
+            var result = try database.execute("summary(S)?", null);
             defer result.deinit();
             if (result.query.answers.items.len != 1) return error.UnexpectedResult;
         }
@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
             const from = try std.fmt.bufPrint(&shortcut_from, "n{d}", .{index});
             const to = try std.fmt.bufPrint(&shortcut_to, "n{d}", .{index + 10});
             try database.addFact("edge", &.{ input.atom(from), input.atom(to) });
-            var result = try database.execute("summary(S)?");
+            var result = try database.execute("summary(S)?", null);
             defer result.deinit();
             if (result.query.answers.items.len != 1) return error.UnexpectedResult;
         }

@@ -38,11 +38,11 @@ pub const InternStats = struct {
 
 /// Where a database stood before one statement ran against it.
 ///
-/// A statement interns as it parses — across many calls, long before it knows
+/// A statement interns as it compiles — across many calls, long before it knows
 /// whether it will succeed — and that is the one thing it cannot undo where it
 /// happens. Everything else a statement does to a database it does in a single
-/// operation that either lands or does not: see `statement.addFactExpr` and
-/// `statement.addRuleClauses`, which take their own work back out on failure.
+/// operation that either lands or does not: see `transaction.addFactExpr` and
+/// `transaction.addRuleClauses`, which take their own work back out on failure.
 /// So this records the tables interning appends to, and `Database.rollback`
 /// checks the rest is where it left it.
 pub const Savepoint = struct {

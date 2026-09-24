@@ -102,7 +102,7 @@ fn loadWithParser(allocator: std.mem.Allocator, io: std.Io, source: []const u8) 
     defer database.deinit();
     const before = database.internStats();
     const start = std.Io.Clock.Timestamp.now(io, .awake);
-    var loaded = try database.execute(source);
+    var loaded = try database.execute(source, null);
     loaded.deinit();
     const elapsed: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
     return .between(elapsed, before, database.internStats());
@@ -124,7 +124,7 @@ fn materializeStructural(allocator: std.mem.Allocator, io: std.Io, names: *const
         \\prefix([], 0).
         \\prefix(H!T, N) :- prefix(T, M), allowed(H), N = M + 1.
         \\deep(N) :- prefix(L, N), N > 1.
-    );
+    , null);
     setup.deinit();
 
     const before = database.internStats();

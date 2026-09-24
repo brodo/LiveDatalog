@@ -40,14 +40,39 @@ pub const Rule = struct {
     body: []const Goal,
 };
 
+pub const ComparisonGoal = struct { kind: Comparison, operands: Binary };
+
+/// A built-in test under `not`, as in `not X < Y` or `not X = Y`. Only tests
+/// can be negated: arithmetic binds its output, and a negated goal binds
+/// nothing.
+pub const NegatedBuiltin = union(enum) {
+    equality: Binary,
+    inequality: Binary,
+    comparison: ComparisonGoal,
+};
+
 pub const Goal = union(enum) {
     relation: Relation,
     negation: Relation,
+    negated_builtin: NegatedBuiltin,
     equality: Binary,
     inequality: Binary,
-    comparison: struct { kind: Comparison, operands: Binary },
+    comparison: ComparisonGoal,
     arithmetic: struct { kind: Arithmetic, output: Term, left: Term, right: Term },
     aggregate: struct { template: Term, body: []const Goal, output: Term },
+};
+
+/// One top-level item of a program: what a parsed program is a sequence of,
+/// and what `Jatalog.executeStatements` runs. See "Statement" in CONTEXT.md.
+pub const Statement = union(enum) {
+    /// `p(a).` — asserts one ground base fact.
+    fact: Relation,
+    /// `h :- b.` — adds a rule to the program.
+    rule: Rule,
+    /// `b?` — answers the goals.
+    query: []const Goal,
+    /// `b~` — removes every base fact the goals' relational goals match.
+    retraction: []const Goal,
 };
 
 pub fn atom(value: []const u8) Term {
@@ -90,6 +115,11 @@ pub fn rule(head: Relation, body: []const Goal) Rule {
 
 pub fn not(predicate: []const u8, terms: []const Term) Goal {
     return .{ .negation = .{ .predicate = predicate, .terms = terms } };
+}
+
+/// `not` applied to a built-in test: `notBuiltin(.{ .comparison = ... })`.
+pub fn notBuiltin(builtin: NegatedBuiltin) Goal {
+    return .{ .negated_builtin = builtin };
 }
 
 pub fn equal(left: Term, right: Term) Goal {

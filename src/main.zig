@@ -57,14 +57,14 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len > 1) {
         const source = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], allocator, .unlimited);
-        return executeAndPrint(init.io, &database, source);
+        return executeAndPrint(init.io, &database, source) catch std.process.exit(1);
     }
 
     if (!(std.Io.File.stdin().isTty(init.io) catch false)) {
         var buffer: [4096]u8 = undefined;
         var reader = std.Io.File.stdin().readerStreaming(init.io, &buffer);
         const source = try reader.interface.allocRemaining(allocator, .unlimited);
-        return executeAndPrint(init.io, &database, source);
+        return executeAndPrint(init.io, &database, source) catch std.process.exit(1);
     }
 
     return repl(allocator, init, &database);
@@ -85,12 +85,19 @@ fn repl(allocator: std.mem.Allocator, init: std.process.Init, database: *LiveDat
         }
 
         try line_editor.history.add(line);
-        executeAndPrint(init.io, database, line) catch |err| try writeError(init.io, err);
+        // The error has already been reported, with where it happened.
+        executeAndPrint(init.io, database, line) catch continue;
     }
 }
 
+/// Runs `source` and prints its result, or reports why it failed and returns
+/// the error.
 fn executeAndPrint(io: std.Io, database: *LiveDatalog.Jatalog, source: []const u8) !void {
-    var result = try database.execute(source);
+    var diagnostic: LiveDatalog.Diagnostic = .{};
+    var result = database.execute(source, &diagnostic) catch |err| {
+        try writeError(io, err, source, diagnostic);
+        return err;
+    };
     defer result.deinit();
 
     var output_buffer: [4096]u8 = undefined;
@@ -131,12 +138,34 @@ fn writeHelpTo(writer: *std.Io.Writer) !void {
     try writer.writeAll(help_text);
 }
 
-fn writeError(io: std.Io, err: anyerror) !void {
+fn writeError(io: std.Io, err: anyerror, source: []const u8, diagnostic: LiveDatalog.Diagnostic) !void {
     var output_buffer: [256]u8 = undefined;
     var file_writer = std.Io.File.stderr().writer(io, &output_buffer);
     const writer = &file_writer.interface;
-    try writer.print("Error: {s}\n", .{@errorName(err)});
+    try writeErrorTo(writer, err, source, diagnostic);
     try writer.flush();
+}
+
+/// Names the error, says where it was, and — when it points into the source —
+/// shows the line with a caret under the offending bytes.
+fn writeErrorTo(
+    writer: *std.Io.Writer,
+    err: anyerror,
+    source: []const u8,
+    diagnostic: LiveDatalog.Diagnostic,
+) !void {
+    try writer.print("Error: {s}", .{@errorName(err)});
+    if (diagnostic.span != null) try writer.print(" at {d}:{d}", .{ diagnostic.line, diagnostic.column });
+    if (diagnostic.expected) |expected| try writer.print(", expected {s}", .{expected});
+    try writer.writeByte('\n');
+    const span = diagnostic.span orelse return;
+    const line_start = span.start + 1 - diagnostic.column;
+    const line_end = std.mem.findScalarPos(u8, source, line_start, '\n') orelse source.len;
+    try writer.print("  {s}\n  ", .{source[line_start..line_end]});
+    try writer.splatByteAll(' ', span.start - line_start);
+    const width = @max(1, @min(span.end, line_end) -| span.start);
+    try writer.splatByteAll('^', width);
+    try writer.writeByte('\n');
 }
 
 test {
@@ -152,4 +181,38 @@ test "REPL help prints the syntax reference" {
     try std.testing.expectEqualStrings(help_text, output.written());
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "% Fact") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "% Aggregate") != null);
+}
+
+test "errors show the offending line with a caret" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var database: LiveDatalog.Jatalog = .init(std.testing.allocator);
+    defer database.deinit();
+
+    const source = "p(a).\nq(a b).";
+    var diagnostic: LiveDatalog.Diagnostic = .{};
+    const err = if (database.execute(source, &diagnostic)) |_| unreachable else |err| err;
+    try writeErrorTo(&output.writer, err, source, diagnostic);
+    try std.testing.expectEqualStrings(
+        \\Error: InvalidSyntax at 2:5, expected ','
+        \\  q(a b).
+        \\      ^
+        \\
+    , output.written());
+
+    output.clearRetainingCapacity();
+    const unsafe = "p(a).\nq(X) :- p(Y).";
+    diagnostic = .{};
+    const rule_err = if (database.execute(unsafe, &diagnostic)) |_| unreachable else |rule_err| rule_err;
+    try writeErrorTo(&output.writer, rule_err, unsafe, diagnostic);
+    try std.testing.expectEqualStrings(
+        \\Error: InvalidRule at 2:1
+        \\  q(X) :- p(Y).
+        \\  ^^^^^^^^^^^^^
+        \\
+    , output.written());
+
+    output.clearRetainingCapacity();
+    try writeErrorTo(&output.writer, error.OutOfMemory, "", .{});
+    try std.testing.expectEqualStrings("Error: OutOfMemory\n", output.written());
 }

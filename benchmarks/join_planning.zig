@@ -107,20 +107,20 @@ fn run(init: std.process.Init, workload: Workload, policy: LiveDatalog.PlanPolic
     database.setPlanPolicy(policy);
     try load(&database, workload.data);
     if (workload.setup.len != 0) {
-        var setup = try database.execute(workload.setup);
+        var setup = try database.execute(workload.setup, null);
         setup.deinit();
     }
 
     // Materialize before timing so the closure build is not charged to the
     // first query; what is measured is solving the question, repeatedly.
-    var warmup = try database.execute(workload.question);
+    var warmup = try database.execute(workload.question, null);
     const observed = warmup.query.answers.items.len;
     warmup.deinit();
     if (observed != workload.answers) return error.UnexpectedResult;
 
     const start = std.Io.Clock.Timestamp.now(init.io, .awake);
     for (0..iterations) |_| {
-        var result = try database.execute(workload.question);
+        var result = try database.execute(workload.question, null);
         defer result.deinit();
         if (result.query.answers.items.len != workload.answers) return error.UnexpectedResult;
     }

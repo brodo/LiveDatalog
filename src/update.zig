@@ -180,7 +180,7 @@ const materialization = @import("materialization.zig");
 const validation = @import("validation.zig");
 
 /// Installs a rule from descriptors, which is the part of `addRuleClauses`
-/// these tests need. That function belongs to `statement.zig`, one layer above
+/// these tests need. That function belongs to `transaction.zig`, one layer above
 /// this one, so a test here cannot call it — and the parser is two above.
 fn defineRule(
     db: *database.Database,

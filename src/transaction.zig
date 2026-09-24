@@ -1,10 +1,10 @@
 //! What a statement does to a database, and the transaction it does it in.
 //!
-//! A source program is a sequence of statements, each of which either commits
+//! A program is a sequence of statements, each of which either commits
 //! completely or leaves the database exactly as it was. The operations here
-//! are the compiled form of those statements — they take clauses the parser
-//! has already built rather than caller descriptors — and `Statement` is the
-//! transaction that stages them.
+//! are the compiled form of those statements — they take clauses already
+//! compiled against the database rather than caller descriptors — and
+//! `Transaction` is what stages them.
 
 const std = @import("std");
 const compile = @import("compile.zig");
@@ -262,10 +262,10 @@ pub fn resolveRetraction(
 /// with a staged copy, applying a retraction's facts through the deletion
 /// engine — are not part of the public interface, because committing a foreign
 /// staging database is not an operation an embedder should be able to name.
-pub const Statement = struct {
-    /// What the next statement will turn out to be, as far as scanning for
-    /// its terminator can tell. Only whether it evaluates matters here.
-    pub const Kind = enum { assertion, query, retraction, end };
+pub const Transaction = struct {
+    /// What the statement is, as far as the transaction cares: only whether
+    /// it evaluates matters here.
+    pub const Kind = enum { assertion, query, retraction };
 
     database: *database.Database,
     staging: database.Database,
@@ -279,10 +279,10 @@ pub const Statement = struct {
     /// run of consecutive ones. A statement that evaluates needs the committed
     /// closure materialized first, so that the staged copy shares its value
     /// identifiers and evaluation never expands.
-    pub fn begin(db: *database.Database, kind: Kind) !Statement {
+    pub fn begin(db: *database.Database, kind: Kind) !Transaction {
         switch (kind) {
             .query, .retraction => try materialization.ensureMaterialized(db),
-            .assertion, .end => {},
+            .assertion => {},
         }
         return .{
             .database = db,
@@ -294,7 +294,7 @@ pub const Statement = struct {
     /// The database to execute the statement against. Everything it interns —
     /// including values a query mentions but the database does not hold — stays
     /// here unless the statement commits.
-    pub fn target(self: *Statement) *database.Database {
+    pub fn target(self: *Transaction) *database.Database {
         return &self.staging;
     }
 
@@ -308,13 +308,13 @@ pub const Statement = struct {
     /// rolled back to its own savepoint and the run is committed without it —
     /// which leaves every earlier statement and none of the failing one,
     /// exactly as a transaction each would.
-    pub fn savepoint(self: *Statement) database.Savepoint {
+    pub fn savepoint(self: *Transaction) database.Savepoint {
         return self.staging.savepoint();
     }
 
     /// Takes a statement that failed back out of the staging copy the
     /// statements before it are on. Allocates nothing.
-    pub fn rollback(self: *Statement, mark: database.Savepoint) void {
+    pub fn rollback(self: *Transaction, mark: database.Savepoint) void {
         self.staging.rollback(mark);
     }
 
@@ -325,13 +325,13 @@ pub const Statement = struct {
     /// second path there is nothing to spend on an allocation and no room for
     /// a second error to report — so the operation a run commits through is
     /// spelled as one that cannot fail.
-    pub fn commitAssertions(self: *Statement) void {
+    pub fn commitAssertions(self: *Transaction) void {
         self.database.commit(&self.staging);
     }
 
     /// Runs a retraction against the staging copy, keeping the base facts its
     /// goals resolved to for the commit. Returns whether it named any.
-    pub fn retract(self: *Statement, goals: []const syntax.Clause) !bool {
+    pub fn retract(self: *Transaction, goals: []const syntax.Clause) !bool {
         const resolved = try resolveRetraction(self.target(), goals);
         self.removed.deinit();
         self.removed = resolved;
@@ -343,7 +343,7 @@ pub const Statement = struct {
     /// database; an assertion installs the staged copy; a retraction applies
     /// the facts it resolved, so that they take the incremental deletion path,
     /// and discards the copy it resolved them on.
-    pub fn commit(self: *Statement, result: results.ExecutionResult) !void {
+    pub fn commit(self: *Transaction, result: results.ExecutionResult) !void {
         switch (result) {
             .query => {},
             .none => self.database.commit(&self.staging),
@@ -351,7 +351,7 @@ pub const Statement = struct {
         }
     }
 
-    pub fn deinit(self: *Statement) void {
+    pub fn deinit(self: *Transaction) void {
         self.removed.deinit();
         self.staging.deinit();
         self.* = undefined;
@@ -363,7 +363,8 @@ const input = @import("input.zig");
 
 /// Installs `reachable(X) :- node(X)`, which is enough of a rule for a
 /// retraction to have a derived consequence to lose. Built from descriptors
-/// rather than parsed, because the parser is the layer above this one.
+/// rather than parsed, because running parsed statements is the layer above
+/// this one.
 fn defineReachableRule(db: *database.Database) !void {
     const head = try compile.compileRelation(db, "reachable", &.{input.variable("X")}, false);
     const body = try compileGoal(db, "node", input.variable("X"));

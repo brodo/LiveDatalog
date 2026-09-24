@@ -101,3 +101,23 @@ built on top of them.
   code.
 - The rule is mechanically checkable and needs no exemption for tests: no file
   under `src/` may import one at or above its own level, `root.zig` included.
+
+## Addendum: parsing below the state
+
+Added 2026-09-24, when the parser became public. Parsing used to intern into
+the database it was pointed at, which put it at the top of the engine and
+fused it with running what it parsed. It is now two modules. `parser.zig`
+turns text into the borrowed `input` descriptors and imports nothing that
+holds state — only `input` and the database-free literal classifier in
+`scalar.zig` — so it sits at the bottom beside `input.zig`. `program.zig` runs
+`input` statements against a `*Database` through `transaction.zig` (formerly
+`statement.zig`) and sits where the parser used to. No new rule was needed:
+this is the existing one applied to a layer that turned out not to need the
+state at all.
+
+It also retires the reason the tests section above gives for keeping
+source-built tests in `root.zig`: parsing is no longer the top of the engine.
+A module at or above `program.zig` can build its database from source with
+`parser.parseProgram` and `program.execute`, as `program.zig`'s own tests do.
+The tests still in `root.zig` for that reason can move down; moving them is a
+separate change.

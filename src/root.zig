@@ -25,12 +25,13 @@ const materialization = @import("materialization.zig");
 const monotonicity = @import("monotonicity.zig");
 const parser = @import("parser.zig");
 const planner = @import("planner.zig");
+const program_runner = @import("program.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const scalar = @import("scalar.zig");
-const statement = @import("statement.zig");
 const update = @import("update.zig");
 const string_table = @import("string_table.zig");
+const transaction = @import("transaction.zig");
 const syntax = @import("syntax.zig");
 const test_support = @import("test_support.zig");
 const validation = @import("validation.zig");
@@ -51,7 +52,24 @@ pub const MaintenancePolicy = cost_model.MaintenancePolicy;
 pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
 pub const InternStats = database.InternStats;
-pub const Statement = statement.Statement;
+/// One statement's transaction: what a front end runs a statement in.
+pub const Transaction = transaction.Transaction;
+
+/// Where a parse or a program run failed. See `parseProgram` and `execute`.
+pub const Diagnostic = parser.Diagnostic;
+/// A byte range of source text.
+pub const Span = parser.Span;
+/// A parse result together with the arena its descriptors borrow from.
+pub const Parsed = parser.Parsed;
+/// A parsed program: its statements, and the span of source each came from.
+pub const Program = parser.Program;
+/// Parses a whole program into `input.Statement`s without a database. Run the
+/// result with `Jatalog.executeStatements`.
+pub const parseProgram = parser.parseProgram;
+/// Parses one rule, for `addRule`, `defineView` or a fold's query program.
+pub const parseRule = parser.parseRule;
+/// Parses a list of goals, for `query`, `retract`, `explainQuery` or `foldQuery`.
+pub const parseGoals = parser.parseGoals;
 
 /// A view this database's catalog holds, as `defineView` handed it back.
 pub const ViewId = fold_ir.ViewId;
@@ -68,7 +86,7 @@ pub const Guarantee = folding.Guarantee;
 /// The engine's state is `state`, and every operation here is expressed in
 /// terms of the layers that act on it. Those layers are not part of this
 /// interface: an embedder drives the database through these methods, and a
-/// statement front end additionally through `Statement`.
+/// statement front end additionally through `Transaction`.
 pub const Jatalog = struct {
     state: database.Database,
     /// What a fold of a query against this database is allowed to read.
@@ -119,30 +137,18 @@ pub const Jatalog = struct {
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const input.Term) !void {
         var staging = try self.state.clone();
         defer staging.deinit();
-        const expression = try compile.compileRelation(&staging, predicate, terms, false);
-        defer syntax.freeExpr(staging.allocator, expression);
-        try statement.addFactExpr(&staging, expression);
+        try program_runner.addFact(&staging, input.fact(predicate, terms));
         self.state.commit(&staging);
     }
 
     pub fn addRule(self: *Jatalog, head: input.Goal, body: []const input.Goal) !void {
-        var staging = try self.state.clone();
-        defer staging.deinit();
-        const compiled_head = switch (head) {
-            .relation => |relation| try compile.compileRelation(&staging, relation.predicate, relation.terms, false),
+        const relation = switch (head) {
+            .relation => |relation| relation,
             else => return errors.Error.InvalidRule,
         };
-        var head_owned = true;
-        defer if (head_owned) syntax.freeExpr(staging.allocator, compiled_head);
-        const compiled_body = try compile.compileGoals(&staging, body);
-        var body_owned = true;
-        defer {
-            if (body_owned) for (compiled_body) |clause| syntax.freeClauseTree(staging.allocator, clause);
-            staging.allocator.free(compiled_body);
-        }
-        try statement.addRuleClauses(&staging, compiled_head, compiled_body);
-        head_owned = false;
-        body_owned = false;
+        var staging = try self.state.clone();
+        defer staging.deinit();
+        try program_runner.addRule(&staging, input.rule(relation, body));
         self.state.commit(&staging);
     }
 
@@ -162,7 +168,7 @@ pub const Jatalog = struct {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
-        return statement.queryClauses(&staging, compiled);
+        return transaction.queryClauses(&staging, compiled);
     }
 
     /// Charges this database with what evaluating on a staging copy cost,
@@ -192,10 +198,10 @@ pub const Jatalog = struct {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
-        var removed = try statement.resolveRetraction(&staging, compiled);
+        var removed = try transaction.resolveRetraction(&staging, compiled);
         defer removed.deinit();
         if (removed.len() == 0) return false;
-        try statement.commitRetraction(&self.state, &removed);
+        try transaction.commitRetraction(&self.state, &removed);
         return true;
     }
 
@@ -304,7 +310,7 @@ pub const Jatalog = struct {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
-        return statement.explainClauses(&staging, compiled);
+        return transaction.explainClauses(&staging, compiled);
     }
 
     /// Declares a view a fold may reason about: what it is defined by, and
@@ -580,7 +586,7 @@ pub const Jatalog = struct {
         // The reconstruction is kept, so its counter is cumulative and only
         // this call's share of it belongs here.
         const work_before = entry.reconstruction.?.eval.cost.work;
-        const answers = try statement.queryClauses(
+        const answers = try transaction.queryClauses(
             &entry.reconstruction.?,
             entry.executable.?.goals,
         );
@@ -594,7 +600,7 @@ pub const Jatalog = struct {
     /// and the relations those rules reconstruct already derived.
     ///
     /// Deriving here rather than leaving it to `queryClauses` is the whole of
-    /// the split. `statement.evaluateClauses` materializes on its way to
+    /// the split. `transaction.evaluateClauses` materializes on its way to
     /// solving, so a caller that lets it do both cannot tell the two phases
     /// apart, let alone keep one of them; done here, the closure is clean
     /// before any goal is solved and a later call finds it that way.
@@ -609,7 +615,7 @@ pub const Jatalog = struct {
         errdefer staged.deinit();
         for (executable.rules) |rule| {
             const copy = try syntax.cloneRule(staged.allocator, rule);
-            statement.addRuleClauses(&staged, copy.head, copy.body) catch |err| {
+            transaction.addRuleClauses(&staged, copy.head, copy.body) catch |err| {
                 syntax.freeRule(staged.allocator, copy);
                 return err;
             };
@@ -818,9 +824,39 @@ pub const Jatalog = struct {
         return self.state.internStats();
     }
 
-    pub fn execute(self: *Jatalog, source: []const u8) !results.ExecutionResult {
-        var statement_parser: parser.Parser = .{ .jatalog = &self.state, .source = source };
-        return statement_parser.executeAll();
+    /// Parses `source` and runs it, returning the last statement's result.
+    ///
+    /// The whole program is parsed before any of it runs, so a syntax error
+    /// anywhere leaves the database untouched. A statement that fails when it
+    /// runs keeps every statement before it and none of itself. On failure,
+    /// `diagnostic` says where: the offending token for a syntax error, the
+    /// failing statement for any other.
+    pub fn execute(
+        self: *Jatalog,
+        source: []const u8,
+        diagnostic: ?*Diagnostic,
+    ) !results.ExecutionResult {
+        const parsed = try parser.parseProgram(self.state.allocator, source, diagnostic);
+        defer parsed.deinit();
+        return program_runner.execute(
+            &self.state,
+            parsed.value.statements,
+            .{ .text = source, .spans = parsed.value.spans },
+            diagnostic,
+        );
+    }
+
+    /// Runs statements — parsed by `parseProgram` or built by hand — in
+    /// order, returning the last one's result. Consecutive facts and rules
+    /// share one transaction, which is what makes loading many facts cheap; a
+    /// statement that fails keeps every statement before it and none of
+    /// itself, and `diagnostic` names it by index.
+    pub fn executeStatements(
+        self: *Jatalog,
+        statements: []const input.Statement,
+        diagnostic: ?*Diagnostic,
+    ) !results.ExecutionResult {
+        return program_runner.execute(&self.state, statements, null, diagnostic);
     }
 };
 
@@ -1184,11 +1220,14 @@ test {
     _ = list_functions;
     _ = maintenance;
     _ = monotonicity;
+    _ = parser;
+    _ = program_runner;
     _ = relation_store;
     _ = scalar;
     _ = string_table;
     _ = syntax;
     _ = test_support;
+    _ = transaction;
     _ = validation;
     _ = view_catalog;
 }
@@ -1197,7 +1236,7 @@ test {
 /// assertion needs `execute`, so unlike the rest of `test_support` it cannot
 /// live below the interface.
 fn expectAnswerCount(db: *Jatalog, source: []const u8, expected: usize) !void {
-    var result = try db.execute(source);
+    var result = try db.execute(source, null);
     defer result.deinit();
     try std.testing.expectEqual(expected, result.query.answers.items.len);
 }
@@ -1218,7 +1257,7 @@ test "recursive query and numeric builtins" {
         \\ancestor(X, Y) :- parent(X, Y).
         \\ancestor(X, Y) :- ancestor(X, Z), parent(Z, Y).
         \\ancestor(X, carol), X != carol?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
 }
@@ -1230,10 +1269,10 @@ test "stratified negation and retraction" {
         \\person(alice). person(bob). employed(alice).
         \\idle(X) :- person(X), not employed(X).
         \\idle(X)?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     result.deinit();
-    result = try db.execute("person(bob)~");
+    result = try db.execute("person(bob)~", null);
     defer result.deinit();
     try std.testing.expect(result.changed);
 }
@@ -1244,7 +1283,7 @@ test "negative recursion is rejected" {
     try std.testing.expectError(errors.Error.NotStratified, db.execute(
         \\p(X) :- q(X).
         \\q(X) :- not p(X), seed(X).
-    ));
+    , null));
 }
 
 test "repeated queries reuse the persistent closure without expansion" {
@@ -1254,7 +1293,7 @@ test "repeated queries reuse the persistent closure without expansion" {
         \\edge(a, b). edge(b, c). edge(c, d).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try std.testing.expectEqual(@as(usize, 0), db.state.eval.expansions);
 
@@ -1287,7 +1326,7 @@ test "persistent closure equals a fresh naive rebuild" {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\numchildren(X, N) :- children(X, S), length(S, N).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "numchildren(alice, 1)?", 1);
     try std.testing.expect(db.state.materialization == .clean);
@@ -1309,19 +1348,19 @@ test "base updates and rule additions rebuild the closure correctly" {
         \\edge(a, b). edge(b, c).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(a, c)?", 1);
 
     // A base insertion marks the closure dirty and the next query repairs it.
-    var inserted = try db.execute("edge(c, d).");
+    var inserted = try db.execute("edge(c, d).", null);
     inserted.deinit();
     try std.testing.expect(db.state.materialization == .dirty_from_stratum);
     try expectAnswerCount(&db, "path(a, d)?", 1);
     try std.testing.expect(db.state.materialization == .clean);
 
     // Retraction removes derived consequences through the dirty rebuild.
-    var retracted = try db.execute("edge(a, b)~");
+    var retracted = try db.execute("edge(a, b)~", null);
     retracted.deinit();
     try expectAnswerCount(&db, "path(a, c)?", 0);
     try expectAnswerCount(&db, "path(b, d)?", 1);
@@ -1335,7 +1374,7 @@ test "base updates and rule additions rebuild the closure correctly" {
     try expectAnswerCount(&db, "path(b, e)?", 0);
 
     // Rule addition invalidates from the new head's stratum.
-    var extended = try db.execute("reach(X) :- path(b, X).");
+    var extended = try db.execute("reach(X) :- path(b, X).", null);
     extended.deinit();
     try std.testing.expect(db.state.materialization == .dirty_from_stratum);
     try expectAnswerCount(&db, "reach(d)?", 1);
@@ -1349,7 +1388,7 @@ test "dirty stratum rebuild skips clean lower strata" {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\note(X) :- flag(X), not path(a, X).
-    );
+    , null);
     setup.deinit();
     // First materialization runs both strata.
     try expectAnswerCount(&db, "note(a)?", 1);
@@ -1357,13 +1396,13 @@ test "dirty stratum rebuild skips clean lower strata" {
     try std.testing.expectEqual(@as(usize, 2), full_build);
 
     // Only the negation stratum reads flag, so its update rebuilds one level.
-    var flagged = try db.execute("flag(c).");
+    var flagged = try db.execute("flag(c).", null);
     flagged.deinit();
     try expectAnswerCount(&db, "note(X)?", 1);
     try std.testing.expectEqual(full_build + 1, db.state.eval.expansions);
 
     // An edge update dirties the recursive stratum and rebuilds both levels.
-    var edged = try db.execute("edge(c, d).");
+    var edged = try db.execute("edge(c, d).", null);
     edged.deinit();
     try expectAnswerCount(&db, "note(X)?", 1);
     try std.testing.expectEqual(full_build + 3, db.state.eval.expansions);
@@ -1391,17 +1430,17 @@ fn materializationAllocationScenario(allocator: std.mem.Allocator) !void {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
-    );
+    , null);
     setup.deinit();
-    var first = try db.execute("summary(S)?");
+    var first = try db.execute("summary(S)?", null);
     first.deinit();
-    var inserted = try db.execute("edge(c, d).");
+    var inserted = try db.execute("edge(c, d).", null);
     inserted.deinit();
-    var second = try db.execute("path(a, d)?");
+    var second = try db.execute("path(a, d)?", null);
     second.deinit();
-    var retracted = try db.execute("edge(c, d)~");
+    var retracted = try db.execute("edge(c, d)~", null);
     retracted.deinit();
-    var third = try db.execute("path(a, d)?");
+    var third = try db.execute("path(a, d)?", null);
     defer third.deinit();
     if (third.query.answers.items.len != 0) return error.UnexpectedAnswer;
 }
@@ -1421,7 +1460,7 @@ test "materialize rebuild and stats form the explicit maintenance API" {
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\group(g). member(g, m1).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
+    , null);
     setup.deinit();
 
     // Maintenance is lazy until asked: nothing is materialized yet.
@@ -1453,7 +1492,7 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     // fact matching a goal, which exact-fact batch deletion cannot express.
     try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
     try expectAnswerCount(&db, "path(a, d)?", 1);
-    var executed = try db.execute("edge(d, e).");
+    var executed = try db.execute("edge(d, e).", null);
     executed.deinit();
     try expectAnswerCount(&db, "path(a, e)?", 1);
     try std.testing.expect(try db.retract(&.{
@@ -1484,7 +1523,7 @@ test "materialize rebuild and stats form the explicit maintenance API" {
     try std.testing.expect(try db.applyChanges(&.{
         input.fact("member", &.{ input.atom("g"), input.atom("m2") }),
     }, &.{}));
-    var collected = try db.execute("collected(g, S)?");
+    var collected = try db.execute("collected(g, S)?", null);
     try test_support.expectBindingValue(&collected.query.answers.items[0], "S", "[m1, m2]");
     collected.deinit();
     try std.testing.expect(db.maintenanceStats().maintained_groups > before_member.maintained_groups);
@@ -1512,7 +1551,7 @@ test "lists round trip through queries and nested terms unify structurally" {
     var result = try db.execute(
         \\nested([a, [b, []]]).
         \\nested(X)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "X", "[a, [b, []]]");
@@ -1524,7 +1563,7 @@ test "repeated variables inside structures enforce equality" {
     var result = try db.execute(
         \\pair([a, [a]]). pair([a, [b]]).
         \\pair([X, [X]])?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqualStrings("a", try result.query.answers.items[0].getAtom("X"));
@@ -1533,10 +1572,10 @@ test "repeated variables inside structures enforce equality" {
 test "facts reject variables at every structural depth" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(errors.Error.InvalidFact, db.execute("bad([a, X])."));
-    try std.testing.expectError(errors.Error.InvalidFact, db.execute("bad(a!T)."));
+    try std.testing.expectError(errors.Error.InvalidFact, db.execute("bad([a, X]).", null));
+    try std.testing.expectError(errors.Error.InvalidFact, db.execute("bad(a!T).", null));
 
-    var result = try db.execute("improper(a!b). improper(X)?");
+    var result = try db.execute("improper(a!b). improper(X)?", null);
     defer result.deinit();
     try test_support.expectBindingValue(&result.query.answers.items[0], "X", "cons(a, b)");
 }
@@ -1548,7 +1587,7 @@ test "ground values have a deterministic structural total order" {
         \\value(z). value(a). value('1'). value(-2). value(10). value(2). value([]).
         \\value([-1]). value(cons(a, z)). value([a]). value([a, b]).
         \\setof(X, value(X), S)?
-    );
+    , null);
     defer result.deinit();
     try test_support.expectBindingValue(
         &result.query.answers.items[0],
@@ -1563,7 +1602,7 @@ test "correlated aggregate clauses parse and validate without evaluation" {
     var result = try db.execute(
         \\person(alice). parent(alice, bob). passed(bob).
         \\children(X, S) :- person(X), setof([Y, X], (parent(X, Y), passed(Y)), S).
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), db.state.eval.rules.items.len);
     try std.testing.expect(db.state.eval.rules.items[0].body[0] == .relational);
@@ -1579,7 +1618,7 @@ test "rule bodies classify every clause kind distinctly" {
     var result = try db.execute(
         \\seed(a).
         \\classified(X, S) :- seed(X), X = X, not blocked(X), setof(Y, item(X, Y), S).
-    );
+    , null);
     defer result.deinit();
     const body = db.state.eval.rules.items[0].body;
     try std.testing.expect(body[0] == .relational);
@@ -1593,9 +1632,11 @@ test "aggregate safety rejects unbound correlations and escaping locals" {
     defer db.deinit();
     try std.testing.expectError(errors.Error.InvalidRule, db.execute(
         "bad(X, S) :- setof(Y, parent(X, Y), S).",
+        null,
     ));
     try std.testing.expectError(errors.Error.InvalidRule, db.execute(
         "bad(Y, S) :- seed(k), setof(Y, parent(X, Y), S).",
+        null,
     ));
 }
 
@@ -1605,7 +1646,7 @@ test "aggregate output binds head variables and aggregate locals stay local" {
     var result = try db.execute(
         \\seed(k).
         \\all_parents(S) :- seed(k), setof([X, Y], parent(X, Y), S).
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), db.state.eval.rules.items.len);
 }
@@ -1616,7 +1657,7 @@ test "nested aggregates are represented directly and validate recursively" {
     var result = try db.execute(
         \\seed(k).
         \\grouped(S) :- seed(k), setof(T, (group(G), setof(Y, parent(G, Y), T)), S).
-    );
+    , null);
     defer result.deinit();
     const outer = db.state.eval.rules.items[0].body[1].aggregate;
     try std.testing.expectEqual(@as(usize, 2), outer.body.len);
@@ -1629,7 +1670,7 @@ test "direct and indirect recursion through aggregation are rejected" {
     try std.testing.expectError(errors.Error.NotStratified, direct.execute(
         \\seed(k).
         \\p(S) :- seed(k), setof(X, p(X), S).
-    ));
+    , null));
 
     var indirect: Jatalog = .init(std.testing.allocator);
     defer indirect.deinit();
@@ -1637,7 +1678,7 @@ test "direct and indirect recursion through aggregation are rejected" {
         \\seed(k).
         \\p(S) :- seed(k), setof(X, q(X), S).
         \\q(X) :- p(X).
-    ));
+    , null));
 }
 
 test "positive recursion may complete below an aggregate stratum" {
@@ -1648,7 +1689,7 @@ test "positive recursion may complete below an aggregate stratum" {
         \\reachable(X, Y) :- edge(X, Y).
         \\reachable(X, Y) :- reachable(X, Z), edge(Z, Y).
         \\all_reachable(S) :- seed(k), setof([X, Y], reachable(X, Y), S).
-    );
+    , null);
     defer result.deinit();
     var levels = try db.state.eval.computeStrata();
     defer levels.deinit(std.testing.allocator);
@@ -1665,7 +1706,7 @@ test "negation and aggregate strict edges share one dependency graph" {
         \\seed(a). excluded(b).
         \\allowed(X) :- seed(X), not excluded(X).
         \\summary(S) :- seed(a), setof(X, allowed(X), S).
-    );
+    , null);
     defer result.deinit();
     var levels = try db.state.eval.computeStrata();
     defer levels.deinit(std.testing.allocator);
@@ -1686,7 +1727,7 @@ test "grouped setof is sorted, deduplicated, and includes empty groups" {
         \\child(X, Y) :- from_right(X, Y).
         \\children(X, S) :- person(X), setof(Y, child(X, Y), S).
         \\children(X, S)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
     for (result.query.answers.items) |*answer| {
@@ -1702,7 +1743,7 @@ test "grouped setof is sorted, deduplicated, and includes empty groups" {
 test "setof evaluates directly in queries" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var result = try db.execute("item(c). item(a). setof(X, item(X), S)?");
+    var result = try db.execute("item(c). item(a). setof(X, item(X), S)?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a, c]");
@@ -1717,7 +1758,7 @@ test "setof sees completed recursive strata and preserves structural templates" 
         \\reachable(X, Y) :- reachable(X, Z), edge(Z, Y).
         \\all(S) :- seed(k), setof([Y, X], reachable(X, Y), S).
         \\all(S)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(
@@ -1735,7 +1776,7 @@ test "nested and multiple setof goals evaluate from correlated bindings" {
         \\summary(All, Groups) :- seed(k), setof(X, item(g1, X), All),
         \\  setof([G, S], (group(G), setof(X, item(G, X), S)), Groups).
         \\summary(All, Groups)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "All", "[a, b]");
@@ -1749,9 +1790,9 @@ test "setof recomputes after retraction" {
         \\seed(k). item(b). item(a).
         \\items(S) :- seed(k), setof(X, item(X), S).
         \\item(b)~
-    );
+    , null);
     result.deinit();
-    result = try db.execute("items(S)?");
+    result = try db.execute("items(S)?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a]");
@@ -1765,7 +1806,7 @@ test "setof ordering is independent of insertion and rule order" {
         \\value(X) :- base(X).
         \\values(S) :- seed(k), setof(X, value(X), S).
         \\values(S)?
-    );
+    , null);
     defer first_result.deinit();
 
     var second: Jatalog = .init(std.testing.allocator);
@@ -1775,7 +1816,7 @@ test "setof ordering is independent of insertion and rule order" {
         \\values(S) :- seed(k), setof(X, value(X), S).
         \\value(X) :- base(X).
         \\values(S)?
-    );
+    , null);
     defer second_result.deinit();
 
     const first_value = try first_result.query.answers.items[0].getValue("S");
@@ -1794,7 +1835,7 @@ fn aggregateEvaluationAllocationScenario(allocator: std.mem.Allocator) !void {
         \\group(g1). group(g2). item(g1, b). item(g1, a).
         \\grouped(Groups) :- group(g1), setof([G, S], (group(G), setof(X, item(G, X), S)), Groups).
         \\grouped(Groups)?
-    );
+    , null);
     defer result.deinit();
 }
 
@@ -1809,9 +1850,9 @@ fn floatAllocationScenario(allocator: std.mem.Allocator) !void {
         \\measure(a, 2.5). measure(b, 1e-3). measure(c, 4.0).
         \\small(X) :- measure(X, V), V < 3.
         \\setof([X, V], measure(X, V), S)?
-    );
+    , null);
     result.deinit();
-    var overflow = db.execute("measure(d, 1e400).") catch |err| switch (err) {
+    var overflow = db.execute("measure(d, 1e400).", null) catch |err| switch (err) {
         errors.Error.NumericOverflow => return,
         else => return err,
     };
@@ -1830,10 +1871,11 @@ fn mixedArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
         \\measure(a, 2.5). measure(b, 0.5).
         \\shifted(X, S) :- measure(X, V), S = V + 0.5.
         \\setof([X, S], shifted(X, S), Out)?
-    );
+    , null);
     result.deinit();
     var overflow = db.execute(
         "N = 1.7976931348623157e308 + 1.7976931348623157e308?",
+        null,
     ) catch |err| switch (err) {
         errors.Error.NumericOverflow => return,
         else => return err,
@@ -1860,26 +1902,26 @@ test "recursive list length and sum use checked integer arithmetic" {
         \\sum(H!T, N) :- sum(T, M), N = M + H.
         \\total(N) :- numbers(S), sum(S, N).
         \\numchildren(X, N)?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
     result.deinit();
 
-    result = try db.execute("total(N)?");
+    result = try db.execute("total(N)?", null);
     try std.testing.expectEqual(@as(i64, 6), try result.query.answers.items[0].getInteger("N"));
     result.deinit();
 
-    result = try db.execute("person(alice), 3 = 1 + 2, -2 = 1 - 3?");
+    result = try db.execute("person(alice), 3 = 1 + 2, -2 = 1 - 3?", null);
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     result.deinit();
 
-    result = try db.execute("person(alice), 4 = 1 + 2?");
+    result = try db.execute("person(alice), 4 = 1 + 2?", null);
     try std.testing.expectEqual(@as(usize, 0), result.query.answers.items.len);
     result.deinit();
 
-    try std.testing.expectError(errors.Error.NumericType, db.execute("person(alice), N = nope + 1?"));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("person(alice), N = nope + 1?", null));
     try std.testing.expectError(
         errors.Error.NumericOverflow,
-        db.execute("person(alice), N = 9223372036854775807 + 1?"),
+        db.execute("person(alice), N = 9223372036854775807 + 1?", null),
     );
 }
 
@@ -1891,7 +1933,7 @@ test "ground list query inputs seed recursive evaluation" {
         \\sum([], 0).
         \\sum(H!T, N) :- sum(T, M), N = M + H.
         \\sum([3, 3, 3], Total)?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqual(@as(i64, 9), try result.query.answers.items[0].getInteger("Total"));
     result.deinit();
@@ -1900,7 +1942,7 @@ test "ground list query inputs seed recursive evaluation" {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\length([a, b, c], Count)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqual(@as(i64, 3), try result.query.answers.items[0].getInteger("Count"));
@@ -1915,13 +1957,13 @@ test "ground list query inputs seed recursive evaluation" {
     try std.testing.expectEqual(@as(i64, 9), try query_result.answers.items[0].getInteger("total"));
     try std.testing.expectEqual(value_count_before_typed_query, db.state.eval.values.values.items.len);
 
-    var open_result = try db.execute("sum(Input, Total)?");
+    var open_result = try db.execute("sum(Input, Total)?", null);
     defer open_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), open_result.query.answers.items.len);
     try test_support.expectBindingValue(&open_result.query.answers.items[0], "Input", "[]");
     try std.testing.expectEqual(@as(i64, 0), try open_result.query.answers.items[0].getInteger("Total"));
 
-    var structural_result = try db.execute("Value = [a, b]?");
+    var structural_result = try db.execute("Value = [a, b]?", null);
     defer structural_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), structural_result.query.answers.items.len);
     try test_support.expectBindingValue(&structural_result.query.answers.items[0], "Value", "[a, b]");
@@ -1939,11 +1981,11 @@ test "member and collectfirst are ordinary admissible list relations" {
         \\score(s1, 10). score(s2, 10). score(s3, 20). seed(k).
         \\bag(S) :- seed(k), setof([Score, Student], score(Student, Score), Pairs), collectfirst(Pairs, S).
         \\items(S), member(X, S)?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 3), result.query.answers.items.len);
     result.deinit();
 
-    result = try db.execute("bag(S)?");
+    result = try db.execute("bag(S)?", null);
     const value = try result.query.answers.items[0].getValue("S");
     const text = try value.formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(text);
@@ -1956,7 +1998,7 @@ test "structurally growing recursion is not admissible" {
     defer db.deinit();
     try std.testing.expectError(errors.Error.NotAdmissible, db.execute(
         \\q([X]) :- q(X).
-    ));
+    , null));
 }
 
 test "non-recursive rules may construct structural head values" {
@@ -1966,7 +2008,7 @@ test "non-recursive rules may construct structural head values" {
         \\item(a).
         \\wrapped([X]) :- item(X).
         \\wrapped(Value)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
@@ -1980,7 +2022,7 @@ test "structurally recursive rules retain their proven input seed" {
         \\p([a]).
         \\p(H!T) :- base(H), p(T).
         \\p(Value)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "Value", "[a]");
@@ -1992,7 +2034,7 @@ test "recursive arithmetic generators are not admissible" {
     try std.testing.expectError(errors.Error.NotAdmissible, direct.execute(
         \\number(0).
         \\number(N) :- number(M), N = M + 1.
-    ));
+    , null));
 
     var indirect: Jatalog = .init(std.testing.allocator);
     defer indirect.deinit();
@@ -2000,7 +2042,7 @@ test "recursive arithmetic generators are not admissible" {
         \\left(0).
         \\left(N) :- right(N).
         \\right(N) :- left(M), N = M + 1.
-    ));
+    , null));
 }
 
 fn recursiveArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
@@ -2010,7 +2052,7 @@ fn recursiveArithmeticAllocationScenario(allocator: std.mem.Allocator) !void {
         \\left(0).
         \\left(N) :- right(N).
         \\right(N) :- left(M), N = M + 1.
-    ) catch |err| switch (err) {
+    , null) catch |err| switch (err) {
         errors.Error.NotAdmissible => return,
         else => return err,
     };
@@ -2049,7 +2091,7 @@ test "recursive list construction outside a proven self-call is not admissible" 
     for (rejected) |program| {
         var db: Jatalog = .init(std.testing.allocator);
         defer db.deinit();
-        try std.testing.expectError(errors.Error.NotAdmissible, db.execute(program));
+        try std.testing.expectError(errors.Error.NotAdmissible, db.execute(program, null));
     }
 
     // Mutual recursion that builds nothing is ordinary Datalog and stays.
@@ -2061,7 +2103,7 @@ test "recursive list construction outside a proven self-call is not admissible" 
         \\even(X) :- odd(Y), step(Y, X).
         \\odd(X) :- even(Y), step(Y, X).
         \\even(X)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
 }
@@ -2156,15 +2198,15 @@ test "aggregate retraction is correct across the complete language tour" {
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\numchildren(X, N) :- children(X, S), length(S, N).
         \\numchildren(X, N)?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 2), result.query.answers.items.len);
     result.deinit();
 
-    result = try db.execute("parent(alice, bob)~");
+    result = try db.execute("parent(alice, bob)~", null);
     try std.testing.expect(result.changed);
     result.deinit();
 
-    result = try db.execute("children(alice, S), numchildren(alice, N)?");
+    result = try db.execute("children(alice, S), numchildren(alice, N)?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[]");
@@ -2174,20 +2216,20 @@ test "aggregate retraction is correct across the complete language tour" {
 test "public errors distinguish each aggregation failure boundary" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(errors.Error.InvalidSyntax, db.execute("broken([a)."));
+    try std.testing.expectError(errors.Error.InvalidSyntax, db.execute("broken([a).", null));
     try std.testing.expectError(
         errors.Error.InvalidRule,
-        db.execute("bad(X, S) :- setof(Y, parent(X, Y), S)."),
+        db.execute("bad(X, S) :- setof(Y, parent(X, Y), S).", null),
     );
     try std.testing.expectError(
         errors.Error.NotStratified,
-        db.execute("seed(k). cycle(S) :- seed(k), setof(X, cycle(X), S)."),
+        db.execute("seed(k). cycle(S) :- seed(k), setof(X, cycle(X), S).", null),
     );
     try std.testing.expectError(
         errors.Error.InvalidQuery,
         db.query(&.{input.add(input.variable("x"), input.variable("y"), input.integer(1))}),
     );
-    try std.testing.expectError(errors.Error.NotAdmissible, db.execute("grow([X]) :- grow(X)."));
+    try std.testing.expectError(errors.Error.NotAdmissible, db.execute("grow([X]) :- grow(X).", null));
 }
 
 test "public source interface canonicalizes the complete i64 domain" {
@@ -2198,7 +2240,7 @@ test "public source interface canonicalizes the complete i64 domain" {
         \\number(1). number(01). number(+1).
         \\number(-9223372036854775808). number(9223372036854775807).
         \\setof(X, number(X), Values)?
-    );
+    , null);
     defer result.deinit();
     try test_support.expectBindingValue(
         &result.query.answers.items[0],
@@ -2206,23 +2248,23 @@ test "public source interface canonicalizes the complete i64 domain" {
         "[-9223372036854775808, 0, 1, 9223372036854775807]",
     );
 
-    try std.testing.expectError(errors.Error.NumericOverflow, db.execute("number(9223372036854775808)."));
-    try std.testing.expectError(errors.Error.NumericOverflow, db.execute("number(-9223372036854775809)."));
+    try std.testing.expectError(errors.Error.NumericOverflow, db.execute("number(9223372036854775808).", null));
+    try std.testing.expectError(errors.Error.NumericOverflow, db.execute("number(-9223372036854775809).", null));
 }
 
 test "mixed numeric comparison and query-local float literals" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var less = try db.execute("1.5 < 2?");
+    var less = try db.execute("1.5 < 2?", null);
     defer less.deinit();
     try std.testing.expectEqual(@as(usize, 1), less.query.answers.items.len);
 
-    var greater = try db.execute("2 < 1.5?");
+    var greater = try db.execute("2 < 1.5?", null);
     defer greater.deinit();
     try std.testing.expectEqual(@as(usize, 0), greater.query.answers.items.len);
 
     const scalar_count = db.state.eval.scalars.values.items.len;
-    var bound = try db.execute("X = 2.5?");
+    var bound = try db.execute("X = 2.5?", null);
     const spelled = try (try bound.query.answers.items[0].getValue("X"))
         .formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(spelled);
@@ -2235,21 +2277,21 @@ test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
 
-    var promoted = try db.execute("X = 1.5 + 1?");
+    var promoted = try db.execute("X = 1.5 + 1?", null);
     const spelled = try (try promoted.query.answers.items[0].getValue("X"))
         .formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(spelled);
     try std.testing.expectEqualStrings("2.5", spelled);
     promoted.deinit();
 
-    var integral = try db.execute("X = 1.5 + 2.5?");
+    var integral = try db.execute("X = 1.5 + 2.5?", null);
     defer integral.deinit();
     try std.testing.expectEqual(
         @as(i64, 4),
         try integral.query.answers.items[0].getInteger("X"),
     );
 
-    var negative = try db.execute("X = -0.5 - 0.5?");
+    var negative = try db.execute("X = -0.5 - 0.5?", null);
     defer negative.deinit();
     try std.testing.expectEqual(
         @as(i64, -1),
@@ -2272,7 +2314,7 @@ test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
 
     // A mixed operation on an i64 extreme produces the rounded f64, which
     // stays a float because its integral value is outside the i64 range.
-    var extreme = try db.execute("X = 9223372036854775807 + 0.5?");
+    var extreme = try db.execute("X = 9223372036854775807 + 0.5?", null);
     const extreme_spelled = try (try extreme.query.answers.items[0].getValue("X"))
         .formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(extreme_spelled);
@@ -2281,15 +2323,18 @@ test "mixed arithmetic promotes to f64 and canonicalizes integral results" {
 
     try std.testing.expectError(errors.Error.NumericOverflow, db.execute(
         "N = 1.7976931348623157e308 + 1.7976931348623157e308?",
+        null,
     ));
     try std.testing.expectError(errors.Error.NumericOverflow, db.execute(
         "N = -1.7976931348623157e308 - 1.7976931348623157e308?",
+        null,
     ));
-    try std.testing.expectError(errors.Error.NumericType, db.execute("N = nope + 0.5?"));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("N = nope + 0.5?", null));
 
     // Integer-only overflow behavior is unchanged by promotion.
     try std.testing.expectError(errors.Error.NumericOverflow, db.execute(
         "N = 9223372036854775807 + 1?",
+        null,
     ));
 }
 
@@ -2316,7 +2361,7 @@ test "mixed equality and ordering are exact at numeric boundaries" {
     var ordered = try db.execute(
         \\near(0.9999999999999999). near(1). near(1.0000000000000002).
         \\setof(X, near(X), S)?
-    );
+    , null);
     defer ordered.deinit();
     try test_support.expectBindingValue(
         &ordered.query.answers.items[0],
@@ -2332,7 +2377,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
     var dedup = try db.execute(
         \\one(1). one(1.0). one(01). one(1e0). one('1'). one('1.0').
         \\setof(X, one(X), S)?
-    );
+    , null);
     defer dedup.deinit();
     try test_support.expectBindingValue(&dedup.query.answers.items[0], "S", "[1, '1', '1.0']");
 
@@ -2343,7 +2388,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
         \\kind(g). kind(h). item(g, 0.5). item(g, 1.0). item(g, 1). item(h, 2.5).
         \\grouped(Out) :- kind(g), setof([G, S], (kind(G), setof(V, item(G, V), S)), Out).
         \\grouped(Out)?
-    );
+    , null);
     defer grouped.deinit();
     try test_support.expectBindingValue(
         &grouped.query.answers.items[0],
@@ -2355,7 +2400,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
         \\sum([], 0).
         \\sum(H!T, N) :- sum(T, M), N = M + H.
         \\sum([1, 0.5, 2.5], Total)?
-    );
+    , null);
     defer summed.deinit();
     try std.testing.expectEqual(
         @as(i64, 4),
@@ -2366,7 +2411,7 @@ test "canonical numeric identity holds inside lists and nested aggregates" {
 test "source and typed mixed numeric operations produce identical answers" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var setup = try db.execute("measure(a, 2.5). measure(b, 3). measure(c, 0.5).");
+    var setup = try db.execute("measure(a, 2.5). measure(b, 3). measure(c, 0.5).", null);
     setup.deinit();
 
     const x = input.variable("x");
@@ -2381,7 +2426,7 @@ test "source and typed mixed numeric operations produce identical answers" {
     });
     defer typed.deinit();
 
-    var source = try db.execute("measure(X, V), V < 3, S = V + 1, D = V - 2?");
+    var source = try db.execute("measure(X, V), V < 3, S = V + 1, D = V - 2?", null);
     defer source.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), typed.answers.items.len);
@@ -2446,7 +2491,7 @@ test "typed float descriptors canonicalize and getters never coerce" {
     try expectAnswerCount(&db, "items([0.5, 2])?", 1);
 
     // Typed retraction matches a fact added from source, and vice versa.
-    var added = try db.execute("measure(d, 3.5).");
+    var added = try db.execute("measure(d, 3.5).", null);
     added.deinit();
     try std.testing.expect(try db.retract(&.{
         input.relation("measure", &.{ input.atom("d"), input.float(3.5) }),
@@ -2522,7 +2567,7 @@ test "integer identity is exact above 2^53 and recursive inside lists" {
         \\number(9007199254740992). number(9007199254740993).
         \\nested([9007199254740992]). nested([9007199254740993]).
         \\number(X), X = 9007199254740993?
-    );
+    , null);
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqual(
         @as(i64, 9007199254740993),
@@ -2530,7 +2575,7 @@ test "integer identity is exact above 2^53 and recursive inside lists" {
     );
     result.deinit();
 
-    result = try db.execute("nested([X]), X = 9007199254740992?");
+    result = try db.execute("nested([X]), X = 9007199254740992?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try std.testing.expectEqual(
@@ -2542,10 +2587,10 @@ test "integer identity is exact above 2^53 and recursive inside lists" {
 test "numeric comparisons reject every nonnumeric ground value kind" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). seed(X), X < 1?"));
-    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). [] < 1?"));
-    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). [1] < 2?"));
-    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). cons(1, 2) < 3?"));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). seed(X), X < 1?", null));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). [] < 1?", null));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). [1] < 2?", null));
+    try std.testing.expectError(errors.Error.NumericType, db.execute("seed(ok). cons(1, 2) < 3?", null));
 }
 
 test "typed descriptors cover scalars lists rules builtins negation and retraction" {
@@ -2786,15 +2831,28 @@ test "source statements are atomic while prior statements remain committed" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     try std.testing.expectError(
-        errors.Error.NumericOverflow,
-        db.execute("kept(ok). rejected(9223372036854775808)."),
+        errors.Error.InvalidFact,
+        db.execute("kept(ok). rejected(X).", null),
     );
-    var result = try db.execute("kept(X)?");
+    var result = try db.execute("kept(X)?", null);
     try std.testing.expectEqualStrings("ok", try result.query.answers.items[0].getAtom("X"));
     result.deinit();
-    result = try db.execute("rejected(X)?");
+    result = try db.execute("rejected(X)?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.query.answers.items.len);
+}
+
+test "a literal that does not fit is a parse error, so nothing runs" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(
+        errors.Error.NumericOverflow,
+        db.execute("kept(ok). rejected(9223372036854775808).", &diagnostic),
+    );
+    try std.testing.expectEqual(@as(?usize, 1), diagnostic.statement);
+    try std.testing.expectEqual(@as(u32, 20), diagnostic.column);
+    try expectAnswerCount(&db, "kept(X)?", 0);
 }
 
 test "typed persistent operations roll back every allocation failure point" {
@@ -2904,7 +2962,7 @@ test "source persistent statements roll back every allocation failure point" {
         const persistent_bytes = failing.allocated_bytes - failing.freed_bytes;
 
         failing.fail_index = failing.alloc_index + offset;
-        const operation = db.execute("added(fresh).");
+        const operation = db.execute("added(fresh).", null);
         failing.fail_index = std.math.maxInt(usize);
         if (operation) |result_value| {
             var result = result_value;
@@ -2945,6 +3003,124 @@ fn nodesPresent(db: *Jatalog, count: usize) !u32 {
     return present;
 }
 
+/// Renders a query's answers one per line, so two databases can be compared
+/// by what they answer.
+fn renderAnswers(allocator: std.mem.Allocator, result: *const QueryResult) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    for (result.answers.items) |answer| {
+        for (answer.bindings.items) |binding| {
+            try output.writer.print("{s}=", .{binding.name});
+            try binding.value.write(&output.writer);
+            try output.writer.writeByte(' ');
+        }
+        try output.writer.writeByte('\n');
+    }
+    return output.toOwnedSlice();
+}
+
+test "running parsed statements is running the source" {
+    // `execute` is `parseProgram` followed by `executeStatements`; this checks
+    // the two spellings leave identical databases, down to what was interned.
+    const programs = [_][]const u8{
+        \\edge(a, b). edge(b, c). edge(c, d).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\edge(b, c)~
+        \\path(a, X)?
+        ,
+        \\item(g1, 3). item(g1, 1.5). item(g2, 7). item(g2, -2e0).
+        \\tag(g1, 'x'). tag(g2, [a, b]).
+        \\group(g1). group(g2).
+        \\members(G, S) :- group(G), setof([V, W], (item(G, V), tag(G, W)), S).
+        \\small(G, V) :- item(G, V), not V >= 2, not V = 7.
+        \\members(G, S), setof(V, small(G, V), T)?
+        ,
+        \\n(1). n(2). total(S) :- setof(X, n(X), L), sum(L, S).
+        \\sum([], 0).
+        \\sum(H!T, N) :- sum(T, M), N = M + H.
+        \\total(S)?
+    };
+    for (programs) |source| {
+        var executed: Jatalog = .init(std.testing.allocator);
+        defer executed.deinit();
+        var from_source = try executed.execute(source, null);
+        defer from_source.deinit();
+
+        var stepped: Jatalog = .init(std.testing.allocator);
+        defer stepped.deinit();
+        const parsed = try parseProgram(std.testing.allocator, source, null);
+        defer parsed.deinit();
+        var from_statements = try stepped.executeStatements(parsed.value.statements, null);
+        defer from_statements.deinit();
+
+        const expected = try renderAnswers(std.testing.allocator, &from_source.query);
+        defer std.testing.allocator.free(expected);
+        const actual = try renderAnswers(std.testing.allocator, &from_statements.query);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expect(expected.len > 0);
+        try std.testing.expectEqualStrings(expected, actual);
+        try std.testing.expectEqual(executed.state.facts.len(), stepped.state.facts.len());
+        try std.testing.expectEqualDeep(executed.internStats(), stepped.internStats());
+    }
+}
+
+test "parsed rules and goals feed the descriptor interface" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    const facts = try parseProgram(std.testing.allocator, "edge(a, b). edge(b, c).", null);
+    defer facts.deinit();
+    var loaded = try db.executeStatements(facts.value.statements, null);
+    loaded.deinit();
+
+    const rules = [_][]const u8{
+        "reach(X, Y) :- edge(X, Y)",
+        "reach(X, Z) :- edge(X, Y), reach(Y, Z).",
+    };
+    for (rules) |text| {
+        const rule = try parseRule(std.testing.allocator, text, null);
+        defer rule.deinit();
+        try db.addRule(.{ .relation = rule.value.head }, rule.value.body);
+    }
+    const goals = try parseGoals(std.testing.allocator, "reach(a, X), X != b?", null);
+    defer goals.deinit();
+    var result = try db.query(goals.value);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.answers.items.len);
+    try std.testing.expectEqualStrings("c", try result.answers.items[0].getAtom("X"));
+}
+
+test "a failing statement is named whether it was parsed or built by hand" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(Error.NotStratified, db.execute(
+        \\p(a).
+        \\q(X) :- p(X), not r(X).
+        \\  r(X) :- q(X).
+    , &diagnostic));
+    try std.testing.expectEqual(@as(?usize, 2), diagnostic.statement);
+    try std.testing.expectEqual(@as(u32, 3), diagnostic.line);
+    try std.testing.expectEqual(@as(u32, 3), diagnostic.column);
+    try std.testing.expectEqual(@as(?[]const u8, null), diagnostic.expected);
+
+    try std.testing.expectError(Error.InvalidSyntax, db.execute("p(b).\np(c", &diagnostic));
+    try std.testing.expectEqual(@as(?usize, 1), diagnostic.statement);
+    try std.testing.expectEqual(@as(u32, 2), diagnostic.line);
+    try std.testing.expectEqual(@as(u32, 4), diagnostic.column);
+    try std.testing.expectEqualStrings("','", diagnostic.expected.?);
+
+    const statements = [_]input.Statement{
+        .{ .fact = input.fact("p", &.{input.atom("d")}) },
+        .{ .fact = input.fact("p", &.{input.variable("X")}) },
+    };
+    diagnostic = .{};
+    try std.testing.expectError(Error.InvalidFact, db.executeStatements(&statements, &diagnostic));
+    try std.testing.expectEqual(@as(?usize, 1), diagnostic.statement);
+    try std.testing.expectEqual(@as(?Span, null), diagnostic.span);
+    try expectAnswerCount(&db, "p(X)?", 2);
+}
+
 test "a source program commits and rolls back one statement at a time" {
     // Assertions, a query and a retraction interleaved. Each statement either
     // lands completely or not at all, whatever its neighbours are, and the
@@ -2958,7 +3134,7 @@ test "a source program commits and rolls back one statement at a time" {
         \\node(n2). node(n3).
         \\node(n1) ~
         \\node(n4).
-    );
+    , null);
     program.deinit();
     try std.testing.expectEqual(@as(u32, 0b11101), try nodesPresent(&db, 5));
     var derived = try db.query(&.{input.relation("reachable", &.{input.variable("X")})});
@@ -2972,18 +3148,27 @@ test "a source program commits and rolls back one statement at a time" {
     // structural recursion, so a value left behind can derive facts.
     var partial: Jatalog = .init(std.testing.allocator);
     defer partial.deinit();
-    var prefix = try partial.execute("node(n0). node(n1).");
+    var prefix = try partial.execute("node(n0). node(n1).", null);
     prefix.deinit();
     const before = partial.internStats();
     try std.testing.expectError(
-        Error.InvalidSyntax,
-        partial.execute("node(n2). oops(n9, [n8, n7] . node(n3)."),
+        Error.InvalidFact,
+        partial.execute("node(n2). oops(n9, [n8, n7], X). node(n3).", null),
     );
     try std.testing.expectEqual(@as(u32, 0b111), try nodesPresent(&partial, 5));
     const after = partial.internStats();
     // Exactly `n2`, and nothing the failing statement named.
     try std.testing.expectEqual(before.scalar_entries + 1, after.scalar_entries);
     try std.testing.expectEqual(before.value_entries + 1, after.value_entries);
+
+    // A syntax error is found before anything runs, so even the statements
+    // ahead of it leave nothing behind.
+    try std.testing.expectError(
+        Error.InvalidSyntax,
+        partial.execute("node(n3). oops(n9, [n8, n7] . node(n4).", null),
+    );
+    try std.testing.expectEqual(@as(u32, 0b111), try nodesPresent(&partial, 5));
+    try std.testing.expectEqual(after.scalar_entries, partial.internStats().scalar_entries);
 }
 
 test "an allocation failure leaves a source program's statements as a prefix" {
@@ -2996,11 +3181,11 @@ test "an allocation failure leaves a source program's statements as a prefix" {
         var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
         var db: Jatalog = .init(failing.allocator());
         defer db.deinit();
-        var seed = try db.execute("node(n0).");
+        var seed = try db.execute("node(n0).", null);
         seed.deinit();
 
         failing.fail_index = failing.alloc_index + offset;
-        const operation = db.execute("node(n1). node(n2). node(n3). node(n4).");
+        const operation = db.execute("node(n1). node(n2). node(n3). node(n4).", null);
         failing.fail_index = std.math.maxInt(usize);
         if (operation) |value| {
             var result = value;
@@ -3038,7 +3223,7 @@ test "semi-naive and naive closures agree across rule classes" {
     var joins_setup = try joins.execute(
         \\parent(a, b). parent(b, c). parent(c, d).
         \\grand(X, Z) :- parent(X, Y), parent(Y, Z).
-    );
+    , null);
     joins_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&joins.state);
 
@@ -3049,7 +3234,7 @@ test "semi-naive and naive closures agree across rule classes" {
         \\edge(a, b). edge(b, c). edge(c, d). edge(d, a).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     direct_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&direct.state);
 
@@ -3061,7 +3246,7 @@ test "semi-naive and naive closures agree across rule classes" {
         \\even(X) :- start(X).
         \\even(X) :- odd(Y), step(Y, X).
         \\odd(X) :- even(Y), step(Y, X).
-    );
+    , null);
     mutual_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&mutual.state);
 
@@ -3074,7 +3259,7 @@ test "semi-naive and naive closures agree across rule classes" {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\numchildren(X, N) :- children(X, S), length(S, N).
-    );
+    , null);
     structural_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&structural.state);
 
@@ -3086,7 +3271,7 @@ test "semi-naive and naive closures agree across rule classes" {
         \\reachable(X) :- edge(a, X).
         \\reachable(X) :- reachable(Y), edge(Y, X).
         \\isolated(X) :- node(X), not reachable(X).
-    );
+    , null);
     negated_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&negated.state);
 
@@ -3098,7 +3283,7 @@ test "semi-naive and naive closures agree across rule classes" {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\summary(S) :- edge(a, b), setof([X, Y], path(X, Y), S).
-    );
+    , null);
     aggregated_setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&aggregated.state);
 }
@@ -3110,7 +3295,7 @@ test "multiple recursive body occurrences miss no derivations" {
         \\edge(n1, n2). edge(n2, n3). edge(n3, n4). edge(n4, n5).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- path(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&db.state);
 
@@ -3128,7 +3313,7 @@ test "duplicate derivations create no duplicate facts or endless rounds" {
         \\edge(a, b). edge(a, c). edge(b, d). edge(c, d). edge(d, a).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try test_support.expectSemiNaiveMatchesNaive(&db.state);
     // Every node reaches every node exactly once in the answer set.
@@ -3143,7 +3328,7 @@ test "indexed lookups match every structural binding pattern deterministically" 
         \\edge(a, b). edge(b, c). edge(a, c).
         \\holds([1, 2], a). holds([1, [2, 3]], b). holds(cons(1, 2), c). holds([], d).
         \\p(a). p(a, b).
-    );
+    , null);
     setup.deinit();
 
     // Bound-position patterns over atoms.
@@ -3153,28 +3338,28 @@ test "indexed lookups match every structural binding pattern deterministically" 
     try expectAnswerCount(&db, "edge(c, X)?", 0);
 
     // Answers arrive in fact insertion order.
-    var ordered = try db.execute("edge(X, c)?");
+    var ordered = try db.execute("edge(X, c)?", null);
     defer ordered.deinit();
     try std.testing.expectEqual(@as(usize, 2), ordered.query.answers.items.len);
     try std.testing.expectEqualStrings("b", try ordered.query.answers.items[0].getAtom("X"));
     try std.testing.expectEqualStrings("a", try ordered.query.answers.items[1].getAtom("X"));
 
     // Bound structural values: proper, nested, improper, and empty lists.
-    var proper = try db.execute("holds([1, 2], X)?");
+    var proper = try db.execute("holds([1, 2], X)?", null);
     defer proper.deinit();
     try std.testing.expectEqualStrings("a", try proper.query.answers.items[0].getAtom("X"));
-    var nested = try db.execute("holds([1, [2, 3]], X)?");
+    var nested = try db.execute("holds([1, [2, 3]], X)?", null);
     defer nested.deinit();
     try std.testing.expectEqualStrings("b", try nested.query.answers.items[0].getAtom("X"));
-    var improper = try db.execute("holds(cons(1, 2), X)?");
+    var improper = try db.execute("holds(cons(1, 2), X)?", null);
     defer improper.deinit();
     try std.testing.expectEqualStrings("c", try improper.query.answers.items[0].getAtom("X"));
-    var empty = try db.execute("holds([], X)?");
+    var empty = try db.execute("holds([], X)?", null);
     defer empty.deinit();
     try std.testing.expectEqualStrings("d", try empty.query.answers.items[0].getAtom("X"));
 
     // A structural value bound through the second position.
-    var reverse = try db.execute("holds(X, c)?");
+    var reverse = try db.execute("holds(X, c)?", null);
     defer reverse.deinit();
     try test_support.expectBindingValue(&reverse.query.answers.items[0], "X", "cons(1, 2)");
 
@@ -3186,7 +3371,7 @@ test "indexed lookups match every structural binding pattern deterministically" 
     try expectAnswerCount(&db, "p(X, Y)?", 1);
 
     // Retraction through the same lookup interface removes exactly one fact.
-    var retract = try db.execute("edge(a, X)~");
+    var retract = try db.execute("edge(a, X)~", null);
     defer retract.deinit();
     try expectAnswerCount(&db, "edge(X, Y)?", 1);
     try expectAnswerCount(&db, "edge(b, c)?", 1);
@@ -3199,7 +3384,7 @@ test "stratification distinguishes predicate arities" {
         \\p(a, b). seed(k).
         \\p(S) :- seed(k), setof([X, Y], p(X, Y), S).
         \\p(S)?
-    );
+    , null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.query.answers.items.len);
     try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[[a, b]]");
@@ -3213,7 +3398,7 @@ test "insert-only batches propagate incrementally and match full rebuild" {
         \\edge(n0, n1). edge(n1, n2).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(n0, n2)?", 1);
     const expansions_after_build = db.state.eval.expansions;
@@ -3244,7 +3429,7 @@ test "one inserted edge propagates each recursive consequence exactly once" {
         \\edge(a, b). edge(b, c). edge(c, d).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(X, Y)?", 6);
 
@@ -3265,7 +3450,7 @@ test "duplicate base insertions produce no derived delta" {
         \\edge(a, b).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(a, b)?", 1);
     const closure_len = db.state.closure.?.len();
@@ -3289,7 +3474,7 @@ test "propagation reaching negation or setof falls back to dirty rebuild" {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\note(X) :- flag(X), not path(a, X).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "note(X)?", 1);
     const expansions_after_build = db.state.eval.expansions;
@@ -3323,7 +3508,7 @@ test "batch deletions and mixed batches maintain the closure correctly" {
         \\edge(a, b). edge(b, c).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(a, c)?", 1);
 
@@ -3369,7 +3554,7 @@ test "over-deletion reaches a seeded rule fed by values from a higher stratum" {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\size(G, N) :- collected(G, S), length(S, N).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "size(g1, 2)?", 1);
@@ -3417,7 +3602,7 @@ test "deleting a structural base case unwinds the whole chain incrementally" {
         \\chain([a, b, c]). chain([d]).
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     // [a, b, c], [b, c], [c], [d] and [] are interned, and each has a length:
@@ -3467,7 +3652,7 @@ test "a seeded rule whose body consumes the seed over-deletes correctly" {
         \\item([1, 2, 4]).
         \\total([], 0).
         \\total(H!T, N) :- total(T, M), N = M + H.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "total([1, 2, 4], 7)?", 1);
@@ -3491,7 +3676,7 @@ test "a chain fact with an alternative proof survives its support's deletion" {
         \\len([], 0).
         \\len(H!T, N) :- len(T, M), N = M + 1.
         \\len(H!T, N) :- unit(H!T), N = 1.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     // [], [b], [a, b] and [q] all have lengths, and [q] has two proofs.
@@ -3521,7 +3706,7 @@ test "several seeded occurrences over-delete each head once" {
         \\list([a, b, c]).
         \\twice([], 0).
         \\twice(H!T, N) :- twice(T, M), twice(T, K), N = M + K.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "twice(L, N)?", 4);
@@ -3553,13 +3738,13 @@ fn seededDeletionAllocationScenario(allocator: std.mem.Allocator) !void {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\longest(N) :- length(L, N), N > 1.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     _ = try db.applyChanges(&.{}, &.{
         input.fact("length", &.{ input.list(&.{}), input.integer(0) }),
     });
-    var result = try db.execute("length(L, N)?");
+    var result = try db.execute("length(L, N)?", null);
     defer result.deinit();
     if (result.query.answers.items.len != 0) return error.UnexpectedAnswer;
 }
@@ -3582,7 +3767,7 @@ test "randomized structural deletions match a clean rebuild under shadow verific
         \\big(K) :- size(K, N), N > 1.
         \\quiet(K) :- box(K, L), not big(K).
         \\spread(S) :- tag(t), setof(N, size(K, N), S).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
@@ -3635,7 +3820,7 @@ test "deleting the only base support removes the entire unsupported cycle" {
         \\edge(a, b). edge(b, c). edge(c, a).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     // The full cycle reaches every node from every node.
     try expectAnswerCount(&db, "path(X, Y)?", 9);
@@ -3665,7 +3850,7 @@ test "alternative recursive and non-recursive derivations preserve facts" {
         \\marked(a).
         \\special(X) :- marked(X).
         \\special(X) :- path(X, d).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "path(a, d)?", 1);
     try expectAnswerCount(&db, "special(b)?", 1);
@@ -3700,7 +3885,7 @@ test "a deletion falling back to rebuild leaves the batch's insertions a clean c
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\isolated(X) :- node(X), not path(a, X).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "isolated(b)?", 0);
@@ -3731,7 +3916,7 @@ test "adding and removing a fact toggles negation-dependent conclusions" {
         \\item(a). item(b).
         \\blocked(b).
         \\allowed(X) :- item(X), not blocked(X).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "allowed(a)?", 1);
     try expectAnswerCount(&db, "allowed(b)?", 0);
@@ -3756,7 +3941,7 @@ test "projection counts change without prematurely deleting supported tuples" {
     var setup = try db.execute(
         \\holds(a, b1). holds(a, b2).
         \\present(X) :- holds(X, Y).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "present(a)?", 1);
     const present_id = db.state.strings.get("present").?;
@@ -3805,7 +3990,7 @@ test "random mixed update traces match a clean rebuild after every batch" {
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\isolated(X) :- node(X), not path(a, X).
         \\summary(S) :- node(a), setof([X, Y], path(X, Y), S).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "summary(S)?", 1);
 
@@ -3860,7 +4045,7 @@ test "a cloned database interns to the same identifiers as the database it came 
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Y) :- path(X, Z), edge(Z, Y).
         \\reach(X, S) :- path(X, Y), setof(Y, path(X, Y), S).
-    );
+    , null);
     loaded.deinit();
     try db.materialize();
 
@@ -3912,7 +4097,7 @@ test "retraction maintains the closure incrementally" {
         \\edge(a, b). edge(b, c). edge(c, a). edge(x, y).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     try expectAnswerCount(&db, "path(X, Y)?", 10);
@@ -3951,7 +4136,7 @@ test "pattern retraction removes every matching fact incrementally" {
         \\edge(a, b). edge(a, c). edge(a, d). edge(b, e).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     const after_build = db.maintenanceStats();
@@ -3969,7 +4154,7 @@ test "pattern retraction removes every matching fact incrementally" {
 
     // Source-level retraction takes the same path.
     const before_source = db.maintenanceStats();
-    var retracted = try db.execute("edge(b, e)~");
+    var retracted = try db.execute("edge(b, e)~", null);
     retracted.deinit();
     try std.testing.expect(db.state.materialization == .clean);
     try std.testing.expectEqual(before_source.stratum_expansions, db.maintenanceStats().stratum_expansions);
@@ -3988,7 +4173,7 @@ test "retraction maintains aggregate groups and negation strata" {
         \\banned(g2).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
         \\allowed(G) :- group(G), not banned(G).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     const after_build = db.maintenanceStats();
@@ -4000,7 +4185,7 @@ test "retraction maintains aggregate groups and negation strata" {
     try std.testing.expect(db.state.materialization == .clean);
     try std.testing.expectEqual(after_build.stratum_expansions, db.maintenanceStats().stratum_expansions);
     try std.testing.expect(db.maintenanceStats().maintained_groups > after_build.maintained_groups);
-    var collected = try db.execute("collected(g1, S)?");
+    var collected = try db.execute("collected(g1, S)?", null);
     try test_support.expectBindingValue(&collected.query.answers.items[0], "S", "[b]");
     collected.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4009,7 +4194,7 @@ test "retraction maintains aggregate groups and negation strata" {
     try std.testing.expect(try db.retract(&.{
         input.relation("member", &.{ input.atom("g1"), input.atom("b") }),
     }));
-    var emptied = try db.execute("collected(g1, S)?");
+    var emptied = try db.execute("collected(g1, S)?", null);
     try test_support.expectBindingValue(&emptied.query.answers.items[0], "S", "[]");
     emptied.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4033,7 +4218,7 @@ fn retractionAllocationScenario(allocator: std.mem.Allocator) !void {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
     _ = try db.retract(&.{
@@ -4042,7 +4227,7 @@ fn retractionAllocationScenario(allocator: std.mem.Allocator) !void {
     _ = try db.retract(&.{
         input.relation("member", &.{ input.atom("g"), input.atom("m1") }),
     });
-    var result = try db.execute("collected(g, S)?");
+    var result = try db.execute("collected(g, S)?", null);
     defer result.deinit();
     const formatted = try (try result.query.answers.items[0].getValue("S")).formatAlloc(allocator);
     defer allocator.free(formatted);
@@ -4062,9 +4247,9 @@ fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {
         \\edge(a, b). edge(b, c).
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
-    );
+    , null);
     setup.deinit();
-    var first = try db.execute("path(a, c)?");
+    var first = try db.execute("path(a, c)?", null);
     first.deinit();
     _ = try db.applyChanges(&.{
         input.fact("edge", &.{ input.atom("c"), input.atom("d") }),
@@ -4074,7 +4259,7 @@ fn batchUpdateAllocationScenario(allocator: std.mem.Allocator) !void {
     }, &.{
         input.fact("edge", &.{ input.atom("a"), input.atom("b") }),
     });
-    var second = try db.execute("path(b, e)?");
+    var second = try db.execute("path(b, e)?", null);
     defer second.deinit();
     if (second.query.answers.items.len != 1) return error.UnexpectedAnswer;
 }
@@ -4095,7 +4280,7 @@ fn runPolicyTrace(db: *Jatalog, policy: cost_model.MaintenancePolicy) !void {
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\size(G, N) :- collected(G, S), length(S, N).
         \\isolated(X) :- node(X), not path(a, X).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
@@ -4158,7 +4343,7 @@ test "the maintenance estimate counts facts changed, not facts named" {
     var lean: Jatalog = .init(std.testing.allocator);
     defer lean.deinit();
     lean.setMaintenancePolicy(.incremental);
-    var lean_setup = try lean.execute(cost_attribution_program);
+    var lean_setup = try lean.execute(cost_attribution_program, null);
     lean_setup.deinit();
     try lean.materialize();
     _ = try lean.applyChanges(&.{new_edge}, &.{});
@@ -4166,7 +4351,7 @@ test "the maintenance estimate counts facts changed, not facts named" {
     var padded: Jatalog = .init(std.testing.allocator);
     defer padded.deinit();
     padded.setMaintenancePolicy(.incremental);
-    var padded_setup = try padded.execute(cost_attribution_program);
+    var padded_setup = try padded.execute(cost_attribution_program, null);
     padded_setup.deinit();
     try padded.materialize();
     // The same single real insertion, named alongside deletions of facts the
@@ -4198,7 +4383,7 @@ test "a rebuild fallback is charged to the rebuild estimate, not to maintenance"
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\isolated(X) :- node(X), not path(a, X).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
@@ -4276,7 +4461,7 @@ test "the cost model learns to prefer the cheaper path per workload" {
         std.testing.allocator,
         "path(X, Y) :- edge(X, Y). path(X, Z) :- edge(X, Y), path(Y, Z).",
     );
-    var chain_setup = try closure_db.execute(chain_source.items);
+    var chain_setup = try closure_db.execute(chain_source.items, null);
     chain_setup.deinit();
     try closure_db.materialize();
     for (0..8) |index| {
@@ -4288,7 +4473,7 @@ test "the cost model learns to prefer the cheaper path per workload" {
         _ = try closure_db.applyChanges(&.{input.fact("edge", &terms)}, &.{});
         // Query between batches so a recompute decision is actually paid and
         // the closure is clean again when the next decision is made.
-        var query = try closure_db.execute("path(n0, X)?");
+        var query = try closure_db.execute("path(n0, X)?", null);
         query.deinit();
     }
     const closure_stats = closure_db.maintenanceStats();
@@ -4302,7 +4487,7 @@ test "the cost model learns to prefer the cheaper path per workload" {
     var flat_setup = try flat_db.execute(
         \\item(a). item(b). item(c).
         \\present(X) :- item(X).
-    );
+    , null);
     flat_setup.deinit();
     try flat_db.materialize();
     for (0..8) |index| {
@@ -4310,7 +4495,7 @@ test "the cost model learns to prefer the cheaper path per workload" {
         const name = try std.fmt.bufPrint(&buffer, "i{d}", .{index});
         const terms: [1]input.Term = .{input.atom(name)};
         _ = try flat_db.applyChanges(&.{input.fact("item", &terms)}, &.{});
-        var query = try flat_db.execute("present(X)?");
+        var query = try flat_db.execute("present(X)?", null);
         query.deinit();
     }
     try test_support.expectClosureMatchesRebuild(&flat_db.state);
@@ -4331,7 +4516,7 @@ test "shadow verification accepts maintained closures and reports corruption" {
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
         \\reachable(X) :- path(a, X).
         \\unreachable(X) :- edge(X, Y), not reachable(X).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
@@ -4384,7 +4569,7 @@ test "randomized mixed traces hold under shadow verification" {
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\size(G, N) :- collected(G, S), length(S, N).
         \\quiet(G) :- group(G), not member(G, m1).
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
@@ -4433,9 +4618,9 @@ test "aggregate groups are maintained incrementally across member changes" {
         \\group(g1). group(g2).
         \\member(g1, b). member(g1, a). member(g2, z).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("collected(g1, S)?");
+    var initial = try db.execute("collected(g1, S)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
     initial.deinit();
     const expansions_after_build = db.state.eval.expansions;
@@ -4446,14 +4631,14 @@ test "aggregate groups are maintained incrementally across member changes" {
     }, &.{}));
     try std.testing.expect(db.state.materialization == .clean);
     try std.testing.expectEqual(expansions_after_build, db.state.eval.expansions);
-    var inserted = try db.execute("collected(g1, S)?");
+    var inserted = try db.execute("collected(g1, S)?", null);
     try test_support.expectBindingValue(&inserted.query.answers.items[0], "S", "[a, b, c]");
     inserted.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
 
     // The untouched group keeps its list and there is exactly one tuple
     // per group after the change.
-    var untouched = try db.execute("collected(g2, S)?");
+    var untouched = try db.execute("collected(g2, S)?", null);
     try test_support.expectBindingValue(&untouched.query.answers.items[0], "S", "[z]");
     untouched.deinit();
     try expectAnswerCount(&db, "collected(G, S)?", 2);
@@ -4462,7 +4647,7 @@ test "aggregate groups are maintained incrementally across member changes" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
     }));
-    var deleted = try db.execute("collected(g1, S)?");
+    var deleted = try db.execute("collected(g1, S)?", null);
     try test_support.expectBindingValue(&deleted.query.answers.items[0], "S", "[b, c]");
     deleted.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4472,7 +4657,7 @@ test "aggregate groups are maintained incrementally across member changes" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("member", &.{ input.atom("g2"), input.atom("z") }),
     }));
-    var emptied = try db.execute("collected(g2, S)?");
+    var emptied = try db.execute("collected(g2, S)?", null);
     try test_support.expectBindingValue(&emptied.query.answers.items[0], "S", "[]");
     emptied.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4489,7 +4674,7 @@ test "aggregate groups are maintained incrementally across member changes" {
     try std.testing.expect(try db.applyChanges(&.{
         input.fact("group", &.{input.atom("g2")}),
     }, &.{}));
-    var restored = try db.execute("collected(g2, S)?");
+    var restored = try db.execute("collected(g2, S)?", null);
     try test_support.expectBindingValue(&restored.query.answers.items[0], "S", "[]");
     restored.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4503,9 +4688,9 @@ test "duplicate member derivations do not disturb a maintained group" {
         \\member(G, X) :- direct(G, X).
         \\member(G, X) :- mirrored(G, X).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("collected(g, S)?");
+    var initial = try db.execute("collected(g, S)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a, b]");
     initial.deinit();
 
@@ -4513,7 +4698,7 @@ test "duplicate member derivations do not disturb a maintained group" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("mirrored", &.{ input.atom("g"), input.atom("a") }),
     }));
-    var kept = try db.execute("collected(g, S)?");
+    var kept = try db.execute("collected(g, S)?", null);
     try test_support.expectBindingValue(&kept.query.answers.items[0], "S", "[a, b]");
     kept.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4522,7 +4707,7 @@ test "duplicate member derivations do not disturb a maintained group" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("direct", &.{ input.atom("g"), input.atom("a") }),
     }));
-    var dropped = try db.execute("collected(g, S)?");
+    var dropped = try db.execute("collected(g, S)?", null);
     try test_support.expectBindingValue(&dropped.query.answers.items[0], "S", "[b]");
     dropped.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4540,9 +4725,9 @@ test "canonical aggregate lists are independent of update order" {
         var setup = try db.execute(
             \\group(g).
             \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-        );
+        , null);
         setup.deinit();
-        var empty = try db.execute("collected(g, S)?");
+        var empty = try db.execute("collected(g, S)?", null);
         try test_support.expectBindingValue(&empty.query.answers.items[0], "S", "[]");
         empty.deinit();
 
@@ -4551,7 +4736,7 @@ test "canonical aggregate lists are independent of update order" {
                 input.fact("member", &.{ input.atom("g"), input.atom(name) }),
             }, &.{});
         }
-        var result = try db.execute("collected(g, S)?");
+        var result = try db.execute("collected(g, S)?", null);
         try test_support.expectBindingValue(&result.query.answers.items[0], "S", "[a, b, c]");
         result.deinit();
         try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4564,9 +4749,9 @@ test "bag emulation retains equal values with distinct discriminators" {
     var setup = try db.execute(
         \\group(g). reading(g, r1, 5). reading(g, r2, 5). reading(g, r3, 7).
         \\bag(G, S) :- group(G), setof([V, D], reading(G, D, V), S).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("bag(g, S)?");
+    var initial = try db.execute("bag(g, S)?", null);
     try test_support.expectBindingValue(
         &initial.query.answers.items[0],
         "S",
@@ -4577,7 +4762,7 @@ test "bag emulation retains equal values with distinct discriminators" {
     try std.testing.expect(try db.applyChanges(&.{
         input.fact("reading", &.{ input.atom("g"), input.atom("r4"), input.integer(5) }),
     }, &.{}));
-    var added = try db.execute("bag(g, S)?");
+    var added = try db.execute("bag(g, S)?", null);
     try test_support.expectBindingValue(
         &added.query.answers.items[0],
         "S",
@@ -4590,7 +4775,7 @@ test "bag emulation retains equal values with distinct discriminators" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("reading", &.{ input.atom("g"), input.atom("r2"), input.integer(5) }),
     }));
-    var removed = try db.execute("bag(g, S)?");
+    var removed = try db.execute("bag(g, S)?", null);
     try test_support.expectBindingValue(
         &removed.query.answers.items[0],
         "S",
@@ -4610,9 +4795,9 @@ test "maintained aggregates feed downstream strata and recursive consumers" {
         \\length([], 0).
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\numchildren(X, N) :- children(X, S), length(S, N).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("numchildren(alice, N)?");
+    var initial = try db.execute("numchildren(alice, N)?", null);
     try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
     initial.deinit();
 
@@ -4622,7 +4807,7 @@ test "maintained aggregates feed downstream strata and recursive consumers" {
         input.fact("person", &.{input.atom("carol")}),
         input.fact("parent", &.{ input.atom("alice"), input.atom("carol") }),
     }, &.{}));
-    var grown = try db.execute("numchildren(alice, N)?");
+    var grown = try db.execute("numchildren(alice, N)?", null);
     try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
     grown.deinit();
     try expectAnswerCount(&db, "numchildren(X, N)?", 3);
@@ -4631,7 +4816,7 @@ test "maintained aggregates feed downstream strata and recursive consumers" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("parent", &.{ input.atom("alice"), input.atom("bob") }),
     }));
-    var shrunk = try db.execute("numchildren(alice, N)?");
+    var shrunk = try db.execute("numchildren(alice, N)?", null);
     try std.testing.expectEqual(@as(i64, 1), try shrunk.query.answers.items[0].getInteger("N"));
     shrunk.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4644,9 +4829,9 @@ test "multiple and nested aggregates stay correct through the rebuild path" {
         \\group(g1). group(g2). item(g1, a). item(g2, b). tag(g1, t1). tag(g2, t2).
         \\both(G, S, T) :- group(G), setof(X, item(G, X), S), setof(Y, tag(G, Y), T).
         \\nested(S) :- group(g1), setof([G, T], (group(G), setof(X, item(G, X), T)), S).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("both(g1, S, T)?");
+    var initial = try db.execute("both(g1, S, T)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[a]");
     try test_support.expectBindingValue(&initial.query.answers.items[0], "T", "[t1]");
     initial.deinit();
@@ -4657,11 +4842,11 @@ test "multiple and nested aggregates stay correct through the rebuild path" {
         input.fact("item", &.{ input.atom("g1"), input.atom("c") }),
         input.fact("tag", &.{ input.atom("g1"), input.atom("t3") }),
     }, &.{}));
-    var updated = try db.execute("both(g1, S, T)?");
+    var updated = try db.execute("both(g1, S, T)?", null);
     try test_support.expectBindingValue(&updated.query.answers.items[0], "S", "[a, c]");
     try test_support.expectBindingValue(&updated.query.answers.items[0], "T", "[t1, t3]");
     updated.deinit();
-    var nested = try db.execute("nested(S)?");
+    var nested = try db.execute("nested(S)?", null);
     try test_support.expectBindingValue(
         &nested.query.answers.items[0],
         "S",
@@ -4673,7 +4858,7 @@ test "multiple and nested aggregates stay correct through the rebuild path" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("item", &.{ input.atom("g1"), input.atom("a") }),
     }));
-    var reduced = try db.execute("both(g1, S, T)?");
+    var reduced = try db.execute("both(g1, S, T)?", null);
     try test_support.expectBindingValue(&reduced.query.answers.items[0], "S", "[c]");
     reduced.deinit();
     try test_support.expectClosureMatchesRebuild(&db.state);
@@ -4691,7 +4876,7 @@ test "random aggregate update traces match a clean rebuild after every batch" {
         \\length(H!T, N) :- length(T, M), N = M + 1.
         \\size(G, N) :- collected(G, S), length(S, N).
         \\empty(G) :- group(G), not member(G, m1), not member(G, m2), not member(G, m3).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "size(G, N)?", 3);
 
@@ -4756,14 +4941,14 @@ test "Chapter 5 Example 5.2.1 maintains a view without projections" {
     var setup = try db.execute(
         \\p(a). p(b). r(a, 1). r(c, 3).
         \\v(X, S) :- p(X), setof(Y, r(X, Y), S).
-    );
+    , null);
     setup.deinit();
 
     // The materialization contains v(a, [1]) and v(b, []).
-    var initial = try db.execute("v(a, S)?");
+    var initial = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
     initial.deinit();
-    var empty = try db.execute("v(b, S)?");
+    var empty = try db.execute("v(b, S)?", null);
     try test_support.expectBindingValue(&empty.query.answers.items[0], "S", "[]");
     empty.deinit();
     try expectAnswerCount(&db, "v(X, S)?", 2);
@@ -4777,7 +4962,7 @@ test "Chapter 5 Example 5.2.1 maintains a view without projections" {
     }));
     try std.testing.expect(db.state.materialization == .clean);
     try expectAnswerCount(&db, "v(a, S)?", 0);
-    var updated = try db.execute("v(b, S)?");
+    var updated = try db.execute("v(b, S)?", null);
     try test_support.expectBindingValue(&updated.query.answers.items[0], "S", "[2]");
     updated.deinit();
     try expectAnswerCount(&db, "v(X, S)?", 1);
@@ -4797,13 +4982,13 @@ test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
     var setup = try db.execute(
         \\p(a, 1). p(a, 2). p(b, 1). r(a, 1). r(a, 2). r(b, 2).
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
+    , null);
     setup.deinit();
 
-    var initial = try db.execute("v(a, S)?");
+    var initial = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1, 2]");
     initial.deinit();
-    var other = try db.execute("v(b, S)?");
+    var other = try db.execute("v(b, S)?", null);
     try test_support.expectBindingValue(&other.query.answers.items[0], "S", "[2]");
     other.deinit();
 
@@ -4821,7 +5006,7 @@ test "Chapter 5 Example 5.3.1 counts derivations of a projected view" {
         input.fact("p", &.{ input.atom("a"), input.integer(2) }),
     }));
     try std.testing.expect(db.state.materialization == .clean);
-    var retained = try db.execute("v(a, S)?");
+    var retained = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&retained.query.answers.items[0], "S", "[1, 2]");
     retained.deinit();
     try std.testing.expectEqual(@as(u32, 1), try derivationCountOf(&db, "v", "a"));
@@ -4843,9 +5028,9 @@ test "a changed aggregate list transfers support to the new tuple" {
     var setup = try db.execute(
         \\p(a, 1). p(a, 2). p(a, 3). r(a, 1).
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
+    , null);
     setup.deinit();
-    var initial = try db.execute("v(a, S)?");
+    var initial = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&initial.query.answers.items[0], "S", "[1]");
     initial.deinit();
     try std.testing.expectEqual(@as(u32, 3), try derivationCountOf(&db, "v", "a"));
@@ -4856,7 +5041,7 @@ test "a changed aggregate list transfers support to the new tuple" {
         input.fact("r", &.{ input.atom("a"), input.integer(2) }),
     }, &.{}));
     try std.testing.expect(db.state.materialization == .clean);
-    var moved = try db.execute("v(a, S)?");
+    var moved = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&moved.query.answers.items[0], "S", "[1, 2]");
     moved.deinit();
     try expectAnswerCount(&db, "v(a, S)?", 1);
@@ -4868,7 +5053,7 @@ test "a changed aggregate list transfers support to the new tuple" {
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("r", &.{ input.atom("a"), input.integer(1) }),
     }));
-    var shrunk = try db.execute("v(a, S)?");
+    var shrunk = try db.execute("v(a, S)?", null);
     try test_support.expectBindingValue(&shrunk.query.answers.items[0], "S", "[2]");
     shrunk.deinit();
     try expectAnswerCount(&db, "v(a, S)?", 1);
@@ -4884,7 +5069,7 @@ test "projected view counts agree with explicit proof enumeration" {
     var setup = try db.execute(
         \\p(a, 1). r(a, 1).
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
-    );
+    , null);
     setup.deinit();
     try expectAnswerCount(&db, "v(X, S)?", 1);
 
@@ -4923,7 +5108,7 @@ test "projected view counts agree with explicit proof enumeration" {
         // Every proof of v(k, S) comes from one p(k, Z) fact, so the stored
         // derivation count must equal the number of such base facts.
         for (keys) |key| {
-            var proofs = try db.execute("p(K, Z)?");
+            var proofs = try db.execute("p(K, Z)?", null);
             defer proofs.deinit();
             var expected: u32 = 0;
             for (proofs.query.answers.items) |*answer| {
@@ -4949,12 +5134,12 @@ test "aggregate changes propagate through downstream list functions and arithmet
         \\size(T, N) :- roster(T, S), length(S, N).
         \\headcount(T, N) :- size(T, M), N = M + 1.
         \\staffed(T) :- size(T, N), N > 1.
-    );
+    , null);
     setup.deinit();
     try db.materialize();
 
     // Empty rosters flow through length, arithmetic, and the comparison.
-    var initial = try db.execute("headcount(red, N)?");
+    var initial = try db.execute("headcount(red, N)?", null);
     try std.testing.expectEqual(@as(i64, 1), try initial.query.answers.items[0].getInteger("N"));
     initial.deinit();
     try expectAnswerCount(&db, "staffed(T)?", 0);
@@ -4964,10 +5149,10 @@ test "aggregate changes propagate through downstream list functions and arithmet
         input.fact("plays", &.{ input.atom("red"), input.atom("ann") }),
         input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
     }, &.{}));
-    var grown = try db.execute("size(red, N)?");
+    var grown = try db.execute("size(red, N)?", null);
     try std.testing.expectEqual(@as(i64, 2), try grown.query.answers.items[0].getInteger("N"));
     grown.deinit();
-    var counted = try db.execute("headcount(red, N)?");
+    var counted = try db.execute("headcount(red, N)?", null);
     try std.testing.expectEqual(@as(i64, 3), try counted.query.answers.items[0].getInteger("N"));
     counted.deinit();
     try expectAnswerCount(&db, "staffed(red)?", 1);
@@ -4978,7 +5163,7 @@ test "aggregate changes propagate through downstream list functions and arithmet
     try std.testing.expect(try db.applyChanges(&.{}, &.{
         input.fact("plays", &.{ input.atom("red"), input.atom("bo") }),
     }));
-    var shrunk = try db.execute("headcount(red, N)?");
+    var shrunk = try db.execute("headcount(red, N)?", null);
     try std.testing.expectEqual(@as(i64, 2), try shrunk.query.answers.items[0].getInteger("N"));
     shrunk.deinit();
     try expectAnswerCount(&db, "staffed(T)?", 0);
@@ -4996,9 +5181,9 @@ fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
     var setup = try db.execute(
         \\group(g1). group(g2). member(g1, a).
         \\collected(G, S) :- group(G), setof(X, member(G, X), S).
-    );
+    , null);
     setup.deinit();
-    var first = try db.execute("collected(G, S)?");
+    var first = try db.execute("collected(G, S)?", null);
     first.deinit();
     _ = try db.applyChanges(&.{
         input.fact("member", &.{ input.atom("g1"), input.atom("b") }),
@@ -5007,7 +5192,7 @@ fn aggregateMaintenanceAllocationScenario(allocator: std.mem.Allocator) !void {
     _ = try db.applyChanges(&.{}, &.{
         input.fact("member", &.{ input.atom("g1"), input.atom("a") }),
     });
-    var second = try db.execute("collected(g1, S)?");
+    var second = try db.execute("collected(g1, S)?", null);
     defer second.deinit();
     const formatted = try (try second.query.answers.items[0].getValue("S"))
         .formatAlloc(allocator);
@@ -5036,7 +5221,7 @@ const planning_program =
 test "the planner solves the smaller relation first" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var setup = try db.execute(planning_program);
+    var setup = try db.execute(planning_program, null);
     setup.deinit();
 
     // Written most-selective-last on purpose: `many` has eight facts and no
@@ -5057,7 +5242,7 @@ test "the planner solves the smaller relation first" {
 test "planning never moves a goal before the bindings it needs" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var setup = try db.execute(planning_program);
+    var setup = try db.execute(planning_program, null);
     setup.deinit();
 
     // Every goal but the first is cheaper than `many(X)` and would be hoisted
@@ -5111,7 +5296,7 @@ test "a plan chosen on cost answers exactly what the stored order answers" {
     defer stored.deinit();
     stored.setPlanPolicy(.source_order);
     for ([_]*Jatalog{ &planned, &stored }) |db| {
-        var setup = try db.execute(program);
+        var setup = try db.execute(program, null);
         setup.deinit();
         try db.materialize();
     }
@@ -5123,9 +5308,9 @@ test "a plan chosen on cost answers exactly what the stored order answers" {
     for (0..stored.state.closure.?.len()) |index|
         try std.testing.expect(try planned.state.closure.?.contains(stored.state.closure.?.factAt(index)));
 
-    var planned_result = try planned.execute(question);
+    var planned_result = try planned.execute(question, null);
     defer planned_result.deinit();
-    var stored_result = try stored.execute(question);
+    var stored_result = try stored.execute(question, null);
     defer stored_result.deinit();
     const planned_lines = try answerLines(&planned_result.query);
     defer freeLines(planned_lines);
@@ -5177,9 +5362,9 @@ test "an answer names its variables in the query's order, not the plan's" {
     // leads with the variable the query leads with.
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
-    var setup = try db.execute(planning_program);
+    var setup = try db.execute(planning_program, null);
     setup.deinit();
-    var result = try db.execute("many(X), few(Y)?");
+    var result = try db.execute("many(X), few(Y)?", null);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 24), result.query.answers.items.len);
     for (result.query.answers.items) |answer| {
@@ -5196,9 +5381,9 @@ fn planningAllocationScenario(allocator: std.mem.Allocator) !void {
         \\path(X, Y) :- edge(X, Y).
         \\path(X, Z) :- edge(X, Y), path(Y, Z).
         \\reach(X, S) :- node(X), setof(Y, path(X, Y), S).
-    );
+    , null);
     setup.deinit();
-    var result = try db.execute("reach(a, S), not path(a, a)?");
+    var result = try db.execute("reach(a, S), not path(a, a)?", null);
     result.deinit();
     const explained = try db.explainQuery(&.{
         input.relation("reach", &.{ input.variable("X"), input.variable("S") }),
@@ -5272,7 +5457,7 @@ fn installPlan(db: *database.Database, executable: *folding.Executable) !void {
     for (0..executable.rules.len) |index| {
         const rule = executable.takeRule(index);
         defer db.allocator.free(rule.body);
-        statement.addRuleClauses(db, rule.head, rule.body) catch |err| {
+        transaction.addRuleClauses(db, rule.head, rule.body) catch |err| {
             syntax.freeExpr(db.allocator, rule.head);
             for (rule.body) |clause| syntax.freeClauseTree(db.allocator, clause);
             return err;
@@ -5282,7 +5467,7 @@ fn installPlan(db: *database.Database, executable: *folding.Executable) !void {
 
 fn runPlan(db: *database.Database, executable: *folding.Executable) !results.QueryResult {
     try installPlan(db, executable);
-    return statement.queryClauses(db, executable.goals);
+    return transaction.queryClauses(db, executable.goals);
 }
 
 /// Adds one fact without staging a copy of the database, which is what the
@@ -5295,7 +5480,7 @@ fn addFactTerms(
 ) !void {
     const expression = try compile.compileRelation(db, predicate, terms, false);
     defer syntax.freeExpr(db.allocator, expression);
-    try statement.addFactExpr(db, expression);
+    try transaction.addFactExpr(db, expression);
 }
 
 fn addAtomPair(
@@ -5562,7 +5747,7 @@ test "every answer a folded plan returns is one the query would have returned" {
                 try addAtomPair(&folded.state, "v", names[from], names[to]);
         };
 
-        var produced = try statement.queryClauses(&folded.state, executable.goals);
+        var produced = try transaction.queryClauses(&folded.state, executable.goals);
         defer produced.deinit();
         for (produced.answers.items) |answer| {
             const from = (try answer.bindings.items[0].value.getAtom())[0] - 'a';
@@ -5690,16 +5875,16 @@ test "inverting a view that collected a list reads the values back out of it" {
         \\r(a, b). r(a, c). r(c, a). r(c, c).
         \\v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).
         \\q(X, Y) :- r(X, Y), p(Y, Z).
-    );
+    , null);
     program.deinit();
-    var extension = try source.execute("v(X, S)?");
+    var extension = try source.execute("v(X, S)?", null);
     defer extension.deinit();
     const stored = try answerTuples(&extension.query);
     defer freeLines(stored);
     for ([_][]const u8{ "a [b, c]", "b []", "c [a, c]" }, stored) |expected, actual|
         try std.testing.expectEqualStrings(expected, actual);
 
-    var wanted = try source.execute("q(X, Y)?");
+    var wanted = try source.execute("q(X, Y)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
@@ -5707,7 +5892,7 @@ test "inverting a view that collected a list reads the values back out of it" {
     // The folded side holds that extension and nothing else.
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a, [b, c]). v(b, []). v(c, [a, c]).");
+    var facts = try db.execute("v(a, [b, c]). v(b, []). v(c, [a, c]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -5772,15 +5957,15 @@ test "a value projected out of an aggregate is a witness per element, not per tu
         \\r(a, b, 1). r(a, c, 2).
         \\v(X, S) :- p(X), setof(Y, r(X, Y, W), S).
         \\q(Y1, Y2) :- r(X, Y1, W), r(X, Y2, W), Y1 != Y2.
-    );
+    , null);
     program.deinit();
-    var wanted = try source.execute("q(A, B)?");
+    var wanted = try source.execute("q(A, B)?", null);
     defer wanted.deinit();
     try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a, [b, c]).");
+    var facts = try db.execute("v(a, [b, c]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -5842,21 +6027,21 @@ test "an aggregate nested in another is read by chaining into the list it collec
         \\s(b, 1). s(b, 2). s(c, 3).
         \\v(X, S) :- p(X), setof(Y!T, (r(X, Y), setof(Z, s(Y, Z), T)), S).
         \\q(Y, Z) :- s(Y, Z), r(X, Y).
-    );
+    , null);
     program.deinit();
-    var extension = try source.execute("v(X, S)?");
+    var extension = try source.execute("v(X, S)?", null);
     defer extension.deinit();
     const stored = try answerTuples(&extension.query);
     defer freeLines(stored);
     try std.testing.expectEqualStrings("a [[b, 1, 2], [c, 3]]", stored[0]);
-    var wanted = try source.execute("q(A, B)?");
+    var wanted = try source.execute("q(A, B)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a, [[b, 1, 2], [c, 3]]).");
+    var facts = try db.execute("v(a, [[b, 1, 2], [c, 3]]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -5921,15 +6106,15 @@ test "two aggregates side by side collect for themselves, not for each other" {
         \\r(a, b, 1). t(a, b, 2).
         \\v(X, S1, S2) :- p(X), setof(Y, r(X, Y, W), S1), setof(Y, t(X, Y, W), S2).
         \\q(Y1, Y2) :- r(X, Y1, W), t(X, Y2, W).
-    );
+    , null);
     program.deinit();
-    var wanted = try source.execute("q(A, B)?");
+    var wanted = try source.execute("q(A, B)?", null);
     defer wanted.deinit();
     try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a, [b], [b]).");
+    var facts = try db.execute("v(a, [b], [b]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -5980,7 +6165,7 @@ test "two aggregates side by side collect for themselves, not for each other" {
 fn collectingAllocationScenario(allocator: std.mem.Allocator) !void {
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a, [b]).");
+    var facts = try db.execute("v(a, [b]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -6104,12 +6289,12 @@ test "Chapter 6's empty-set counterexample is refused and the query beside it is
         \\v(X, S) :- p(X), setof(Y, r(X, Y), S).
         \\empty(a) :- setof(Y, r(a, Y), []).
         \\nonempty(c) :- setof(Y, r(c, Y), H!T).
-    );
+    , null);
     program.deinit();
-    var refused_answers = try source.execute("empty(X)?");
+    var refused_answers = try source.execute("empty(X)?", null);
     defer refused_answers.deinit();
     try std.testing.expectEqual(@as(usize, 0), refused_answers.query.answers.items.len);
-    var admitted_answers = try source.execute("nonempty(X)?");
+    var admitted_answers = try source.execute("nonempty(X)?", null);
     defer admitted_answers.deinit();
     try std.testing.expectEqual(@as(usize, 1), admitted_answers.query.answers.items.len);
 
@@ -6118,7 +6303,7 @@ test "Chapter 6's empty-set counterexample is refused and the query beside it is
     // to 2. That `r` also holds (a, 1) is exactly what is no longer there.
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(b, []). v(c, [2]).");
+    var facts = try db.execute("v(b, []). v(c, [2]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -6204,7 +6389,7 @@ test "Chapter 6's empty-set counterexample is refused and the query beside it is
     var counterexample = try db.execute(
         \\bad(a) :- setof(Y, r(a, Y), []).
         \\bad(X)?
-    );
+    , null);
     defer counterexample.deinit();
     try std.testing.expectEqual(@as(usize, 1), counterexample.query.answers.items.len);
 }
@@ -6224,19 +6409,19 @@ test "a canonical aggregate view folds a query no monotonicity argument covers" 
         \\w(X) :- r(X, Y).
         \\empty(a) :- setof(Y, r(a, Y), []).
         \\gone(d) :- setof(Y, r(d, Y), []).
-    );
+    , null);
     program.deinit();
-    var wanted = try source.execute("empty(X)?");
+    var wanted = try source.execute("empty(X)?", null);
     defer wanted.deinit();
     try std.testing.expectEqual(@as(usize, 0), wanted.query.answers.items.len);
-    var elsewhere = try source.execute("gone(X)?");
+    var elsewhere = try source.execute("gone(X)?", null);
     defer elsewhere.deinit();
     try std.testing.expectEqual(@as(usize, 1), elsewhere.query.answers.items.len);
 
     // The folded side holds both view extensions and no base relation.
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("c(a, [1]). c(c, [2]). w(a). w(c).");
+    var facts = try db.execute("c(a, [1]). c(c, [2]). w(a). w(c).", null);
     facts.deinit();
 
     const x = input.variable("X");
@@ -6330,7 +6515,7 @@ test "a canonical aggregate view folds a query no monotonicity argument covers" 
     var absent = try db.execute(
         \\gone(d) :- setof(Y, r(d, Y), []).
         \\gone(X)?
-    );
+    , null);
     defer absent.deinit();
     try std.testing.expectEqual(@as(usize, 1), absent.query.answers.items.len);
 }
@@ -6351,21 +6536,21 @@ test "a view that projected its collected list away still remembers its outer go
         \\r(a, 1).
         \\v(X) :- p(X, S), setof(Y, r(X, Y), S).
         \\q(X) :- p(X, S).
-    );
+    , null);
     program.deinit();
-    var extension = try source.execute("v(X)?");
+    var extension = try source.execute("v(X)?", null);
     defer extension.deinit();
     const stored = try answerTuples(&extension.query);
     defer freeLines(stored);
     try std.testing.expectEqual(@as(usize, 2), stored.len);
-    var wanted = try source.execute("q(X)?");
+    var wanted = try source.execute("q(X)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v(a). v(b).");
+    var facts = try db.execute("v(a). v(b).", null);
     facts.deinit();
 
     const x = input.variable("X");
@@ -6421,7 +6606,7 @@ test "a view that projected its collected list away still remembers its outer go
     // now holds the rules of the first plan.
     var second: Jatalog = .init(allocator);
     defer second.deinit();
-    var more = try second.execute("v(a). v(b).");
+    var more = try second.execute("v(a). v(b).", null);
     more.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -6593,7 +6778,7 @@ test "bounded exhaustive models find no counterexample to either discharge" {
                     try Model.addCollected(&folded.state, "v", edges, key);
             }
 
-            var produced = try statement.queryClauses(&folded.state, executable.goals);
+            var produced = try transaction.queryClauses(&folded.state, executable.goals);
             defer produced.deinit();
             for (produced.answers.items) |answer| {
                 const column = try Model.indexOf(answer, 0);
@@ -6664,7 +6849,7 @@ test "bounded exhaustive models find no counterexample to either discharge" {
             if (holds) try Model.addCollected(&folded.state, "c", edges, key);
         }
 
-        var produced = try statement.queryClauses(&folded.state, counted.goals);
+        var produced = try transaction.queryClauses(&folded.state, counted.goals);
         defer produced.deinit();
         var empty = true;
         for (0..Model.size) |column| empty = empty and !Model.relates(edges, 0, column);
@@ -6691,7 +6876,7 @@ test "bounded exhaustive models find no counterexample to either discharge" {
 fn restrictedFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("c(a, [1]). v(a).");
+    var facts = try db.execute("c(a, [1]). v(a).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -6848,9 +7033,9 @@ test "a list function no view exposes is folded through the two that do" {
 
     var source: Jatalog = .init(allocator);
     defer source.deinit();
-    var program = try source.execute(Excess.program);
+    var program = try source.execute(Excess.program, null);
     program.deinit();
-    var wanted = try source.execute("q(X, E)?");
+    var wanted = try source.execute("q(X, E)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
@@ -6864,7 +7049,7 @@ test "a list function no view exposes is folded through the two that do" {
     // of `sum` or of `length` either.
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute(Excess.extensions);
+    var facts = try db.execute(Excess.extensions, null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -6934,7 +7119,7 @@ test "Example 6.5.1's recursive list function is refused rather than merely surv
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute(Excess.extensions);
+    var facts = try db.execute(Excess.extensions, null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -7076,7 +7261,7 @@ test "a plan whose views leave the collected set undetermined is unsupported" {
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). link(w, a).");
+    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). link(w, a).", null);
     facts.deinit();
 
     const x = input.variable("X");
@@ -7173,7 +7358,7 @@ test "a set collected from a relation the plan half knows is refused, monotonic 
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). asked(a, [1, 2]).");
+    var facts = try db.execute("v1(a, 3). cr(a, [1, 2]). asked(a, [1, 2]).", null);
     facts.deinit();
 
     const x = input.variable("X");
@@ -7377,7 +7562,7 @@ test "bounded exhaustive models find no counterexample to the folded list functi
             defer folded.deinit();
             try ExcessModel.extend(&folded.state, keys, edges);
 
-            var produced = try statement.queryClauses(&folded.state, executable.goals);
+            var produced = try transaction.queryClauses(&folded.state, executable.goals);
             defer produced.deinit();
             var seen: usize = 0;
             for (produced.answers.items) |answer| {
@@ -7429,7 +7614,7 @@ test "bounded exhaustive models find no counterexample to the folded list functi
 fn listFunctionFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v1(a, 1). cr(a, [1]).");
+    var facts = try db.execute("v1(a, 1). cr(a, [1]).", null);
     facts.deinit();
 
     const x = input.variable("X");
@@ -7520,9 +7705,9 @@ test "identifying two collected sets that were never one answers more than the q
         \\r(a, 2). r(a, 5). r(b, a).
         \\seed([2, 5]). seed([b]).
         \\q(X, E) :- p(X), setof(Y, r(X, Y), S), sum(S, T), length(S, C), E = T - C.
-    );
+    , null);
     program.deinit();
-    var wanted = try source.execute("q(X, E)?");
+    var wanted = try source.execute("q(X, E)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
@@ -7535,7 +7720,7 @@ test "identifying two collected sets that were never one answers more than the q
     // v1 sums the successors, v3 counts them, v2 counts the predecessors — and
     // `a` has two successors and one predecessor, so a plan confusing the two
     // sets answers six as well as five.
-    var facts = try db.execute("v1(a, 7). v3(a, 2). v2(a, 1). cr(a, [2, 5]). cr(b, [a]).");
+    var facts = try db.execute("v1(a, 7). v3(a, 2). v2(a, 1). cr(a, [2, 5]). cr(b, [a]).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);
@@ -7632,9 +7817,9 @@ test "an auxiliary view whose group a plan cannot name derives nothing rather th
         \\r(a, 2). r(a, 5).
         \\seed([2, 5]).
         \\q(X, W, T) :- p(X), g(W), setof(Y, r(X, Y), S), sum(S, T).
-    );
+    , null);
     program.deinit();
-    var wanted = try source.execute("q(X, W, T)?");
+    var wanted = try source.execute("q(X, W, T)?", null);
     defer wanted.deinit();
     const expected = try answerTuples(&wanted.query);
     defer freeLines(expected);
@@ -7643,7 +7828,7 @@ test "an auxiliary view whose group a plan cannot name derives nothing rather th
 
     var db: Jatalog = .init(allocator);
     defer db.deinit();
-    var facts = try db.execute("v1(a, w, 7). cr(a, [2, 5]). hp(z). hg(z). m(z).");
+    var facts = try db.execute("v1(a, w, 7). cr(a, [2, 5]). hp(z). hg(z). m(z).", null);
     facts.deinit();
 
     var catalog: view_catalog.Catalog = .init(allocator);

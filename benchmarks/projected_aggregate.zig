@@ -54,11 +54,11 @@ fn runPolicy(
             try database.addFact("r", &.{ input.atom(key), input.atom(name) });
         }
     }
-    var setup = try database.execute("v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).");
+    var setup = try database.execute("v(X, S) :- p(X, Z), setof(Y, r(X, Y), S).", null);
     setup.deinit();
 
     // Materialize before timing so the first batch is not charged for it.
-    var warmup = try database.execute("v(X, S)?");
+    var warmup = try database.execute("v(X, S)?", null);
     if (warmup.query.answers.items.len != key_count) return error.UnexpectedResult;
     warmup.deinit();
 
@@ -86,14 +86,14 @@ fn runPolicy(
         }
         // Query every batch so work a recompute decision defers is paid
         // inside the measured region rather than escaping it.
-        var observed = try database.execute("v(k0, S)?");
+        var observed = try database.execute("v(k0, S)?", null);
         observed.deinit();
     }
     const elapsed: u64 = @intCast(start.untilNow(init.io).raw.nanoseconds);
 
     // Verify every group by key, because answer order is an implementation
     // detail that differs between rebuilt and incrementally kept closures.
-    var verify = try database.execute("v(X, S)?");
+    var verify = try database.execute("v(X, S)?", null);
     defer verify.deinit();
     if (verify.query.answers.items.len != key_count) return error.UnexpectedResult;
     for (verify.query.answers.items) |*answer| {

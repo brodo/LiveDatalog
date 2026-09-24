@@ -90,12 +90,24 @@ fn compileGoalValidated(db: *database.Database, descriptor: input.Goal) anyerror
         .inequality => |binary| .{
             .builtin = try compileBuiltin(db, .inequality, &.{ binary.left, binary.right }),
         },
-        .comparison => |comparison| .{ .builtin = try compileBuiltin(db, switch (comparison.kind) {
-            .less_than => .less_than,
-            .less_or_equal => .less_or_equal,
-            .greater_than => .greater_than,
-            .greater_or_equal => .greater_or_equal,
-        }, &.{ comparison.operands.left, comparison.operands.right }) },
+        .negated_builtin => |builtin| blk: {
+            var expression = switch (builtin) {
+                .equality => |binary| try compileBuiltin(db, .equality, &.{ binary.left, binary.right }),
+                .inequality => |binary| try compileBuiltin(db, .inequality, &.{ binary.left, binary.right }),
+                .comparison => |comparison| try compileBuiltin(
+                    db,
+                    comparisonKind(comparison.kind),
+                    &.{ comparison.operands.left, comparison.operands.right },
+                ),
+            };
+            expression.negated = true;
+            break :blk .{ .negated = expression };
+        },
+        .comparison => |comparison| .{ .builtin = try compileBuiltin(
+            db,
+            comparisonKind(comparison.kind),
+            &.{ comparison.operands.left, comparison.operands.right },
+        ) },
         .arithmetic => |arithmetic| .{ .builtin = try compileBuiltin(db, switch (arithmetic.kind) {
             .add => .add,
             .subtract => .subtract,
@@ -109,6 +121,14 @@ fn compileGoalValidated(db: *database.Database, descriptor: input.Goal) anyerror
             const body = try compileGoalsValidated(db, aggregate.body);
             break :blk .{ .aggregate = .{ .template = template, .body = body, .output = output } };
         },
+    };
+}
+fn comparisonKind(kind: input.Comparison) syntax.GoalKind {
+    return switch (kind) {
+        .less_than => .less_than,
+        .less_or_equal => .less_or_equal,
+        .greater_than => .greater_than,
+        .greater_or_equal => .greater_or_equal,
     };
 }
 pub fn compileBuiltin(db: *database.Database, kind: syntax.GoalKind, terms: []const input.Term) !syntax.Expr {

@@ -65,6 +65,16 @@ const Validator = struct {
                 try self.term(binary.left);
                 try self.term(binary.right);
             },
+            .negated_builtin => |builtin| switch (builtin) {
+                .equality, .inequality => |binary| {
+                    try self.term(binary.left);
+                    try self.term(binary.right);
+                },
+                .comparison => |comparison| {
+                    try self.term(comparison.operands.left);
+                    try self.term(comparison.operands.right);
+                },
+            },
             .comparison => |comparison| {
                 try self.term(comparison.operands.left);
                 try self.term(comparison.operands.right);
