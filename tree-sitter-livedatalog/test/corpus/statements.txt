@@ -1,0 +1,373 @@
+================================================================================
+Facts, rules, queries and retractions
+================================================================================
+
+parent(alice, bob).
+grandparent(X, Z) :- parent(X, Y), parent(Y, Z).
+parent(alice, X)?
+parent(X, bob)~
+
+--------------------------------------------------------------------------------
+
+(program
+  (fact
+    (relation
+      (atom)
+      (atom)
+      (atom)))
+  (rule
+    (relation
+      (atom)
+      (variable)
+      (variable))
+    (body
+      (relation
+        (atom)
+        (variable)
+        (variable))
+      (relation
+        (atom)
+        (variable)
+        (variable))))
+  (query
+    (body
+      (relation
+        (atom)
+        (atom)
+        (variable))))
+  (retraction
+    (body
+      (relation
+        (atom)
+        (variable)
+        (atom)))))
+
+================================================================================
+Built-ins, negation and arithmetic
+================================================================================
+
+p(X), not q(X), X = Y, X != Y, X <> Y, X < Y, X >= Y, Z = X + Y, W = X - 1?
+p(X), not X < Y, not X = Y?
+
+--------------------------------------------------------------------------------
+
+(program
+  (query
+    (body
+      (relation
+        (atom)
+        (variable))
+      (negation
+        (relation
+          (atom)
+          (variable)))
+      (comparison
+        (variable)
+        (variable))
+      (comparison
+        (variable)
+        (variable))
+      (comparison
+        (variable)
+        (variable))
+      (comparison
+        (variable)
+        (variable))
+      (comparison
+        (variable)
+        (variable))
+      (arithmetic
+        (variable)
+        (variable)
+        (variable))
+      (arithmetic
+        (variable)
+        (variable)
+        (number))))
+  (query
+    (body
+      (relation
+        (atom)
+        (variable))
+      (negation
+        (comparison
+          (variable)
+          (variable)))
+      (negation
+        (comparison
+          (variable)
+          (variable))))))
+
+================================================================================
+Scalars
+================================================================================
+
+v(abc, 'quoted \' atom', "1", 42, -7, +36, 2.5, 1e3, 1e-3, _x).
+
+--------------------------------------------------------------------------------
+
+(program
+  (fact
+    (relation
+      (atom)
+      (atom)
+      (string)
+      (string)
+      (number)
+      (number)
+      (number)
+      (number)
+      (number)
+      (number)
+      (atom))))
+
+================================================================================
+Lists and cons
+================================================================================
+
+v([], [a, b], [a,], H!T, cons(H, T), [a, b!T], H!T!U).
+
+--------------------------------------------------------------------------------
+
+(program
+  (fact
+    (relation
+      (atom)
+      (list)
+      (list
+        (atom)
+        (atom))
+      (list
+        (atom))
+      (cons_pattern
+        (variable)
+        (variable))
+      (cons
+        (variable)
+        (variable))
+      (list
+        (atom)
+        (cons_pattern
+          (atom)
+          (variable)))
+      (cons_pattern
+        (variable)
+        (cons_pattern
+          (variable)
+          (variable))))))
+
+================================================================================
+Aggregates
+================================================================================
+
+s(S) :- setof(Y, p(Y), S).
+n(S) :- seed(k), setof(T, (group(G), setof([Y, G], parent(G, Y), T)), S).
+
+--------------------------------------------------------------------------------
+
+(program
+  (rule
+    (relation
+      (atom)
+      (variable))
+    (body
+      (setof
+        (variable)
+        (relation
+          (atom)
+          (variable))
+        (variable))))
+  (rule
+    (relation
+      (atom)
+      (variable))
+    (body
+      (relation
+        (atom)
+        (atom))
+      (setof
+        (variable)
+        (parenthesized_body
+          (relation
+            (atom)
+            (variable))
+          (setof
+            (list
+              (variable)
+              (variable))
+            (relation
+              (atom)
+              (variable)
+              (variable))
+            (variable)))
+        (variable)))))
+
+================================================================================
+Order by
+================================================================================
+
+score(P, S) order by S desc, P?
+p(X) order by X asc?
+
+--------------------------------------------------------------------------------
+
+(program
+  (query
+    (body
+      (relation
+        (atom)
+        (variable)
+        (variable)))
+    (order_by
+      (sort_key
+        (variable))
+      (sort_key
+        (variable))))
+  (query
+    (body
+      (relation
+        (atom)
+        (variable)))
+    (order_by
+      (sort_key
+        (variable)))))
+
+================================================================================
+Schemas and type tests
+================================================================================
+
+schema age(Person: atom, Years: int).
+schema scores(atom, list(number)).
+schema nested(list(list(any)), list).
+schema empty().
+tagged(X) :- raw(X), X : atom, not X : list(int).
+
+--------------------------------------------------------------------------------
+
+(program
+  (schema
+    (atom)
+    (column
+      (variable)
+      (primitive_type))
+    (column
+      (variable)
+      (primitive_type)))
+  (schema
+    (atom)
+    (column
+      (primitive_type))
+    (column
+      (list_type
+        (primitive_type))))
+  (schema
+    (atom)
+    (column
+      (list_type
+        (list_type
+          (primitive_type))))
+    (column
+      (primitive_type)))
+  (schema
+    (atom))
+  (rule
+    (relation
+      (atom)
+      (variable))
+    (body
+      (relation
+        (atom)
+        (variable))
+      (type_test
+        (variable)
+        (primitive_type))
+      (negation
+        (type_test
+          (variable)
+          (list_type
+            (primitive_type)))))))
+
+================================================================================
+Contextual keywords are atoms elsewhere
+================================================================================
+
+schema(x).
+order(a).
+p(schema, cons, not, setof, order, by, asc, desc, atom, int, list).
+cons(a, []) = X?
+
+--------------------------------------------------------------------------------
+
+(program
+  (fact
+    (relation
+      (atom)
+      (atom)))
+  (fact
+    (relation
+      (atom)
+      (atom)))
+  (fact
+    (relation
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)
+      (atom)))
+  (query
+    (body
+      (comparison
+        (cons
+          (atom)
+          (list))
+        (variable)))))
+
+================================================================================
+Comments
+================================================================================
+
+% percent
+p(a). // slash
+/* block
+   comment */ p(b).
+
+--------------------------------------------------------------------------------
+
+(program
+  (comment)
+  (fact
+    (relation
+      (atom)
+      (atom)))
+  (comment)
+  (comment)
+  (fact
+    (relation
+      (atom)
+      (atom))))
+
+================================================================================
+Quoted predicate names
+================================================================================
+
+"a relation"(x).
+schema 'Quoted'(atom).
+
+--------------------------------------------------------------------------------
+
+(program
+  (fact
+    (relation
+      (string)
+      (atom)))
+  (schema
+    (string)
+    (column
+      (primitive_type))))
