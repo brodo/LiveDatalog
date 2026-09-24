@@ -11,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Client = @import("Client.zig");
+const Graph = @import("Graph.zig");
 
 const Model = @This();
 const log = std.log.scoped(.browser);
@@ -21,6 +22,9 @@ pub const page_size = 1000;
 /// when they scroll back into view.
 const max_pages = 16;
 const retry_delay: Io.Duration = .fromSeconds(1);
+/// The most facts the graph draws; the rest of the chosen predicates' facts
+/// are left out, and the window says so.
+pub const graph_cap = 5000;
 
 gpa: std.mem.Allocator,
 io: Io,
@@ -50,6 +54,19 @@ table_revision: u64 = 0,
 query: ?[]const u8 = null,
 /// What the server last answered to `query`.
 answer: ?Answer = null,
+/// Whether the window shows the graph, and so wants its facts. Set by the
+/// window.
+graph_mode: bool = false,
+/// The predicates the graph draws, their names owned by `gpa`. Set by the
+/// window through `toggleGraph`, and first from the first catalog.
+graph_choice: std.ArrayList(Key) = .empty,
+graph_choice_ready: bool = false,
+/// Counts the changes to `graph_choice`.
+graph_choice_revision: u64 = 0,
+/// The facts of the chosen predicates, once fetched.
+graph: ?GraphData = null,
+/// Counts the changes to `graph`.
+graph_revision: u64 = 0,
 
 /// Wakes the fetcher. Holds at most one pending wake.
 fetch_signal: Io.Queue(u8),
@@ -89,6 +106,28 @@ pub const Catalog = struct {
             if (predicate.arity == arity and std.mem.eql(u8, predicate.name, name)) return predicate;
         return null;
     }
+};
+
+/// A predicate, by name and arity.
+pub const Key = struct {
+    name: []const u8,
+    arity: usize,
+
+    pub fn eql(self: Key, name: []const u8, arity: usize) bool {
+        return self.arity == arity and std.mem.eql(u8, self.name, name);
+    }
+};
+
+/// The facts the graph draws, as of one generation and one choice of
+/// predicates.
+pub const GraphData = struct {
+    arena: std.heap.ArenaAllocator,
+    generation: ?u64,
+    choice_revision: u64,
+    predicates: []const Graph.Predicate = &.{},
+    facts: []const Graph.Fact = &.{},
+    /// How many facts the chosen predicates hold, drawn or not.
+    total: usize = 0,
 };
 
 pub const Sort = struct {
@@ -184,7 +223,53 @@ pub fn deinit(self: *Model) void {
     if (self.selection) |selection| self.gpa.free(selection.name);
     if (self.answer) |*answer| answer.arena.deinit();
     if (self.query) |query| self.gpa.free(query);
+    for (self.graph_choice.items) |key| self.gpa.free(key.name);
+    self.graph_choice.deinit(self.gpa);
+    if (self.graph) |*graph| graph.arena.deinit();
     self.* = undefined;
+}
+
+/// Shows or hides the graph. Call with `mutex` held.
+pub fn showGraph(self: *Model, shown: bool) void {
+    self.graph_mode = shown;
+    self.signalFetch();
+}
+
+/// Whether the graph draws `name`/`arity`. Call with `mutex` held.
+pub fn graphChosen(self: *const Model, name: []const u8, arity: usize) bool {
+    for (self.graph_choice.items) |key| if (key.eql(name, arity)) return true;
+    return false;
+}
+
+/// Adds `name`/`arity` to the graph, or takes it out. Call with `mutex` held.
+pub fn toggleGraph(self: *Model, name: []const u8, arity: usize) !void {
+    const found = for (self.graph_choice.items, 0..) |key, index| {
+        if (key.eql(name, arity)) break index;
+    } else null;
+    if (found) |index| {
+        self.gpa.free(self.graph_choice.items[index].name);
+        _ = self.graph_choice.orderedRemove(index);
+    } else {
+        const owned = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned);
+        try self.graph_choice.append(self.gpa, .{ .name = owned, .arity = arity });
+    }
+    self.graph_choice_revision += 1;
+    self.signalFetch();
+}
+
+/// The graph starts with every binary predicate, if their facts fit under
+/// the cap, and with nothing otherwise.
+fn chooseFirstGraph(self: *Model) !void {
+    self.graph_choice_ready = true;
+    var binary_facts: usize = 0;
+    for (self.catalog.predicates) |predicate| {
+        if (predicate.arity == 2) binary_facts += predicate.facts;
+    }
+    if (binary_facts > graph_cap) return;
+    for (self.catalog.predicates) |predicate| {
+        if (predicate.arity == 2 and !self.graphChosen(predicate.name, 2)) try self.toggleGraph(predicate.name, 2);
+    }
 }
 
 /// Shows the answers to `query` until a predicate is selected again, and
@@ -293,9 +378,16 @@ fn fetchOnce(self: *Model) !void {
 const Need = union(enum) {
     nothing,
     catalog: ?u64,
+    graph: struct { choice: []const GraphChoice, generation: ?u64, choice_revision: u64 },
     query: struct { text: []const u8, generation: ?u64 },
     schema: struct { selection: Selection, generation: ?u64, typed: bool },
     page: struct { selection: Selection, generation: ?u64, page: usize },
+};
+
+/// A chosen predicate as the fetcher asks for it.
+const GraphChoice = struct {
+    key: Key,
+    facts: usize,
 };
 
 /// Fetches one missing thing. Returns false when nothing is missing.
@@ -315,6 +407,7 @@ fn fetchNext(self: *Model, client: *Client) !bool {
         .nothing => return false,
         .catalog => |generation| try self.fetchCatalog(client, generation),
         .query => |query| try self.fetchAnswer(client, query.text, query.generation),
+        .graph => |graph| try self.fetchGraph(arena, client, graph.choice, graph.generation, graph.choice_revision),
         .schema => |schema| try self.fetchSchema(arena, client, schema.selection, schema.generation, schema.typed),
         .page => |page| try self.fetchPage(arena, client, page.selection, page.generation, page.page),
     }
@@ -327,6 +420,27 @@ fn fetchNext(self: *Model, client: *Client) !bool {
 fn decide(self: *Model, arena: std.mem.Allocator) !Need {
     if (self.catalog.arena == null or self.catalog.generation != self.generation)
         return .{ .catalog = self.generation };
+    if (self.graph_mode) {
+        const current = if (self.graph) |*g|
+            g.generation == self.catalog.generation and g.choice_revision == self.graph_choice_revision
+        else
+            false;
+        if (current) return .nothing;
+        // Asked for in the catalog's order, which is the order the cap cuts in.
+        var choice: std.ArrayList(GraphChoice) = .empty;
+        for (self.catalog.predicates) |predicate| {
+            if (!self.graphChosen(predicate.name, predicate.arity)) continue;
+            try choice.append(arena, .{
+                .key = .{ .name = try arena.dupe(u8, predicate.name), .arity = predicate.arity },
+                .facts = predicate.facts,
+            });
+        }
+        return .{ .graph = .{
+            .choice = choice.items,
+            .generation = self.catalog.generation,
+            .choice_revision = self.graph_choice_revision,
+        } };
+    }
     if (self.query) |query| {
         const answer = if (self.answer) |*a| a else null;
         if (answer == null or answer.?.generation != self.catalog.generation or
@@ -403,6 +517,60 @@ fn fetchCatalog(self: *Model, client: *Client, generation: ?u64) !void {
     defer self.mutex.unlock(self.io);
     self.catalog.reset();
     self.catalog = catalog;
+    if (!self.graph_choice_ready) try self.chooseFirstGraph();
+}
+
+fn fetchGraph(
+    self: *Model,
+    scratch: std.mem.Allocator,
+    client: *Client,
+    choice: []const GraphChoice,
+    generation: ?u64,
+    choice_revision: u64,
+) !void {
+    var data: GraphData = .{ .arena = .init(self.gpa), .generation = generation, .choice_revision = choice_revision };
+    errdefer data.arena.deinit();
+    const arena = data.arena.allocator();
+    var predicates: std.ArrayList(Graph.Predicate) = .empty;
+    var facts: std.ArrayList(Graph.Fact) = .empty;
+
+    for (choice) |chosen| {
+        data.total += chosen.facts;
+        const room = graph_cap - facts.items.len;
+        if (chosen.key.arity == 0 or room == 0) continue;
+        const line = try std.fmt.allocPrint(scratch, ".rows {s}/{d} 0 {d} origin", .{
+            chosen.key.name,
+            chosen.key.arity,
+            room,
+        });
+        // A predicate gone since the catalog was fetched is left out.
+        const table = (try client.request(arena, line)).expectTable() catch continue;
+        if (table.header.len != chosen.key.arity + 1) return error.UnexpectedResponse;
+        const index: u32 = @intCast(predicates.items.len);
+        try predicates.append(arena, .{
+            .name = try arena.dupe(u8, chosen.key.name),
+            .arity = chosen.key.arity,
+            .columns = table.header[0..chosen.key.arity],
+        });
+        for (table.rows) |row| {
+            if (row.len != table.header.len) return error.UnexpectedResponse;
+            const values = try arena.alloc(Client.Cell, chosen.key.arity);
+            for (values, row[0..chosen.key.arity]) |*value, text| value.* = try Client.decodeCell(arena, text);
+            try facts.append(arena, .{
+                .predicate = index,
+                .values = values,
+                .derived = std.mem.eql(u8, row[chosen.key.arity], "derived"),
+            });
+        }
+    }
+    data.predicates = predicates.items;
+    data.facts = facts.items;
+
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.graph) |*old| old.arena.deinit();
+    self.graph = data;
+    self.graph_revision += 1;
 }
 
 fn fetchAnswer(self: *Model, client: *Client, query: []const u8, generation: ?u64) !void {
@@ -581,7 +749,8 @@ test "canceling the tasks stops them while they wait on the server" {
 }
 
 /// Answers one connection the way the query listener would, from a script:
-/// no predicates, no load errors, generation 1, and two answers to any query.
+/// one binary predicate with two facts, no load errors, generation 1, and
+/// two answers to `p(X)?`.
 fn fakeListener(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
     defer stream.close(io);
     var read_buffer: [1024]u8 = undefined;
@@ -593,9 +762,11 @@ fn fakeListener(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
         const response = if (std.mem.eql(u8, line, ".watch"))
             "generation 1\n"
         else if (std.mem.eql(u8, line, ".predicates"))
-            "ok table 0\nname\tarity\tkind\tfacts\ttyped\n"
+            "ok table 2\nname\tarity\tkind\tfacts\ttyped\nedge\t2\tmixed\t2\tfalse\nnone\t0\tbase\t1\tfalse\n"
         else if (std.mem.eql(u8, line, ".errors"))
             "ok table 0\nfile\tline\tcolumn\terror\tmessage\n"
+        else if (std.mem.eql(u8, line, ".rows edge/2 0 5000 origin"))
+            "ok table 2\n1\t2\t$origin\na\t'B c'\tbase\n'B c'\ta\tderived\n"
         else if (std.mem.eql(u8, line, "p(X)?"))
             "ok table 2\nX\n'a b'\n-1\n"
         else
@@ -664,6 +835,44 @@ test "a query's answers are fetched, and commands never reach the server" {
     try testing.expectEqualStrings("only queries can be run here, not commands", model.answer.?.failure.?);
 }
 
+test "the graph starts with the binary predicates and fetches their facts with their origin" {
+    const io = testing.io;
+    var server = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var model: Model = undefined;
+    model.init(testing.allocator, io, server.socket.address, ignoreWake, null);
+    defer model.deinit();
+    var fetcher = try io.concurrent(runFetcher, .{&model});
+    defer _ = fetcher.cancel(io) catch {};
+    var watcher = try io.concurrent(runWatcher, .{&model});
+    defer _ = watcher.cancel(io) catch {};
+    var connections: Io.Group = .init;
+    defer connections.cancel(io);
+    for (0..2) |_| try connections.concurrent(io, fakeListener, .{ io, try server.accept(io) });
+
+    try model.mutex.lock(io);
+    model.showGraph(true);
+    model.mutex.unlock(io);
+    try waitFor(&model, struct {
+        fn check(m: *Model) bool {
+            return m.graph != null;
+        }
+    }.check);
+
+    try testing.expect(model.graphChosen("edge", 2));
+    try testing.expect(!model.graphChosen("none", 0));
+    const data = model.graph.?;
+    try testing.expectEqual(@as(usize, 1), data.predicates.len);
+    try testing.expectEqual(@as(usize, 2), data.facts.len);
+    try testing.expectEqual(@as(usize, 2), data.total);
+    try testing.expectEqualStrings("'B c'", data.facts[0].values[1].canonical);
+    try testing.expectEqualStrings("B c", data.facts[0].values[1].text);
+    try testing.expect(!data.facts[0].derived);
+    try testing.expect(data.facts[1].derived);
+}
+
 test {
     _ = Client;
+    _ = @import("Graph.zig");
 }

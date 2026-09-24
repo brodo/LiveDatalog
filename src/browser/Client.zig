@@ -163,6 +163,9 @@ pub const Cell = struct {
     kind: Kind,
     /// What to show: an atom without its quotes, anything else as written.
     text: []const u8,
+    /// The value as the server wrote it, which names it: two cells hold the
+    /// same value exactly when this is the same.
+    canonical: []const u8 = "",
 
     pub const Kind = enum { empty, atom, number, structure };
 };
@@ -171,15 +174,14 @@ pub const Cell = struct {
 /// Borrows from `canonical` unless a quoted atom has escapes to undo.
 pub fn decodeCell(arena: std.mem.Allocator, canonical: []const u8) !Cell {
     if (canonical.len == 0) return .{ .kind = .empty, .text = "" };
-    switch (canonical[0]) {
-        '\'' => return .{ .kind = .atom, .text = try unquote(arena, canonical) },
-        '[' => return .{ .kind = .structure, .text = canonical },
-        '-', '0'...'9' => return .{ .kind = .number, .text = canonical },
-        else => {},
-    }
-    // A pair that is not a proper list is written `cons(H, T)`.
-    if (std.mem.startsWith(u8, canonical, "cons(")) return .{ .kind = .structure, .text = canonical };
-    return .{ .kind = .atom, .text = canonical };
+    const kind: Cell.Kind = switch (canonical[0]) {
+        '\'' => return .{ .kind = .atom, .text = try unquote(arena, canonical), .canonical = canonical },
+        '[' => .structure,
+        '-', '0'...'9' => .number,
+        // A pair that is not a proper list is written `cons(H, T)`.
+        else => if (std.mem.startsWith(u8, canonical, "cons(")) .structure else .atom,
+    };
+    return .{ .kind = kind, .text = canonical, .canonical = canonical };
 }
 
 fn unquote(arena: std.mem.Allocator, quoted: []const u8) ![]const u8 {

@@ -614,8 +614,8 @@ what went wrong loading them.
 
 ### Browser
 
-A graphical client of the query listener that shows the database one
-predicate at a time as a table. As everywhere, a predicate is its name *and*
+A graphical client of the query listener that shows the database either one
+predicate at a time as a table, or as a graph (see *Graph view*). As everywhere, a predicate is its name *and*
 arity, so an untyped name used at two arities is two tables. It lists every
 predicate that has facts, base or derived, and every predicate a schema
 declares, even one with no facts yet. A column is headed by its schema's name
@@ -623,6 +623,17 @@ for it and, for a typed predicate, its column type; a column without a name is
 headed by its 1-based position. The browser can also show the answers to a
 query in place of a predicate, headed by the query's variables. Like every
 client, the browser cannot change the database.
+
+### Graph view
+
+The browser's picture of the database as a network. Each distinct value is a
+*value node*, identified by its canonical text, so `1` and `1.0` are one node
+and the atom `'1'` is another. A fact of a binary predicate is an arrow from
+its first value to its second, a fact of a unary predicate is a tag on its
+value's node, and a fact of three or more arguments is a *fact node* wired to
+each argument by position. Only the predicates chosen for the graph are drawn,
+and a fact is drawn differently when its *origin* is derived rather than base:
+a fact asserted in the files is base even if a rule derives it too.
 
 ### Kind
 

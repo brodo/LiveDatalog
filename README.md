@@ -112,7 +112,7 @@ and one empty row when it holds.
 | --- | --- |
 | `.predicates` | every predicate: `name`, `arity`, `kind` (`base`, `derived` or `mixed`), `facts`, `typed` |
 | `.schema NAME` | a predicate's schema: `position`, `name`, `type`; no rows if it has none |
-| `.rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc\|desc] ...]` | a predicate's facts, headed by its schema's column names, one page at a time |
+| `.rows NAME/ARITY [OFFSET [LIMIT]] [origin] [by POSITION [asc\|desc] ...]` | a predicate's facts, headed by its schema's column names, one page at a time; `origin` adds a `$origin` column saying `base` or `derived` |
 | `.status` | directory, generation and counts |
 | `.errors` | the load errors: `file`, `line`, `column`, `error`, `message` |
 | `.files` | the loaded files |
@@ -144,6 +144,18 @@ The query bar above the table runs any query the query listener accepts, such
 as `born(Who, Year), Year < 1800` or `p(X, N) order by N desc?`, and shows its
 answers in a grid headed by the query's variables until a predicate is chosen
 again. Commands are not run from there.
+
+**Graph** switches the right side to a network of the database. Each value is
+a node; a fact of a binary predicate is an arrow between its two values,
+colored by predicate and dashed when it is derived; a fact of a unary
+predicate is a chip under its value; and a wider fact is a small dot wired to
+each of its values, the wires labeled with the schema's column names. The
+sidebar's checkboxes choose which predicates are drawn: every binary predicate
+at first, unless together they hold more than 5,000 facts. At most 5,000 facts
+are drawn, and the view says when some are left out. Drag a node to move and
+pin it, drag the background to pan, scroll to zoom, and hover over a node or
+an edge to see it in full. When the files change, the nodes still there stay
+where they were. For large graphs, build with `-Doptimize=ReleaseFast`.
 
 The browser follows `.watch`, so the open table and a query's answers
 refresh when the files change. It reconnects every second while the server

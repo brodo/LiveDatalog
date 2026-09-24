@@ -8,6 +8,8 @@ const Io = std.Io;
 const dvui = @import("dvui");
 const Model = @import("Model.zig");
 const Client = @import("Client.zig");
+const Graph = @import("Graph.zig");
+const GraphView = @import("GraphView.zig");
 
 const log = std.log.scoped(.browser);
 
@@ -48,6 +50,11 @@ var sized_revision: ?u64 = null;
 /// The share of the window's width the predicate list takes. Dragging the
 /// sash between it and the table changes it.
 var sidebar_ratio: f32 = 0.22;
+/// The graph view's nodes and layout, and how it is looked at.
+var graph: Graph = undefined;
+var graph_view: GraphView = .{};
+/// The `Model.graph_revision` the graph was last synced to.
+var graph_synced: ?u64 = null;
 
 fn parseAddress(args: []const [:0]const u8) !Io.net.IpAddress {
     var host: []const u8 = "127.0.0.1";
@@ -80,6 +87,7 @@ fn appInit(win: *dvui.Window) !void {
     };
     server_name = std.fmt.bufPrint(&server_name_buffer, "{f}", .{address}) catch "server";
 
+    graph = .init(process.gpa);
     model.init(process.gpa, io, address, wake, win);
     fetcher = try io.concurrent(Model.runFetcher, .{&model});
     watcher = try io.concurrent(Model.runWatcher, .{&model});
@@ -92,6 +100,7 @@ fn appDeinit(_: *dvui.Window) void {
         };
     };
     model.deinit();
+    graph.deinit();
 }
 
 /// Called from the model's tasks when there is something new to show.
@@ -118,7 +127,13 @@ fn appFrame() !dvui.App.Result {
         var pane = dvui.box(@src(), .{}, .{ .expand = .both });
         defer pane.deinit();
         try queryBar();
-        if (model.query != null) answers() else try table();
+        if (model.graph_mode) {
+            try graphPane();
+        } else if (model.query != null) {
+            answers();
+        } else {
+            try table();
+        }
     }
     return .ok;
 }
@@ -183,6 +198,10 @@ fn predicateList() !void {
     defer scroll.deinit();
 
     for (model.catalog.predicates, 0..) |predicate, index| {
+        if (model.graph_mode) {
+            try graphChoice(predicate, index);
+            continue;
+        }
         const selected = if (model.selection) |s|
             model.query == null and s.arity == predicate.arity and std.mem.eql(u8, s.name, predicate.name)
         else
@@ -201,6 +220,69 @@ fn predicateList() !void {
         options.style = if (selected) .highlight else .control;
         if (dvui.button(@src(), label, .{}, options)) try model.select(predicate.name, predicate.arity, null);
     }
+}
+
+/// A predicate in the sidebar while the graph shows: whether it is drawn, in
+/// the color it is drawn in.
+fn graphChoice(predicate: Model.Predicate, index: usize) !void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = index, .expand = .horizontal });
+    defer row.deinit();
+    dvui.box(@src(), .{}, .{
+        .min_size_content = .{ .w = 10, .h = 10 },
+        .gravity_y = 0.5,
+        .margin = .{ .x = 4, .w = 2 },
+        .background = true,
+        .corners = .all(2),
+        .color_fill = .{ .color = GraphView.predicateColor(predicate.name) },
+    }).deinit();
+    var label_buffer: [256]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buffer, "{s}/{d}   {s} · {d}", .{
+        predicate.name,
+        predicate.arity,
+        predicate.kind,
+        predicate.facts,
+    }) catch predicate.name;
+    // A predicate without arguments has nothing to draw.
+    if (predicate.arity == 0) return dvui.labelNoFmt(@src(), label, .{}, disabledOptions());
+    var chosen = model.graphChosen(predicate.name, predicate.arity);
+    if (dvui.checkbox(@src(), &chosen, label, textOptions())) try model.toggleGraph(predicate.name, predicate.arity);
+}
+
+fn disabledOptions() dvui.Options {
+    return .{ .color_text = .{ .color = dvui.themeGet().text.opacity(0.4) } };
+}
+
+/// The chosen predicates' facts as a network. See "Graph view" in CONTEXT.md.
+fn graphPane() !void {
+    const data = if (model.graph) |*g| g else {
+        dvui.label(@src(), "Loading…", .{}, .{ .gravity_x = 0.5, .gravity_y = 0.5 });
+        return;
+    };
+    if (graph_synced != model.graph_revision) {
+        try graph.sync(data.predicates, data.facts);
+        graph_synced = model.graph_revision;
+    }
+
+    {
+        var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+        defer bar.deinit();
+        dvui.label(@src(), "{d} nodes · {d} edges", .{ graph.nodes.len, graph.edges.len }, .{ .gravity_y = 0.5 });
+        if (data.facts.len < data.total) {
+            dvui.label(@src(), "showing {d} of {d} facts; at most {d} are drawn", .{
+                data.facts.len,
+                data.total,
+                Model.graph_cap,
+            }, .{ .style = .err, .gravity_y = 0.5 });
+        }
+        if (model.graph_choice.items.len == 0)
+            dvui.label(@src(), "Choose predicates on the left to draw them.", .{}, .{ .gravity_y = 0.5 });
+        if (dvui.button(@src(), "Re-layout", .{}, .{ .gravity_x = 1 })) {
+            graph.relayout();
+            graph_view.fitted = false;
+        }
+        if (dvui.button(@src(), "Fit", .{}, .{ .gravity_x = 1 })) graph_view.fitted = false;
+    }
+    graph_view.draw(&graph, data, !model.connected);
 }
 
 fn table() !void {
@@ -288,6 +370,12 @@ fn queryBar() !void {
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
     defer bar.deinit();
 
+    // Which view the right side shows.
+    if (dvui.button(@src(), "Table", .{}, .{ .style = if (model.graph_mode) .control else .highlight }))
+        model.showGraph(false);
+    if (dvui.button(@src(), "Graph", .{}, .{ .style = if (model.graph_mode) .highlight else .control }))
+        model.showGraph(true);
+
     var query_buffer: [max_query]u8 = undefined;
     var entry = dvui.textEntry(@src(), .{
         .text = .{ .internal = .{ .limit = max_query } },
@@ -299,7 +387,11 @@ fn queryBar() !void {
     entry.deinit();
 
     const run = dvui.button(@src(), "Run", .{}, .{});
-    if ((entered or run) and std.mem.trim(u8, query, &std.ascii.whitespace).len != 0) try model.ask(query);
+    if ((entered or run) and std.mem.trim(u8, query, &std.ascii.whitespace).len != 0) {
+        // Answers are rows, not facts, so they show as a table.
+        model.showGraph(false);
+        try model.ask(query);
+    }
 }
 
 /// The answers to the query in the query bar, headed by its variables.
