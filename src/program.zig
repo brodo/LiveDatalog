@@ -78,7 +78,7 @@ pub fn execute(
         switch (statement) {
             .fact, .rule, .schema => {
                 if (run == null) run = .{
-                    .transaction = try transaction.Transaction.begin(db, .assertion),
+                    .transaction = try transaction.Transaction.begin(db),
                 };
                 const open = &run.?.transaction;
                 const mark = open.savepoint();

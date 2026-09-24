@@ -54,7 +54,7 @@ pub const MaintenancePolicy = cost_model.MaintenancePolicy;
 pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
 pub const InternStats = database.InternStats;
-/// One statement's transaction: what a front end runs a statement in.
+/// The transaction a front end stages a run of assertions in.
 pub const Transaction = transaction.Transaction;
 
 /// Where a parse or a program run failed. See `parseProgram` and `execute`.

@@ -1,10 +1,13 @@
 //! What a statement does to a database, and the transaction it does it in.
 //!
 //! A program is a sequence of statements, each of which either commits
-//! completely or leaves the database exactly as it was. The operations here
-//! are the compiled form of those statements — they take clauses already
-//! compiled against the database rather than caller descriptors — and
-//! `Transaction` is what stages them.
+//! completely or leaves the database exactly as it was. Most of the
+//! operations here are the compiled form of those statements — they take
+//! clauses already compiled against the database rather than caller
+//! descriptors. The exceptions are the statements that evaluate: `query`,
+//! `retract` and `explain` take the caller's goals and run the whole
+//! statement, copy and all, because every caller runs them the same way.
+//! `Transaction` is what stages a run of assertions.
 
 const std = @import("std");
 const compile = @import("compile.zig");
@@ -457,51 +460,36 @@ pub fn resolveRetraction(
     return resolved;
 }
 
-/// One statement's transaction.
+/// The transaction a run of assertions is staged in.
 ///
 /// A source program is a sequence of statements, each of which either commits
 /// completely or leaves the database exactly as it was, so a failure part-way
 /// through a program keeps every earlier statement and none of this one. A
-/// front end executes a statement by beginning one of these, running the
-/// statement against `target`, and committing the result.
+/// front end asserts facts, rules and schemas by beginning one of these,
+/// running each statement against `target` under a savepoint of its own, and
+/// committing the run.
+///
+/// Queries and retractions do not need one. Neither commits the copy it
+/// evaluates on, so each is a single call — `query` or `retract` — that makes
+/// and releases its own, which is also what keeps what it cost on the
+/// database's books.
 ///
 /// This is deliberately the whole transaction interface a front end gets for
-/// that. The primitives it is built from — cloning the database, replacing it
-/// with a staged copy, applying a retraction's facts through the deletion
-/// engine — are not part of the public interface, because committing a foreign
-/// staging database is not an operation an embedder should be able to name.
+/// that. The primitives it is built from — cloning the database and replacing
+/// it with a staged copy — are not part of the public interface, because
+/// committing a foreign staging database is not an operation an embedder
+/// should be able to name.
 pub const Transaction = struct {
-    /// What the statement is, as far as the transaction cares: only whether
-    /// it evaluates matters here.
-    pub const Kind = enum { assertion, query, retraction };
-
     database: *database.Database,
     staging: database.Database,
-    /// The base facts a retraction resolved its goals to, held from the point
-    /// the statement runs to the point it commits. A retraction is the one
-    /// statement whose commit needs something the statement itself produced,
-    /// and this transaction is what spans the two.
-    removed: relation_store.RelationStore,
 
-    /// Opens a transaction for one statement, or — with `.assertion` — for a
-    /// run of consecutive ones. A statement that evaluates needs the committed
-    /// closure materialized first, so that the staged copy shares its value
-    /// identifiers and evaluation never expands.
-    pub fn begin(db: *database.Database, kind: Kind) !Transaction {
-        switch (kind) {
-            .query, .retraction => try materialization.ensureMaterialized(db),
-            .assertion => {},
-        }
-        return .{
-            .database = db,
-            .staging = try db.clone(),
-            .removed = .init(db.allocator),
-        };
+    /// Opens a transaction for a run of consecutive assertions.
+    pub fn begin(db: *database.Database) !Transaction {
+        return .{ .database = db, .staging = try db.clone() };
     }
 
-    /// The database to execute the statement against. Everything it interns —
-    /// including values a query mentions but the database does not hold — stays
-    /// here unless the statement commits.
+    /// The database to execute the statements against. Everything they intern
+    /// stays here unless the run commits.
     pub fn target(self: *Transaction) *database.Database {
         return &self.staging;
     }
@@ -528,39 +516,17 @@ pub const Transaction = struct {
 
     /// Installs what a run of assertions has staged so far.
     ///
-    /// This is `commit(.none)` without the error union. A run is committed
-    /// both when it ends and when a statement inside it fails, and on that
-    /// second path there is nothing to spend on an allocation and no room for
-    /// a second error to report — so the operation a run commits through is
-    /// spelled as one that cannot fail.
+    /// Spelled as an operation that cannot fail. A run is committed both when
+    /// it ends and when a statement inside it fails, and on that second path
+    /// there is nothing to spend on an allocation and no room for a second
+    /// error to report.
     pub fn commitAssertions(self: *Transaction) void {
         self.database.commit(&self.staging);
     }
 
-    /// Runs a retraction against the staging copy, keeping the base facts its
-    /// goals resolved to for the commit. Returns whether it named any.
-    pub fn retract(self: *Transaction, goals: []const syntax.Clause) !bool {
-        const resolved = try resolveRetraction(self.target(), goals);
-        self.removed.deinit();
-        self.removed = resolved;
-        return self.removed.len() > 0;
-    }
-
-    /// Commits according to what the statement turned out to be. A query
-    /// changes nothing and keeps its query-local interning out of the
-    /// database; an assertion installs the staged copy; a retraction applies
-    /// the facts it resolved, so that they take the incremental deletion path,
-    /// and discards the copy it resolved them on.
-    pub fn commit(self: *Transaction, result: results.ExecutionResult) !void {
-        switch (result) {
-            .query => {},
-            .none => self.database.commit(&self.staging),
-            .changed => |changed| if (changed) try commitRetraction(self.database, &self.removed),
-        }
-    }
-
+    /// Releases the staging copy — after a commit, the database's previous
+    /// contents, which the commit left there.
     pub fn deinit(self: *Transaction) void {
-        self.removed.deinit();
         self.staging.deinit();
         self.* = undefined;
     }
