@@ -57,6 +57,46 @@ through [linenoize](https://github.com/hazre/linenoize/tree/feat/port-zig-0.16).
 For a guided introduction to facts, queries, rules, recursion, negation,
 lists, and aggregation, read the [LiveDatalog language tutorial](docs/language-tutorial.md).
 
+### Query server
+
+`zig build` installs a second binary, `LiveDatalogServer`, for local
+development. It loads every `*.dl` file under a directory, reloads them as
+they change, and answers queries over TCP:
+
+```sh
+zig build run-server -- --port 7070 examples/researchers
+printf 'researcher(X, N), field(X, physics), quote(X, Q)?\n' | nc 127.0.0.1 7070
+```
+
+[`examples/researchers`](examples/researchers) holds 50 famous researchers
+(`people.dl`) and quotes by them (`quotes.dl`).
+
+Send one request per line; every response ends with an empty line. A request
+is a query (the trailing `?` is optional) or a command: `.explain goals`,
+`.status` (counts and load errors), `.files`, `.reload`, `.help`, `.quit`.
+Answers use the REPL's format. The data comes only from the files: facts,
+rules, retractions and schemas sent over the connection are rejected, and
+queries inside the files are ignored.
+
+The server uses three threads on one `std.Io.Threaded`:
+
+- The **engine** task owns the database. File changes and client requests
+  arrive on one `Io.Queue`, so no other thread touches the database.
+- **Nightwatch**'s thread watches the directory and reports changed `.dl`
+  paths. Hidden directories, `zig-out`, `node_modules` and `target` are
+  ignored.
+- The **TCP** task accepts clients. Each connection runs as a small task that
+  passes its requests to the engine.
+
+The engine waits 40 ms after a change so that bursts of saves become one
+reload. Each file is a contributor to the database, named by its path, so a
+fact stays as long as any file still asserts it. When only facts changed, the
+file's new facts replace its contribution through `setContribution`. Any other
+change rebuilds a fresh database from all files in path order and swaps it in. A change applies completely or not at all: if
+a file fails to parse or load, the previous database stays and `.status`
+shows the error with its location. A full `.reload` skips broken files and
+loads the rest.
+
 ## Embed LiveDatalog in Zig
 
 Import the `LiveDatalog` module and create a `Jatalog` database with an
@@ -116,7 +156,7 @@ try database.addRule(.{ .relation = rule.value.head }, rule.value.body);
 
 const parsed = try LiveDatalog.parseProgram(allocator, "p(a). p(b). p(X)?", null);
 defer parsed.deinit();
-var answers = try database.executeStatements(parsed.value.statements, null);
+var answers = try database.executeStatements(parsed.value.statements, null, null);
 defer answers.deinit();
 ```
 
