@@ -1661,6 +1661,18 @@ pub fn lowerPlan(
     };
 }
 
+/// The name `variable` runs under once a plan holding it is lowered, which
+/// is how a caller finds a query variable of its own among a plan's answers.
+pub fn executableVariableName(
+    allocator: std.mem.Allocator,
+    strings: *string_table.StringTable,
+    symbols: *const fold_ir.Symbols,
+    variable: fold_ir.Variable,
+) !syntax.Id {
+    var lowering: Lowering = .{ .allocator = allocator, .strings = strings, .symbols = symbols };
+    return lowering.variableName(variable);
+}
+
 const Lowering = struct {
     allocator: std.mem.Allocator,
     strings: *string_table.StringTable,

@@ -31,7 +31,5 @@ The only other option was leaving the default order unspecified.
   never change which answers a query returns.
 - Ordering stays outside the query's meaning. The planner, folding, the plan
   cache and maintenance never see it, and `answerFolded` sorts a plan's
-  answers in the default order the same way `query` does. `answerFolded`
-  doesn't take a requested order yet, because folded answers list the plan's
-  variable names (`X#3`) instead of the caller's
-  (`.scratch/folded-answer-names/`).
+  answers the same way `query` does, and takes the same sort keys, since
+  folded answers carry the caller's variable names.

@@ -1,6 +1,6 @@
 # Folded answers should list the caller's variable names
 
-Status: needs-triage
+Status: done
 
 ## Problem
 
@@ -34,3 +34,11 @@ Once this lands, add an `order: []const input.SortKey` parameter to
 - `getValue("X")` works on a folded answer to a query that wrote `X`.
 - A reused plan lists the reusing caller's names.
 - `answerFolded(fold, &.{input.descending("X")})` orders by the caller's `X`.
+
+## Comments
+
+Done. `Fold` owns the caller's answer-variable names and has a `deinit`. Each
+cached plan records where the query's answer variables ended up in the plan.
+`answerFolded(fold, order)` projects the plan's answers onto those variables,
+renames them to the caller's names, lists each projected answer once, and
+sorts them by the caller's keys.

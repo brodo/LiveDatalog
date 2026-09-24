@@ -300,11 +300,36 @@ pub const Database = struct {
             errdefer answer.deinit();
             for (order) |variable| {
                 const value = binding.values.get(variable) orelse continue;
-                try self.appendAnswerBinding(&answer, variable, value);
+                try self.appendAnswerBinding(&answer, self.strings.resolve(variable), value);
             }
             for (binding.values.keys(), binding.values.values()) |variable, value| {
                 if (std.mem.indexOfScalar(syntax.Id, order, variable) != null) continue;
-                try self.appendAnswerBinding(&answer, variable, value);
+                try self.appendAnswerBinding(&answer, self.strings.resolve(variable), value);
+            }
+            try result.answers.append(self.allocator, answer);
+        }
+        return result;
+    }
+
+    /// Copies internal bindings out as owned answers that list exactly
+    /// `variables`, each under the matching entry of `names`. Anything else a
+    /// binding holds is left out. The caller makes sure that leaving it out
+    /// doesn't list one answer twice.
+    pub fn copyProjectedResult(
+        self: *const Database,
+        bindings: []const syntax.Binding,
+        variables: []const syntax.Id,
+        names: []const []const u8,
+    ) !results.QueryResult {
+        std.debug.assert(variables.len == names.len);
+        var result: results.QueryResult = .{ .allocator = self.allocator };
+        errdefer result.deinit();
+        for (bindings) |binding| {
+            var answer: results.Answer = .{ .allocator = self.allocator };
+            errdefer answer.deinit();
+            for (variables, names) |variable, name| {
+                const value = binding.values.get(variable) orelse continue;
+                try self.appendAnswerBinding(&answer, name, value);
             }
             try result.answers.append(self.allocator, answer);
         }
@@ -314,10 +339,10 @@ pub const Database = struct {
     fn appendAnswerBinding(
         self: *const Database,
         answer: *results.Answer,
-        variable: syntax.Id,
+        spelling: []const u8,
         value: syntax.ValueId,
     ) !void {
-        const name = try self.allocator.dupe(u8, self.strings.resolve(variable));
+        const name = try self.allocator.dupe(u8, spelling);
         errdefer self.allocator.free(name);
         const owned_value = try self.copyResultNode(value);
         answer.bindings.append(self.allocator, .{

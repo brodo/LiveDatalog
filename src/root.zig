@@ -473,7 +473,7 @@ pub const Jatalog = struct {
         // dropped: asking the same question twice must not grow the database.
         if (self.plans.find(key)) |index| {
             self.plans.hits += 1;
-            return self.handle(index, true);
+            return self.handle(index, true, try answerNames(&staging, compiled_goals));
         }
         self.plans.misses += 1;
 
@@ -521,11 +521,32 @@ pub const Jatalog = struct {
         }
         errdefer if (executable) |*value| value.deinit();
 
-        const index = try self.plans.insert(key, outcome, executable);
+        // Where the query's own answer variables went in the plan, in the
+        // order the query mentions them. A later caller asking the same
+        // question with other names mentions its variables in this same
+        // order, because the key it matched is the question with variables
+        // numbered by first mention.
+        const surface = try transaction.answerVariables(&staging, compiled_goals);
+        defer allocator.free(surface);
+        const answer_variables = try allocator.alloc(syntax.Id, surface.len);
+        var answer_variables_owned = true;
+        defer if (answer_variables_owned) allocator.free(answer_variables);
+        for (surface, answer_variables) |name, *slot| slot.* = try folding.executableVariableName(
+            allocator,
+            &staging.strings,
+            &self.views.symbols,
+            try self.views.symbols.userVariable(goal_scope, name),
+        );
+
+        const names = try answerNames(&staging, compiled_goals);
+        errdefer freeNames(allocator, names);
+
+        const index = try self.plans.insert(key, outcome, executable, answer_variables);
         key_owned = false;
         outcome_owned = false;
+        answer_variables_owned = false;
         self.state.commit(&staging);
-        return self.handle(index, false);
+        return self.handle(index, false, names);
     }
 
     /// Runs a folded plan and returns its answers.
@@ -557,10 +578,12 @@ pub const Jatalog = struct {
     /// insertion and undo the plan cache to fix a problem the plan cache does
     /// not have.
     ///
-    /// Answers are listed in the default answer order. A requested order is
-    /// not offered yet, because a folded answer lists the plan's variable
-    /// names rather than the caller's, so a key could not name them.
-    pub fn answerFolded(self: *Jatalog, fold: Fold) !results.QueryResult {
+    /// Answers list the caller's own variables under the caller's own names,
+    /// even when another caller's question folded the plan first, and nothing
+    /// the plan introduced for itself. `order` lists them as `query` would: the order
+    /// is presentation, so it is not part of the fold and the same plan
+    /// serves every order.
+    pub fn answerFolded(self: *Jatalog, fold: Fold, order: []const input.SortKey) !results.QueryResult {
         const cached = try self.planAt(fold);
         if (cached.executable == null) return error.PlanNotExecutable;
         // Before anything is read from a kept reconstruction, and after the
@@ -597,10 +620,11 @@ pub const Jatalog = struct {
         // The reconstruction is kept, so its counter is cumulative and only
         // this call's share of it belongs here.
         const work_before = entry.reconstruction.?.eval.cost.work;
-        const answers = try transaction.queryClauses(
+        const answers = try transaction.queryClausesAs(
             &entry.reconstruction.?,
             entry.executable.?.goals,
-            &.{},
+            .{ .variables = entry.answer_variables, .names = fold.names },
+            order,
         );
         self.state.eval.cost.work +|=
             entry.reconstruction.?.eval.cost.work -| work_before;
@@ -755,13 +779,17 @@ pub const Jatalog = struct {
         return &self.plans.entries.items[fold.entry];
     }
 
-    fn handle(self: *const Jatalog, index: usize, reused: bool) Fold {
+    /// A handle on plan `index` for a caller who calls its answer variables
+    /// `names`, which the handle takes.
+    fn handle(self: *const Jatalog, index: usize, reused: bool, names: []const []const u8) Fold {
         return .{
+            .allocator = self.state.allocator,
             .guarantee = self.plans.entries.items[index].outcome.guarantee(),
             .reused = reused,
             .entry = index,
             .catalog_generation = self.plans.catalog_generation,
             .rule_generation = self.plans.rule_generation,
+            .names = names,
         };
     }
 
@@ -891,7 +919,42 @@ pub const Fold = struct {
     entry: usize,
     catalog_generation: u64,
     rule_generation: u32,
+    /// The names this caller gave its answer variables, in the order its
+    /// query mentions them. A cached plan is shared by every caller asking
+    /// the same question, whatever they called its variables, so the names
+    /// belong to the handle rather than to the plan.
+    names: []const []const u8,
+    allocator: std.mem.Allocator,
+
+    /// Releases the names. A handle copied by value shares them, so only one
+    /// copy is released.
+    pub fn deinit(self: Fold) void {
+        freeNames(self.allocator, self.names);
+    }
 };
+
+/// What `goals` call their answer variables, in the order they mention them.
+fn answerNames(staging: *database.Database, goals: []const syntax.Clause) ![]const []const u8 {
+    const allocator = staging.allocator;
+    const surface = try transaction.answerVariables(staging, goals);
+    defer allocator.free(surface);
+    const names = try allocator.alloc([]const u8, surface.len);
+    var built: usize = 0;
+    errdefer {
+        for (names[0..built]) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    for (surface, names) |variable, *slot| {
+        slot.* = try allocator.dupe(u8, staging.strings.resolve(variable));
+        built += 1;
+    }
+    return names;
+}
+
+fn freeNames(allocator: std.mem.Allocator, names: []const []const u8) void {
+    for (names) |name| allocator.free(name);
+    allocator.free(names);
+}
 
 /// A relation a plan derives instead of reading, and how much of it.
 pub const Reconstruction = struct {
@@ -958,8 +1021,13 @@ const CachedPlan = struct {
     /// When this entry's reconstruction was last read, on the cache's own
     /// clock, so the bound above knows which one to drop.
     last_used: u64 = 0,
+    /// The names the plan's answers carry the query's answer variables
+    /// under, in the order the query mentions them. `Fold.names` says what
+    /// each caller calls them.
+    answer_variables: []syntax.Id,
 
     fn deinit(self: *CachedPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.answer_variables);
         self.discardReconstruction();
         if (self.executable) |*value| value.deinit();
         self.outcome.deinit();
@@ -1116,11 +1184,13 @@ const PlanCache = struct {
         key: []u8,
         outcome: folding.Outcome,
         executable: ?folding.Executable,
+        answer_variables: []syntax.Id,
     ) !usize {
         try self.entries.append(self.allocator, .{
             .key = key,
             .outcome = outcome,
             .executable = executable,
+            .answer_variables = answer_variables,
         });
         return self.entries.items.len - 1;
     }
@@ -7973,15 +8043,48 @@ fn expectOrderedTuples(result: *const results.QueryResult, expected: []const []c
     for (expected, tuples) |want, actual| try std.testing.expectEqualStrings(want, actual);
 }
 
-test "query lists answers in the order the caller asks for, and a folded plan in the default one" {
+test "query and answerFolded list answers in the order the caller asks for, under its names" {
     const allocator = std.testing.allocator;
     var db: Jatalog = .init(allocator);
     defer db.deinit();
     _ = try declareEvenPathViews(&db);
     const fold = try evenPathQuery(&db);
-    var folded = try db.answerFolded(fold);
-    defer folded.deinit();
-    try expectOrderedTuples(&folded, &.{ "a c", "a e", "b d", "c e" });
+    defer fold.deinit();
+
+    // One plan serves every order: the order is not part of the fold.
+    var by_default = try db.answerFolded(fold, &.{});
+    defer by_default.deinit();
+    try expectOrderedTuples(&by_default, &.{ "a c", "a e", "b d", "c e" });
+    try std.testing.expectEqualStrings("b", try by_default.answers.items[2].getAtom("X"));
+    try std.testing.expectEqualStrings("d", try by_default.answers.items[2].getAtom("Y"));
+    var descending = try db.answerFolded(fold, &.{input.descending("X")});
+    defer descending.deinit();
+    try expectOrderedTuples(&descending, &.{ "c e", "b d", "a c", "a e" });
+    // `Z` is the query's too, but only its rules say it: no answer lists it.
+    try std.testing.expectError(
+        errors.Error.UnknownVariable,
+        db.answerFolded(fold, &.{input.ascending("Z")}),
+    );
+
+    // The same question in other names reuses the plan and gets its own
+    // names back, not the ones the plan was first folded under.
+    const a = input.variable("A");
+    const b = input.variable("B");
+    const c = input.variable("C");
+    const renamed = try db.foldQuery(&.{input.relation("q", &.{ a, b })}, &.{
+        input.rule(input.fact("q", &.{ a, b }), &.{input.relation("edge", &.{ a, b })}),
+        input.rule(input.fact("q", &.{ a, c }), &.{
+            input.relation("edge", &.{ a, b }),
+            input.relation("q", &.{ b, c }),
+        }),
+    });
+    defer renamed.deinit();
+    try std.testing.expect(renamed.reused);
+    var reused = try db.answerFolded(renamed, &.{input.descending("B")});
+    defer reused.deinit();
+    try expectOrderedTuples(&reused, &.{ "a e", "c e", "b d", "a c" });
+    try std.testing.expectEqualStrings("A", reused.answers.items[0].bindings.items[0].name);
+    try std.testing.expectEqualStrings("B", reused.answers.items[0].bindings.items[1].name);
 
     var plain: Jatalog = .init(allocator);
     defer plain.deinit();
@@ -8001,13 +8104,14 @@ test "a declared view answers a query about relations the database no longer has
     _ = try declareEvenPathViews(&db);
 
     const fold = try evenPathQuery(&db);
+    defer fold.deinit();
     // A view remembers pairs two edges apart and nothing else, so no plan over
     // it answers every path. Maximal containment is the whole claim, and it is
     // the caller's to accept.
     try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
     try std.testing.expect(!fold.reused);
 
-    var answers = try db.answerFolded(fold);
+    var answers = try db.answerFolded(fold, &.{});
     defer answers.deinit();
     const tuples = try answerTuples(&answers);
     defer freeLines(tuples);
@@ -8036,9 +8140,10 @@ test "a declared view answers a query about relations the database no longer has
     var copy = try db.clone();
     defer copy.deinit();
     const copied = try evenPathQuery(&copy);
+    defer copied.deinit();
     try std.testing.expectEqual(Guarantee.maximally_contained, copied.guarantee);
     try std.testing.expect(!copied.reused);
-    var copied_answers = try copy.answerFolded(copied);
+    var copied_answers = try copy.answerFolded(copied, &.{});
     defer copied_answers.deinit();
     try std.testing.expectEqual(@as(usize, 4), copied_answers.answers.items.len);
 
@@ -8088,8 +8193,9 @@ test "a query inside the availability boundary is its own plan, and a hybrid one
     // Nothing was reconstructed, because nothing had to be: the query reads
     // what the policy declared. That is the only way to earn `equivalent`.
     const plain = try db.foldQuery(&.{input.relation("label", &.{ x, c })}, &.{});
+    defer plain.deinit();
     try std.testing.expectEqual(Guarantee.equivalent, plain.guarantee);
-    var plain_answers = try db.answerFolded(plain);
+    var plain_answers = try db.answerFolded(plain, &.{});
     defer plain_answers.deinit();
     try std.testing.expectEqual(@as(usize, 2), plain_answers.answers.items.len);
 
@@ -8101,6 +8207,7 @@ test "a query inside the availability boundary is its own plan, and a hybrid one
         input.relation("r", &.{ x, y }),
         input.relation("label", &.{ x, c }),
     }, &.{});
+    defer hybrid.deinit();
     try std.testing.expectEqual(Guarantee.maximally_contained, hybrid.guarantee);
     var reconstructed = try db.foldReconstructions(hybrid);
     defer reconstructed.deinit();
@@ -8108,7 +8215,7 @@ test "a query inside the availability boundary is its own plan, and a hybrid one
     try std.testing.expectEqualStrings("r", reconstructed.items[0].predicate);
     try std.testing.expect(reconstructed.items[0].exact);
 
-    var joined = try db.answerFolded(hybrid);
+    var joined = try db.answerFolded(hybrid, &.{});
     defer joined.deinit();
     const tuples = try answerTuples(&joined);
     defer freeLines(tuples);
@@ -8167,6 +8274,7 @@ test "cost picks between views that reconstruct one relation exactly, and picks 
         input.variable("V"),
     })};
     const fold = try db.foldQuery(&goals, &.{});
+    defer fold.deinit();
     try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
 
     const explanation = try db.explainFold(fold);
@@ -8186,7 +8294,7 @@ test "cost picks between views that reconstruct one relation exactly, and picks 
     try std.testing.expectEqual(@as(usize, 1), reconstructed.items.len);
     try std.testing.expect(reconstructed.items[0].exact);
 
-    var answers = try db.answerFolded(fold);
+    var answers = try db.answerFolded(fold, &.{});
     defer answers.deinit();
     const tuples = try answerTuples(&answers);
     defer freeLines(tuples);
@@ -8203,6 +8311,7 @@ test "cost picks between views that reconstruct one relation exactly, and picks 
     // own: the same plan twice prints different numbers by construction.
     db.clearPlanCache();
     const again = try db.foldQuery(&goals, &.{});
+    defer again.deinit();
     const repeated = try db.explainFold(again);
     defer allocator.free(repeated);
     const marker = "transformations:\n";
@@ -8227,6 +8336,7 @@ test "views that reconstruct one relation equally well are chosen between by dec
         input.atom("a"),
         input.variable("V"),
     })}, &.{});
+    defer fold.deinit();
     const explanation = try db.explainFold(fold);
     defer allocator.free(explanation);
     try std.testing.expect(std.mem.indexOf(
@@ -8236,7 +8346,7 @@ test "views that reconstruct one relation equally well are chosen between by dec
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, explanation, "narrow@1/2") == null);
 
-    var answers = try db.answerFolded(fold);
+    var answers = try db.answerFolded(fold, &.{});
     defer answers.deinit();
     try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
 }
@@ -8248,8 +8358,10 @@ test "a folded plan is reused until the views or the rules it was folded against
     const view = try declareEvenPathViews(&db);
 
     const first = try evenPathQuery(&db);
+    defer first.deinit();
     try std.testing.expect(!first.reused);
     const second = try evenPathQuery(&db);
+    defer second.deinit();
     try std.testing.expect(second.reused);
     var stats = db.foldStats();
     try std.testing.expectEqual(@as(usize, 1), stats.cached_plans);
@@ -8262,13 +8374,14 @@ test "a folded plan is reused until the views or the rules it was folded against
     // handle that survived would name whichever plan later took its place.
     db.setViewAvailability(view, .withheld);
     try std.testing.expectError(error.StalePlan, db.explainFold(first));
-    try std.testing.expectError(error.StalePlan, db.answerFolded(second));
+    try std.testing.expectError(error.StalePlan, db.answerFolded(second, &.{}));
 
     const withheld = try evenPathQuery(&db);
+    defer withheld.deinit();
     try std.testing.expectEqual(Guarantee.unsupported, withheld.guarantee);
     // No plan at all rather than an empty one, which is the distinction the
     // whole interface is shaped around: there is nothing to run.
-    try std.testing.expectError(error.PlanNotExecutable, db.answerFolded(withheld));
+    try std.testing.expectError(error.PlanNotExecutable, db.answerFolded(withheld, &.{}));
     const refusal = try db.explainFold(withheld);
     defer allocator.free(refusal);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "unmet preconditions") != null);
@@ -8279,6 +8392,7 @@ test "a folded plan is reused until the views or the rules it was folded against
     // again, and it comes back with the guarantee it had.
     db.setViewAvailability(view, .materialized);
     const restored = try evenPathQuery(&db);
+    defer restored.deinit();
     try std.testing.expect(!restored.reused);
     try std.testing.expectEqual(Guarantee.maximally_contained, restored.guarantee);
 
@@ -8290,7 +8404,7 @@ test "a folded plan is reused until the views or the rules it was folded against
         &.{input.relation("v", &.{ input.variable("X"), input.variable("Y") })},
     );
     try std.testing.expectError(error.StalePlan, db.explainFold(restored));
-    _ = try evenPathQuery(&db);
+    (try evenPathQuery(&db)).deinit();
     // Three discards: the withdrawal, the restoration, and the rule. Restoring
     // an availability is a change like any other — the cache cannot tell that
     // it undid the previous one, and a stamp that could would be a stamp that
@@ -8303,7 +8417,8 @@ test "a folded plan is reused until the views or the rules it was folded against
 /// error comes back is part of what a kept reconstruction has to reproduce.
 fn foldedTuples(db: *Jatalog, goals: []const input.Goal) ![][]u8 {
     const fold = try db.foldQuery(goals, &.{});
-    var answers = try db.answerFolded(fold);
+    defer fold.deinit();
+    var answers = try db.answerFolded(fold, &.{});
     defer answers.deinit();
     return answerTuples(&answers);
 }
@@ -8361,9 +8476,10 @@ test "a kept reconstruction answers exactly what a rebuilt one answers, after ea
     try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
 
     const first = try db.foldQuery(&question, &.{});
+    defer first.deinit();
     try std.testing.expect(!first.reused);
     {
-        var answers = try db.answerFolded(first);
+        var answers = try db.answerFolded(first, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
     }
@@ -8376,10 +8492,11 @@ test "a kept reconstruction answers exactly what a rebuilt one answers, after ea
     // calls has to notice a change that moves no stamp.
     try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
     const again = try db.foldQuery(&question, &.{});
+    defer again.deinit();
     try std.testing.expect(again.reused);
     try std.testing.expectEqual(@as(usize, 0), db.foldStats().plan_invalidations);
     {
-        var answers = try db.answerFolded(first);
+        var answers = try db.answerFolded(first, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
     }
@@ -8458,15 +8575,16 @@ test "asking a folded question twice grows neither the database nor what it inte
     try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
 
     const fold = try db.foldQuery(&question, &.{});
-    var warmup = try db.answerFolded(fold);
+    defer fold.deinit();
+    var warmup = try db.answerFolded(fold, &.{});
     warmup.deinit();
 
     const facts = db.state.facts.len();
     const closure = db.maintenanceStats().closure_facts;
     const interned = db.internStats();
     for (0..4) |_| {
-        _ = try db.foldQuery(&question, &.{});
-        var answers = try db.answerFolded(fold);
+        (try db.foldQuery(&question, &.{})).deinit();
+        var answers = try db.answerFolded(fold, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
     }
@@ -8501,9 +8619,10 @@ test "a maintained predicate published as a view answers without its own base fa
     // twice.
     _ = try db.publishView("two", 2, .materialized);
     const fold = try evenPathQuery(&db);
+    defer fold.deinit();
     try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
 
-    var answers = try db.answerFolded(fold);
+    var answers = try db.answerFolded(fold, &.{});
     defer answers.deinit();
     const tuples = try answerTuples(&answers);
     defer freeLines(tuples);
@@ -8562,6 +8681,7 @@ test "two readable extensions of one name are refused at selection, not after a 
     // Withholding one leaves one readable extension of that name.
     db.setViewAvailability(rival, .withheld);
     const fold = try db.foldQuery(&goals, &.{});
+    defer fold.deinit();
     try std.testing.expectEqual(Guarantee.maximally_contained, fold.guarantee);
 }
 
@@ -8581,11 +8701,12 @@ fn publicFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
     );
 
     const fold = try db.foldQuery(&.{input.relation("edge", &.{ x, y })}, &.{});
+    defer fold.deinit();
     if (fold.guarantee != .maximally_contained) return error.UnexpectedGuarantee;
     allocator.free(try db.explainFold(fold));
     var reconstructed = try db.foldReconstructions(fold);
     reconstructed.deinit();
-    var answers = try db.answerFolded(fold);
+    var answers = try db.answerFolded(fold, &.{});
     answers.deinit();
 }
 
@@ -8617,12 +8738,13 @@ test "a folded plan derives its reconstruction once and reuses it until the fact
     try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
 
     const fold = try db.foldQuery(&copied_question, &.{});
+    defer fold.deinit();
     // Nothing is kept until a plan is run: folding decides what to read, and
     // deciding does not read it.
     try std.testing.expectEqual(@as(usize, 0), db.foldStats().kept_reconstructions);
 
     for (0..3) |_| {
-        var answers = try db.answerFolded(fold);
+        var answers = try db.answerFolded(fold, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
     }
@@ -8636,7 +8758,7 @@ test "a folded plan derives its reconstruction once and reuses it until the fact
     // no invalidation, and the next answer is derived again.
     try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
     {
-        var answers = try db.answerFolded(fold);
+        var answers = try db.answerFolded(fold, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
     }
@@ -8652,15 +8774,17 @@ test "a folded plan derives its reconstruction once and reuses it until the fact
         &.{input.relation("mark", &.{input.variable("X")})},
         .withheld,
     );
-    try std.testing.expectError(error.StalePlan, db.answerFolded(fold));
-    _ = try db.foldQuery(&copied_question, &.{});
+    try std.testing.expectError(error.StalePlan, db.answerFolded(fold, &.{}));
+    (try db.foldQuery(&copied_question, &.{})).deinit();
     stats = db.foldStats();
     try std.testing.expectEqual(@as(usize, 1), stats.plan_invalidations);
     try std.testing.expectEqual(@as(usize, 0), stats.kept_reconstructions);
 
     // And clearing the cache is what gives the memory back, which is the one
     // control an embedder has over reconstructions it is no longer asking for.
-    var again = try db.answerFolded(try db.foldQuery(&copied_question, &.{}));
+    const refolded = try db.foldQuery(&copied_question, &.{});
+    defer refolded.deinit();
+    var again = try db.answerFolded(refolded, &.{});
     again.deinit();
     try std.testing.expectEqual(@as(usize, 1), db.foldStats().kept_reconstructions);
     db.clearPlanCache();
@@ -8678,10 +8802,13 @@ test "the cache holds a bounded number of reconstructions and drops the coldest"
     // each folds to a plan of its own and each plan wants a reconstruction.
     const constants = [_][]const u8{ "a", "b", "c", "d", "e", "f" };
     var folds: [constants.len]Fold = undefined;
+    var folded: usize = 0;
+    defer for (folds[0..folded]) |fold| fold.deinit();
     for (constants, &folds) |constant, *slot| {
         const goals = [_]input.Goal{input.relation("r", &.{ input.atom(constant), y })};
         slot.* = try db.foldQuery(&goals, &.{});
-        var answers = try db.answerFolded(slot.*);
+        folded += 1;
+        var answers = try db.answerFolded(slot.*, &.{});
         answers.deinit();
     }
     const stats = db.foldStats();
@@ -8693,7 +8820,7 @@ test "the cache holds a bounded number of reconstructions and drops the coldest"
 
     // Every plan still answers, whether or not its reconstruction survived.
     for (constants, folds) |constant, fold| {
-        var answers = try db.answerFolded(fold);
+        var answers = try db.answerFolded(fold, &.{});
         defer answers.deinit();
         const expected: usize = if (std.mem.eql(u8, constant, "a")) 1 else 0;
         try std.testing.expectEqual(expected, answers.answers.items.len);
@@ -8709,16 +8836,17 @@ fn keptReconstructionAllocationScenario(allocator: std.mem.Allocator) !void {
     try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
 
     const fold = try db.foldQuery(&copied_question, &.{});
-    var first = try db.answerFolded(fold);
+    defer fold.deinit();
+    var first = try db.answerFolded(fold, &.{});
     first.deinit();
 
     try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
-    var refreshed = try db.answerFolded(fold);
+    var refreshed = try db.answerFolded(fold, &.{});
     const rows = refreshed.answers.items.len;
     refreshed.deinit();
     if (rows != 2) return error.UnexpectedResult;
 
-    var reused = try db.answerFolded(fold);
+    var reused = try db.answerFolded(fold, &.{});
     reused.deinit();
 }
 
@@ -8737,6 +8865,7 @@ test "an allocation failure answering a folded question leaves the next answer c
     try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
     try db.addFact("copied", &.{ input.atom("b"), input.atom("two") });
     const fold = try db.foldQuery(&copied_question, &.{});
+    defer fold.deinit();
 
     var offset: usize = 0;
     while (offset < 400) : (offset += 1) {
@@ -8744,13 +8873,13 @@ test "an allocation failure answering a folded question leaves the next answer c
         // deriving the reconstruction the first time round the loop, solving
         // against a kept one afterwards.
         failing.fail_index = failing.alloc_index + offset;
-        if (db.answerFolded(fold)) |result| {
+        if (db.answerFolded(fold, &.{})) |result| {
             var answers = result;
             answers.deinit();
         } else |_| {}
         failing.fail_index = std.math.maxInt(usize);
 
-        var answers = try db.answerFolded(fold);
+        var answers = try db.answerFolded(fold, &.{});
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
     }

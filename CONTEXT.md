@@ -259,6 +259,12 @@ the derived closure all removed — so the contract that a plan reads views
 rather than the relations behind them is enforced rather than described.
 `explainFold` renders it and `foldReconstructions` names every relation the
 plan derives instead of reads, saying of each whether the plan gets all of it.
+
+A plan is shared by everyone who asks its question, whatever they named its
+variables, so the names belong to the handle and not to the plan. A folded
+answer lists the asker's own answer variables under the asker's own names, and
+nothing the plan introduced for itself. So a folded answer reads, and sorts,
+like the answer `query` would have given.
 That per-relation account is what makes `maximally_contained` actionable: the
 guarantee says the plan answers no more than the query, and only the account
 says where an answer could have gone.

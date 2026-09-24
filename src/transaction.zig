@@ -96,21 +96,56 @@ pub fn queryClauses(
     goals: []const syntax.Clause,
     keys: []const input.SortKey,
 ) !results.QueryResult {
-    const order = try queryVariableOrder(db, goals);
-    defer db.allocator.free(order);
-    const resolved = try resolveSortKeys(db, keys, order);
+    const variables = try answerVariables(db, goals);
+    defer db.allocator.free(variables);
+    return queryClausesAs(db, goals, .{ .variables = variables }, keys);
+}
+
+/// Which variables answers list, and under what names.
+pub const Listing = struct {
+    /// The variables answers list, in the order they list them.
+    variables: []const syntax.Id,
+    /// What each of `variables` is called in the answers. When given, answers
+    /// list exactly `variables`, under these names, and an answer that
+    /// differs from another only in a variable left out is listed once. When
+    /// null, answers list each variable under its own name, and anything else
+    /// a binding holds follows.
+    names: ?[]const []const u8 = null,
+};
+
+/// Answers `goals` as `listing` says, in the order `keys` asks for. This is
+/// `queryClauses` for a caller whose goals aren't the ones it asked, like a
+/// folded plan, whose variables are spelled the plan's way.
+pub fn queryClausesAs(
+    db: *database.Database,
+    goals: []const syntax.Clause,
+    listing: Listing,
+    keys: []const input.SortKey,
+) !results.QueryResult {
+    const resolved = try resolveSortKeys(db, keys, listing);
     defer db.allocator.free(resolved);
     var internal_answers = try evaluateClauses(db, goals);
     defer {
-        for (internal_answers.items) |*answer| answer.deinit(db.allocator);
+        for (internal_answers.items) |*binding| binding.deinit(db.allocator);
         internal_answers.deinit(db.allocator);
     }
-    std.sort.pdq(syntax.Binding, internal_answers.items, AnswerOrder{
-        .db = db,
-        .keys = resolved,
-        .variables = order,
-    }, AnswerOrder.lessThan);
-    return db.copyQueryResult(internal_answers.items, order);
+    const order: AnswerOrder = .{ .db = db, .keys = resolved, .variables = listing.variables };
+    std.sort.pdq(syntax.Binding, internal_answers.items, order, AnswerOrder.lessThan);
+    const names = listing.names orelse
+        return db.copyQueryResult(internal_answers.items, listing.variables);
+    // Sorted on every listed variable, so answers that agree on all of them
+    // are adjacent.
+    var kept: usize = 0;
+    for (internal_answers.items, 0..) |*binding, index| {
+        if (kept != 0 and order.equal(internal_answers.items[kept - 1], binding.*)) {
+            binding.deinit(db.allocator);
+            continue;
+        }
+        if (kept != index) internal_answers.items[kept] = binding.*;
+        kept += 1;
+    }
+    internal_answers.shrinkRetainingCapacity(kept);
+    return db.copyProjectedResult(internal_answers.items, listing.variables, names);
 }
 
 const ResolvedKey = struct {
@@ -119,19 +154,25 @@ const ResolvedKey = struct {
 };
 
 /// The keys as identifiers, each checked against the variables the answers
-/// list. A name the database never interned cannot be one of them.
+/// list, by the names the answers list them under.
 fn resolveSortKeys(
     db: *const database.Database,
     keys: []const input.SortKey,
-    variables: []const syntax.Id,
+    listing: Listing,
 ) ![]ResolvedKey {
     const resolved = try db.allocator.alloc(ResolvedKey, keys.len);
     errdefer db.allocator.free(resolved);
     for (keys, resolved) |key, *out| {
-        const id = db.strings.get(key.variable) orelse return errors.Error.UnknownVariable;
-        if (std.mem.indexOfScalar(syntax.Id, variables, id) == null)
-            return errors.Error.UnknownVariable;
-        out.* = .{ .variable = id, .direction = key.direction };
+        const position = if (listing.names) |names|
+            for (names, 0..) |name, index| {
+                if (std.mem.eql(u8, name, key.variable)) break index;
+            } else null
+        else if (db.strings.get(key.variable)) |id|
+            std.mem.findScalar(syntax.Id, listing.variables, id)
+        else
+            null;
+        const index = position orelse return errors.Error.UnknownVariable;
+        out.* = .{ .variable = listing.variables[index], .direction = key.direction };
     }
     return resolved;
 }
@@ -156,6 +197,13 @@ const AnswerOrder = struct {
         return false;
     }
 
+    /// Whether two answers agree on every listed variable.
+    fn equal(self: AnswerOrder, a: syntax.Binding, b: syntax.Binding) bool {
+        for (self.variables) |variable|
+            if (self.compareAt(a, b, variable) != .eq) return false;
+        return true;
+    }
+
     /// An answer that leaves the variable unbound sorts before one that
     /// binds it.
     fn compareAt(self: AnswerOrder, a: syntax.Binding, b: syntax.Binding, variable: syntax.Id) std.math.Order {
@@ -171,7 +219,7 @@ const AnswerOrder = struct {
 /// order its answers list them in. Built from the goals as written rather than
 /// from the plan, so that what a caller sees does not move when the planner
 /// picks a different join order.
-fn queryVariableOrder(db: *database.Database, goals: []const syntax.Clause) ![]syntax.Id {
+pub fn answerVariables(db: *database.Database, goals: []const syntax.Clause) ![]syntax.Id {
     var order: std.ArrayList(syntax.Id) = .empty;
     errdefer order.deinit(db.allocator);
     var seen: std.AutoHashMapUnmanaged(syntax.Id, void) = .empty;
@@ -513,4 +561,37 @@ test "a retraction naming a value the database does not hold leaves it uninterne
     try testing.expect(staging.eval.scalars.values.items.len > scalars_before);
     try testing.expectEqual(scalars_before, db.eval.scalars.values.items.len);
     try testing.expectEqual(@as(usize, 1), db.facts.len());
+}
+
+test "a listing with names projects answers onto them, lists each once, and sorts by them" {
+    var db: database.Database = .init(testing.allocator);
+    defer db.deinit();
+    for ([_][2][]const u8{ .{ "a", "one" }, .{ "b", "three" }, .{ "a", "two" } }) |pair| {
+        const expression = try compile.compileRelation(&db, "p", &.{ input.atom(pair[0]), input.atom(pair[1]) }, false);
+        defer syntax.freeExpr(db.allocator, expression);
+        try addFactExpr(&db, expression);
+    }
+    const goals = try compile.compileGoals(&db, &.{
+        input.relation("p", &.{ input.variable("X"), input.variable("Y") }),
+    });
+    defer freeGoals(&db, goals);
+    const x = db.strings.get("X").?;
+    const listing: Listing = .{ .variables = &.{x}, .names = &.{"Who"} };
+
+    // `Y` is left out, so the two `a` answers are one, listed as `Who`.
+    var projected = try queryClausesAs(&db, goals, listing, &.{});
+    defer projected.deinit();
+    try testing.expectEqual(@as(usize, 2), projected.answers.items.len);
+    try testing.expectEqual(@as(usize, 1), projected.answers.items[0].bindings.items.len);
+    try testing.expectEqualStrings("a", try projected.answers.items[0].getAtom("Who"));
+    try testing.expectEqualStrings("b", try projected.answers.items[1].getAtom("Who"));
+
+    // Keys name what the answers are called, not what the goals call it.
+    var descending = try queryClausesAs(&db, goals, listing, &.{input.descending("Who")});
+    defer descending.deinit();
+    try testing.expectEqualStrings("b", try descending.answers.items[0].getAtom("Who"));
+    try testing.expectError(
+        errors.Error.UnknownVariable,
+        queryClausesAs(&db, goals, listing, &.{input.ascending("X")}),
+    );
 }
