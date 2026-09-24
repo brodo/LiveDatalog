@@ -1,0 +1,67 @@
+name: Release
+
+# Pushing a version tag such as v0.0.1 builds the command-line interpreter and
+# the development server for every platform, and the Zed extension, and
+# publishes them as the assets of a GitHub release named after the tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - run: rustup target add wasm32-wasip2
+
+      - run: zig build test --summary all
+
+      # Zig cross-compiles both binaries to every target from this one runner.
+      - name: Build LiveDatalog and LiveDatalogServer
+        run: |
+          mkdir -p dist
+          for target in \
+            x86_64-linux-musl aarch64-linux-musl \
+            x86_64-macos aarch64-macos \
+            x86_64-windows aarch64-windows
+          do
+            name="livedatalog-$TAG-$target"
+            zig build -Dtarget="$target" -Doptimize=ReleaseSafe --prefix "stage/$name"
+            mkdir -p "stage/$name/package"
+            cp stage/"$name"/bin/LiveDatalog* README.md "stage/$name/package/"
+            rm -f stage/"$name"/package/*.pdb
+            case "$target" in
+              *windows*) (cd "stage/$name/package" && zip -q "../../../dist/$name.zip" *) ;;
+              *) tar -C "stage/$name/package" -czf "dist/$name.tar.gz" . ;;
+            esac
+          done
+
+      # The component Zed builds when it installs the extension.
+      - name: Build the Zed extension
+        working-directory: zed-livedatalog
+        run: |
+          cargo build --release --target wasm32-wasip2
+          cp target/wasm32-wasip2/release/zed_livedatalog.wasm "../dist/zed-livedatalog-$TAG.wasm"
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
