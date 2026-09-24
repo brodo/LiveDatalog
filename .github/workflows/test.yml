@@ -28,6 +28,12 @@ jobs:
       # CLI example check.
       - run: zig build test --summary all
 
+      - name: Build the LiveDatalog and LiveDatalogServer binaries
+        run: |
+          zig build --summary all
+          test -x zig-out/bin/LiveDatalog
+          test -x zig-out/bin/LiveDatalogServer
+
   tree-sitter:
     name: Tree-sitter grammar
     runs-on: ubuntu-latest
@@ -77,4 +83,7 @@ jobs:
       - run: cargo test
 
       # The build Zed runs when it installs the extension.
-      - run: cargo build --release --target wasm32-wasip2
+      - name: Build the extension
+        run: |
+          cargo build --release --target wasm32-wasip2
+          test -f target/wasm32-wasip2/release/zed_livedatalog.wasm
