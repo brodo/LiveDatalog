@@ -121,3 +121,14 @@ A module at or above `program.zig` can build its database from source with
 `parser.parseProgram` and `program.execute`, as `program.zig`'s own tests do.
 The tests still in `root.zig` for that reason can move down; moving them is a
 separate change.
+
+## Addendum: view selection above the program runner
+
+Added 2026-09-24, when the fold code left `root.zig`. `view_selection.zig`
+owns the view catalog, the plan cache and answering folded plans, takes a
+`*Database` per call, and sits directly below `root.zig` — above
+`program.zig` rather than beside it, so that its tests can build their
+databases from source through `program.execute` without importing a module at
+their own level. Nothing below it needs it. `Jatalog` owns one next to its
+`Database` and passes its own state on every call, which is what keeps a
+catalog paired with the database whose identifiers it holds.

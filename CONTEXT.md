@@ -254,7 +254,7 @@ are below, and both are checked rather than assumed.
 ### View selection
 
 What a caller says a fold may read, and what a plan handed back is
-(`root.zig`, over `view_catalog.zig`). A `Jatalog` owns its catalog rather than
+(`view_selection.zig`, over `view_catalog.zig`). A `Jatalog` owns its catalog rather than
 sitting beside one, because a catalog's predicate names and constants are that
 database's identifiers and a catalog paired with any other database resolves
 nothing; owning it is what makes the pairing impossible to get wrong, and it is
@@ -302,7 +302,7 @@ something invisible.
 
 ### Plan cache
 
-Folded plans, kept per database (`root.zig`). The key is the *normalized*
+Folded plans, kept per database (`view_selection.zig`). The key is the *normalized*
 question — the compiled query with variables renumbered by first occurrence, so
 that the same question written with other names is one entry — and the cache as
 a whole is stamped with the catalog's generation and the program's rule count.
