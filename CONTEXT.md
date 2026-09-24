@@ -604,10 +604,32 @@ keeps one database in step with them as they change, and serves that database
 to clients through two listeners on separate ports. The database comes only
 from the files: neither listener can change it.
 
-The *query listener* answers Datalog queries and commands in the REPL's line
-format. The *language listener* speaks the Language Server Protocol to
+The *query listener* answers Datalog queries and commands in a protocol meant
+for programs rather than people, which is why it no longer matches the REPL's
+output (see [ADR 0008](docs/adr/0008-counted-tab-separated-protocol.md)). A
+client can also *watch* the database, and is told the generation each time the
+files change it. The *language listener* speaks the Language Server Protocol to
 editors: it reports what the directory's files say about each predicate and
 what went wrong loading them.
+
+### Browser
+
+A graphical client of the query listener that shows the database one
+predicate at a time as a table. As everywhere, a predicate is its name *and*
+arity, so an untyped name used at two arities is two tables. It lists every
+predicate that has facts, base or derived, and every predicate a schema
+declares, even one with no facts yet. A column is headed by its schema's name
+for it and, for a typed predicate, its column type; a column without a name is
+headed by its 1-based position. Like every client, the browser cannot change
+the database.
+
+### Kind
+
+Where a predicate's facts come from. A predicate is *base* when all of its
+facts are asserted in the files, *derived* when all of them come from rules,
+and *mixed* when it has both asserted facts and rules with it as their head.
+A predicate's fact count is its facts in the closure, base and derived
+together, which is what a table of it shows.
 
 ### Draft
 

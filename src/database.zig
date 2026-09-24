@@ -483,6 +483,7 @@ pub const Database = struct {
     ) !results.QueryResult {
         var result: results.QueryResult = .{ .allocator = self.allocator };
         errdefer result.deinit();
+        for (order) |variable| try result.appendVariable(self.strings.resolve(variable));
         for (bindings) |binding| {
             var answer: results.Answer = .{ .allocator = self.allocator };
             errdefer answer.deinit();
@@ -512,6 +513,7 @@ pub const Database = struct {
         std.debug.assert(variables.len == names.len);
         var result: results.QueryResult = .{ .allocator = self.allocator };
         errdefer result.deinit();
+        for (names) |name| try result.appendVariable(name);
         for (bindings) |binding| {
             var answer: results.Answer = .{ .allocator = self.allocator };
             errdefer answer.deinit();

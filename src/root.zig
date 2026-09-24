@@ -61,6 +61,29 @@ pub const FactCount = struct {
     base: usize = 0,
     derived: usize = 0,
 };
+/// Writes an atom in canonical syntax: bare when it can be, otherwise quoted,
+/// with quotes, backslashes, line breaks and tabs escaped.
+pub const writeAtom = scalar.writeAtom;
+/// A column type a schema declares. See "Schema" in CONTEXT.md.
+pub const ColumnType = schema.ColumnType;
+/// One predicate `Jatalog.predicates` lists: a name and arity the database
+/// holds facts of, has rules for, or declares a schema for.
+pub const PredicateInfo = struct {
+    /// Borrowed from the database, and valid while it lives.
+    name: []const u8,
+    arity: usize,
+    facts: FactCount,
+    /// Whether some rule has this predicate as its head.
+    has_rules: bool,
+    /// Whether its name has a schema.
+    typed: bool,
+};
+/// One column of a schema, as `Jatalog.schemaColumns` lists it.
+pub const SchemaColumn = struct {
+    /// Borrowed from the database; null where the schema names no column.
+    name: ?[]const u8,
+    type: ColumnType,
+};
 /// The transaction a front end stages a run of assertions in.
 pub const Transaction = transaction.Transaction;
 
@@ -518,6 +541,70 @@ pub const Jatalog = struct {
         const base = (try self.state.facts.predicateEntries(key)).len;
         const all = (try self.state.closureStore().predicateEntries(key)).len;
         return .{ .base = base, .derived = all - base };
+    }
+
+    /// Every predicate the database knows of, ordered by name and then arity:
+    /// those with facts, base or derived, those some rule has as its head, and
+    /// those a schema declares, even with no facts. Brings the closure up to
+    /// date first, as a query would. The caller frees the slice; the names
+    /// are the database's.
+    pub fn predicates(self: *Jatalog, allocator: std.mem.Allocator) ![]PredicateInfo {
+        if (self.state.materialization != .clean) try self.materialize();
+        var keys: std.array_hash_map.Auto(relation_store.PredicateKey, bool) = .empty;
+        defer keys.deinit(allocator);
+        const closure = self.state.closureStore();
+        for (0..closure.len()) |index| {
+            const fact = closure.factAt(index);
+            const slot = try keys.getOrPut(allocator, .{ .name = fact.predicate, .arity = fact.terms.len });
+            if (!slot.found_existing) slot.value_ptr.* = false;
+        }
+        for (self.state.eval.rules.items) |rule|
+            try keys.put(allocator, .{ .name = rule.head.predicate, .arity = rule.head.terms.len }, true);
+        for (self.state.schemas.schemas.keys(), self.state.schemas.schemas.values()) |name, declared| {
+            const slot = try keys.getOrPut(allocator, .{ .name = name, .arity = declared.columns.len });
+            if (!slot.found_existing) slot.value_ptr.* = false;
+        }
+
+        const listed = try allocator.alloc(PredicateInfo, keys.count());
+        errdefer allocator.free(listed);
+        for (keys.keys(), keys.values(), listed) |key, has_rules, *info| {
+            const base = (try self.state.facts.predicateEntries(key)).len;
+            const all = (try closure.predicateEntries(key)).len;
+            info.* = .{
+                .name = self.state.strings.resolve(key.name),
+                .arity = key.arity,
+                .facts = .{ .base = base, .derived = all - base },
+                .has_rules = has_rules,
+                .typed = self.state.schemas.get(key.name) != null,
+            };
+        }
+        std.mem.sort(PredicateInfo, listed, {}, struct {
+            fn lessThan(_: void, a: PredicateInfo, b: PredicateInfo) bool {
+                return switch (std.mem.order(u8, a.name, b.name)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => a.arity < b.arity,
+                };
+            }
+        }.lessThan);
+        return listed;
+    }
+
+    /// The columns of `predicate`'s schema, or null when it has none. The
+    /// caller frees the slice; the names are the database's.
+    pub fn schemaColumns(
+        self: *const Jatalog,
+        allocator: std.mem.Allocator,
+        predicate: []const u8,
+    ) !?[]SchemaColumn {
+        const name = self.state.strings.get(predicate) orelse return null;
+        const declared = self.state.schemas.get(name) orelse return null;
+        const columns = try allocator.alloc(SchemaColumn, declared.columns.len);
+        for (declared.columns, declared.names, columns) |column_type, column_name, *column| column.* = .{
+            .name = if (column_name) |id| self.state.strings.resolve(id) else null,
+            .type = column_type,
+        };
+        return columns;
     }
 
     /// Parses `source` and runs it, returning the last statement's result.
@@ -5080,4 +5167,68 @@ test "countFacts separates base facts from the facts only rules derive" {
     // An update leaves the closure dirty; counting brings it up to date.
     try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
     try std.testing.expectEqual(FactCount{ .base = 1, .derived = 5 }, try db.countFacts("path", 2));
+}
+
+test "predicates lists facts, rule heads and schemas, with their columns" {
+    var db = Jatalog.init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\schema age(Who: atom, int).
+        \\schema empty(Thing: atom).
+        \\edge(a, b). edge(b, c). path(a, b). edge(z).
+        \\path(X, Y) :- edge(X, Y).
+        \\never(X) :- edge(X, X).
+        \\age(ada, 36).
+    , null);
+    result.deinit();
+
+    const listed = try db.predicates(std.testing.allocator);
+    defer std.testing.allocator.free(listed);
+    const expected = [_]struct { []const u8, usize, FactCount, bool, bool }{
+        .{ "age", 2, .{ .base = 1 }, false, true },
+        .{ "edge", 1, .{ .base = 1 }, false, false },
+        .{ "edge", 2, .{ .base = 2 }, false, false },
+        .{ "empty", 1, .{}, false, true },
+        .{ "never", 1, .{}, true, false },
+        .{ "path", 2, .{ .base = 1, .derived = 1 }, true, false },
+    };
+    try std.testing.expectEqual(expected.len, listed.len);
+    for (expected, listed) |want, got| {
+        try std.testing.expectEqualStrings(want[0], got.name);
+        try std.testing.expectEqual(want[1], got.arity);
+        try std.testing.expectEqual(want[2], got.facts);
+        try std.testing.expectEqual(want[3], got.has_rules);
+        try std.testing.expectEqual(want[4], got.typed);
+    }
+
+    const columns = (try db.schemaColumns(std.testing.allocator, "age")).?;
+    defer std.testing.allocator.free(columns);
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("Who", columns[0].name.?);
+    try std.testing.expect(columns[0].type.eql(.atom));
+    try std.testing.expectEqual(@as(?[]const u8, null), columns[1].name);
+    try std.testing.expect(columns[1].type.eql(.int));
+    try std.testing.expectEqual(@as(?[]SchemaColumn, null), try db.schemaColumns(std.testing.allocator, "edge"));
+}
+
+test "quoted atoms escape line breaks and tabs, and reparse to themselves" {
+    var db = Jatalog.init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute("p('two\\nlines\\tand\\ra \\\\ and \\'').", null);
+    result.deinit();
+
+    var answers = try db.query(&.{input.relation("p", &.{input.variable("X")})}, &.{});
+    defer answers.deinit();
+    const value = answers.answers.items[0].bindings.items[0].value;
+    try std.testing.expectEqualStrings("two\nlines\tand\ra \\ and '", try value.getAtom());
+    const written = try value.formatAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("'two\\nlines\\tand\\ra \\\\ and \\''", written);
+
+    // Writing it back into a program names the same atom.
+    const source = try std.fmt.allocPrint(std.testing.allocator, "p({s})~", .{written});
+    defer std.testing.allocator.free(source);
+    var retracted = try db.execute(source, null);
+    retracted.deinit();
+    try std.testing.expectEqual(FactCount{}, try db.countFacts("p", 1));
 }

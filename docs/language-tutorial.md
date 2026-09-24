@@ -73,7 +73,9 @@ nickname(alice, 'Al').
 note(bob, 'calls it \'the office\'').
 ```
 
-A backslash escapes a quote or backslash inside a quoted value.
+A backslash escapes a quote or backslash inside a quoted value. `\n`, `\t`
+and `\r` stand for a line break, a tab and a carriage return; a backslash
+before any other character stands for that character.
 
 Quoting always constructs an atom, so `'36'` is distinct from integer `36`.
 Bare integers outside the signed 64-bit range return `NumericOverflow`. Decimal

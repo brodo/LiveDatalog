@@ -72,6 +72,7 @@ fn serve(self: *Server, stream: Io.net.Stream) Io.Cancelable!void {
 
         const request_line = std.mem.trim(u8, line, &std.ascii.whitespace);
         if (std.mem.eql(u8, request_line, ".quit") or std.mem.eql(u8, request_line, ".exit")) return;
+        if (std.mem.eql(u8, request_line, ".watch")) return self.watch(&writer.interface);
 
         var request: Engine.Request = .{
             .line = request_line,
@@ -84,5 +85,58 @@ fn serve(self: *Server, stream: Io.net.Stream) Io.Cancelable!void {
 
         writer.interface.writeAll(request.response.written()) catch return;
         writer.interface.flush() catch return;
+    }
+}
+
+/// Streams `generation <n>` to the client: the current generation now, then
+/// one line after every change, until the client hangs up or the server
+/// stops. The connection takes no more requests.
+fn watch(self: *Server, writer: *Io.Writer) Io.Cancelable!void {
+    const io = self.engine.io;
+    var buffer: [1]u64 = undefined;
+    var changes: Io.Queue(u64) = .init(&buffer);
+
+    const Subscribe = struct {
+        const Self = @This();
+        call: Engine.Call = .{ .run = perform },
+        changes: *Io.Queue(u64),
+        generation: ?u64 = null,
+
+        fn perform(call: *Engine.Call, engine: *Engine) void {
+            const s: *Self = @fieldParentPtr("call", call);
+            engine.subscribe(s.changes) catch return;
+            s.generation = engine.generation;
+        }
+    };
+    var subscription: Subscribe = .{ .changes = &changes };
+    if (!subscription.call.perform(self.engine)) return;
+    const first = subscription.generation orelse {
+        writer.writeAll("error OutOfMemory\n") catch return;
+        writer.flush() catch return;
+        return;
+    };
+    defer {
+        const Unsubscribe = struct {
+            const Self = @This();
+            call: Engine.Call = .{ .run = perform },
+            changes: *Io.Queue(u64),
+
+            fn perform(call: *Engine.Call, engine: *Engine) void {
+                const u: *Self = @fieldParentPtr("call", call);
+                engine.unsubscribe(u.changes);
+            }
+        };
+        var unsubscription: Unsubscribe = .{ .changes = &changes };
+        _ = unsubscription.call.perform(self.engine);
+    }
+
+    var generation = first;
+    while (true) {
+        writer.print("generation {d}\n", .{generation}) catch return;
+        writer.flush() catch return;
+        generation = changes.getOne(io) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => |e| return e,
+        };
     }
 }

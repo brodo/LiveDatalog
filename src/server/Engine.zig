@@ -143,7 +143,7 @@ pub fn post(self: *Engine, message: Message) void {
     self.queue.putOneUncancelable(self.io, message) catch switch (message) {
         .changed => |path| self.gpa.free(path),
         .request => |request| {
-            request.response.writer.writeAll("Error: server is shutting down\n\n") catch |err|
+            request.response.writer.writeAll("error ShuttingDown the server is shutting down\n") catch |err|
                 log.err("cannot answer request: {s}", .{@errorName(err)});
             request.done.set(self.io);
         },
@@ -254,7 +254,7 @@ fn collect(
             if (entry.found_existing) self.gpa.free(path);
         },
         .request => |request| requests.append(self.gpa, message) catch {
-            request.response.writer.writeAll("Error: OutOfMemory\n\n") catch |err|
+            request.response.writer.writeAll("error OutOfMemory\n") catch |err|
                 log.err("cannot answer request: {s}", .{@errorName(err)});
             request.done.set(self.io);
         },
@@ -673,29 +673,6 @@ fn clearError(self: *Engine, path: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
-// Introspection, for the protocol's commands
-
-pub fn writeStatus(self: *Engine, writer: *Io.Writer) !void {
-    try writer.print("directory: {s}\ngeneration: {d}\nfiles: {d}\nfacts: {d}\n", .{
-        self.root,
-        self.generation,
-        self.files.count(),
-        self.db.state.facts.len(),
-    });
-    for (self.errors.values()) |load_error| {
-        try writer.writeAll("error: ");
-        try protocol.writeIndented(writer, load_error.message);
-    }
-}
-
-pub fn writeFiles(self: *Engine, writer: *Io.Writer) !void {
-    const paths = try self.gpa.dupe([]const u8, self.files.keys());
-    defer self.gpa.free(paths);
-    std.mem.sort([]const u8, paths, {}, lessThan);
-    for (paths) |path| try writer.print("{s}\n", .{self.relative(path)});
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 
 const testing = std.testing;
@@ -752,29 +729,29 @@ test "loads a directory and follows fact and rule changes" {
     defer engine.deinit();
     engine.reloadAll();
     try testing.expectEqual(@as(usize, 2), engine.files.count());
-    try expectAnswer(&engine, "path(a, X)?", "X: b\nX: c\n\n");
+    try expectAnswer(&engine, "path(a, X)?", "ok table 2\nX\nb\nc\n");
 
     // Facts only: incremental.
     try dir.write("edges.dl", "edge(a, b). edge(b, d).");
     try touch(&engine, &dir, "edges.dl");
-    try expectAnswer(&engine, "path(a, X)?", "X: b\nX: d\n\n");
+    try expectAnswer(&engine, "path(a, X)?", "ok table 2\nX\nb\nd\n");
 
     // A fact asserted by two files survives removal from one of them.
     try dir.write("more.dl", "edge(b, d).");
     try touch(&engine, &dir, "more.dl");
     try dir.write("edges.dl", "edge(a, b).");
     try touch(&engine, &dir, "edges.dl");
-    try expectAnswer(&engine, "path(a, X)?", "X: b\nX: d\n\n");
+    try expectAnswer(&engine, "path(a, X)?", "ok table 2\nX\nb\nd\n");
 
     // A rule change rebuilds.
     try dir.write("rules.dl", "path(X, Y) :- edge(X, Y).");
     try touch(&engine, &dir, "rules.dl");
-    try expectAnswer(&engine, "path(a, X)?", "X: b\n\n");
+    try expectAnswer(&engine, "path(a, X)?", "ok table 1\nX\nb\n");
 
     // A deleted file takes its facts with it.
     try dir.tmp.dir.deleteFile(testing.io, "more.dl");
     try touch(&engine, &dir, "more.dl");
-    try expectAnswer(&engine, "edge(b, X)?", "No.\n\n");
+    try expectAnswer(&engine, "edge(b, X)?", "ok table 0\nX\n");
     try testing.expectEqual(@as(usize, 2), engine.files.count());
 }
 
@@ -791,18 +768,18 @@ test "a broken file keeps its last good version" {
     try dir.write("a.dl", "p(a). p(");
     try touch(&engine, &dir, "a.dl");
     try testing.expectEqual(@as(usize, 1), engine.errors.count());
-    try expectAnswer(&engine, "p(X)?", "X: a\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 1\nX\na\n");
 
     // A semantic error in a rebuild keeps the old database too.
     try dir.write("a.dl", "p(a). q(X) :- p(X), not q(X).");
     try touch(&engine, &dir, "a.dl");
     try testing.expectEqual(@as(usize, 1), engine.errors.count());
-    try expectAnswer(&engine, "p(X)?", "X: a\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 1\nX\na\n");
 
     try dir.write("a.dl", "p(b).");
     try touch(&engine, &dir, "a.dl");
     try testing.expectEqual(@as(usize, 0), engine.errors.count());
-    try expectAnswer(&engine, "p(X)?", "X: b\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 1\nX\nb\n");
 }
 
 test "a full reload leaves out only the broken files" {
@@ -818,7 +795,7 @@ test "a full reload leaves out only the broken files" {
     engine.reloadAll();
     try testing.expectEqual(@as(usize, 1), engine.files.count());
     try testing.expectEqual(@as(usize, 2), engine.errors.count());
-    try expectAnswer(&engine, "p(X)?", "X: a\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 1\nX\na\n");
 }
 
 test "retractions force a rebuild in file order" {
@@ -831,11 +808,11 @@ test "retractions force a rebuild in file order" {
     engine.init(testing.allocator, testing.io, dir.root);
     defer engine.deinit();
     engine.reloadAll();
-    try expectAnswer(&engine, "p(X)?", "X: a\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 1\nX\na\n");
 
     try dir.write("a.dl", "p(a). p(b). p(c).");
     try touch(&engine, &dir, "a.dl");
-    try expectAnswer(&engine, "p(X)?", "X: a\nX: c\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 2\nX\na\nc\n");
 }
 
 test "a fact two files assert survives deleting one of them" {
@@ -848,14 +825,124 @@ test "a fact two files assert survives deleting one of them" {
     engine.init(testing.allocator, testing.io, dir.root);
     defer engine.deinit();
     engine.reloadAll();
-    try expectAnswer(&engine, "p(X)?", "X: 1\nX: a\nX: shared\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 3\nX\n1\na\nshared\n");
 
     try dir.tmp.dir.deleteFile(testing.io, "a.dl");
     try touch(&engine, &dir, "a.dl");
     try testing.expectEqual(@as(usize, 1), engine.files.count());
-    try expectAnswer(&engine, "p(X)?", "X: 1\nX: shared\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 2\nX\n1\nshared\n");
 
     try dir.tmp.dir.deleteFile(testing.io, "b.dl");
     try touch(&engine, &dir, "b.dl");
-    try expectAnswer(&engine, "p(X)?", "No.\n\n");
+    try expectAnswer(&engine, "p(X)?", "ok table 0\nX\n");
+}
+
+/// `expectAnswer` with `|` standing for the tabs that separate cells, since
+/// a multiline string literal cannot hold a tab.
+fn expectTable(engine: *Engine, line: []const u8, expected: []const u8) !void {
+    const tabbed = try testing.allocator.dupe(u8, expected);
+    defer testing.allocator.free(tabbed);
+    std.mem.replaceScalar(u8, tabbed, '|', '\t');
+    try expectAnswer(engine, line, tabbed);
+}
+
+test "the protocol lists predicates, schemas and rows" {
+    var dir: TestDir = try .init();
+    defer dir.deinit();
+    try dir.write("people.dl",
+        \\schema born(Who: atom, Year: int).
+        \\schema lived(atom, list(int)).
+        \\born(ada, 1815). born(alan, 1912). born('Grace Hopper', 1906).
+        \\edge(a, b). edge(b, c). path(a, b).
+        \\path(X, Y) :- edge(X, Y).
+        \\note('two\nlines').
+    );
+
+    var engine: Engine = undefined;
+    engine.init(testing.allocator, testing.io, dir.root);
+    defer engine.deinit();
+    engine.reloadAll();
+
+    try expectTable(&engine, ".predicates",
+        \\ok table 5
+        \\name|arity|kind|facts|typed
+        \\born|2|base|3|true
+        \\edge|2|base|2|false
+        \\lived|2|base|0|true
+        \\note|1|base|1|false
+        \\path|2|mixed|2|false
+        \\
+    );
+    try expectTable(&engine, ".schema born",
+        \\ok table 2
+        \\position|name|type
+        \\1|'Who'|atom
+        \\2|'Year'|int
+        \\
+    );
+    try expectTable(&engine, ".schema lived",
+        \\ok table 2
+        \\position|name|type
+        \\1||atom
+        \\2||'list(int)'
+        \\
+    );
+    try expectAnswer(&engine, ".schema edge", "ok table 0\nposition\tname\ttype\n");
+    try expectTable(&engine, ".rows born/2",
+        \\ok table 3
+        \\Who|Year
+        \\'Grace Hopper'|1906
+        \\ada|1815
+        \\alan|1912
+        \\
+    );
+    try expectAnswer(&engine, ".rows born/2 1 1 by 2 desc", "ok table 1\nWho\tYear\n'Grace Hopper'\t1906\n");
+    try expectAnswer(&engine, ".rows born/2 5", "ok table 0\nWho\tYear\n");
+    try expectAnswer(&engine, ".rows edge/2 0 1", "ok table 1\n1\t2\na\tb\n");
+    try expectAnswer(&engine, ".rows note/1", "ok table 1\n1\n'two\\nlines'\n");
+    try expectAnswer(
+        &engine,
+        ".rows edge/2 by 3",
+        "error InvalidArgument .rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc|desc] ...]\n",
+    );
+
+    // A query without variables: an empty header, and one empty row if it holds.
+    try expectAnswer(&engine, "edge(a, b)?", "ok table 1\n\n\n");
+    try expectAnswer(&engine, "edge(a, c)?", "ok table 0\n\n");
+    try expectAnswer(&engine, "edge(X, Y), not path(Y, c)?", "ok table 1\nX\tY\nb\tc\n");
+
+    try expectAnswer(
+        &engine,
+        "p(a).",
+        "error ReadOnly facts, rules, retractions and schemas belong in the .dl files\n",
+    );
+    try expectAnswer(&engine, "p(", "error InvalidSyntax at column 3, expected a term\n");
+    try expectAnswer(&engine, ".nope", "error UnknownCommand .nope; try .help\n");
+    try expectAnswer(&engine, ".files", "ok table 1\npath\n'people.dl'\n");
+}
+
+test "the protocol reports load errors as a table" {
+    var dir: TestDir = try .init();
+    defer dir.deinit();
+    try dir.write("a.dl", "p(a).\np(");
+
+    var engine: Engine = undefined;
+    engine.init(testing.allocator, testing.io, dir.root);
+    defer engine.deinit();
+    engine.reloadAll();
+
+    try expectTable(&engine, ".errors",
+        \\ok table 1
+        \\file|line|column|error|message
+        \\'a.dl'|2|3|'InvalidSyntax, expected a term'|'a.dl:2:3: InvalidSyntax, expected a term\np(\n  ^'
+        \\
+    );
+    var response: Io.Writer.Allocating = .init(testing.allocator);
+    defer response.deinit();
+    try protocol.handle(&engine, ".help", &response.writer);
+    const lines = std.mem.count(u8, protocol.help_text, "\n");
+    const status_line = try std.fmt.allocPrint(testing.allocator, "ok text {d}\n", .{lines});
+    defer testing.allocator.free(status_line);
+    try testing.expect(std.mem.startsWith(u8, response.written(), status_line));
+    try testing.expectEqual(lines + 1, std.mem.count(u8, response.written(), "\n"));
 }

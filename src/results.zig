@@ -172,12 +172,24 @@ pub const Answer = struct {
 
 pub const QueryResult = struct {
     allocator: std.mem.Allocator,
+    /// The names of the variables the query's answers list, in the order they
+    /// list them — known even when there are no answers.
+    variables: std.ArrayList([]u8) = .empty,
     answers: std.ArrayList(Answer) = .empty,
 
     pub fn deinit(self: *QueryResult) void {
+        for (self.variables.items) |name| self.allocator.free(name);
+        self.variables.deinit(self.allocator);
         for (self.answers.items) |*answer| answer.deinit();
         self.answers.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    /// Records `name` as the next variable answers list.
+    pub fn appendVariable(self: *QueryResult, name: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.variables.append(self.allocator, owned);
     }
 };
 

@@ -632,8 +632,17 @@ const Parser = struct {
         var text: std.ArrayList(u8) = .empty;
         var cursor: usize = 0;
         while (cursor < raw.len) : (cursor += 1) {
-            if (raw[cursor] == '\\' and cursor + 1 < raw.len) cursor += 1;
-            try text.append(self.arena, raw[cursor]);
+            if (raw[cursor] != '\\' or cursor + 1 == raw.len) {
+                try text.append(self.arena, raw[cursor]);
+                continue;
+            }
+            cursor += 1;
+            try text.append(self.arena, switch (raw[cursor]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                else => |byte| byte,
+            });
         }
         return input.atom(text.items);
     }

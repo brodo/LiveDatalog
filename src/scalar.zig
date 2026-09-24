@@ -380,10 +380,15 @@ pub fn writeFloat(writer: *std.Io.Writer, value: f64) !void {
 pub fn writeAtom(writer: *std.Io.Writer, atom: []const u8) !void {
     if (isBareAtom(atom)) return writer.writeAll(atom);
     try writer.writeByte('\'');
-    for (atom) |byte| {
-        if (byte == '\\' or byte == '\'') try writer.writeByte('\\');
-        try writer.writeByte(byte);
-    }
+    // Line breaks and tabs are escaped so that an atom never spans lines or
+    // the cells of a tab-separated row.
+    for (atom) |byte| switch (byte) {
+        '\\', '\'' => try writer.print("\\{c}", .{byte}),
+        '\n' => try writer.writeAll("\\n"),
+        '\t' => try writer.writeAll("\\t"),
+        '\r' => try writer.writeAll("\\r"),
+        else => try writer.writeByte(byte),
+    };
     try writer.writeByte('\'');
 }
 
