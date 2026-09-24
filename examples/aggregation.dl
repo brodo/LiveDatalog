@@ -1,4 +1,11 @@
 % Structural lists, set aggregation, and an ordinary recursive list function.
+schema person(atom).
+schema parent(Parent: atom, Child: atom).
+schema children(Parent: atom, Children: list(atom)).
+schema length(list, int).
+schema numchildren(Parent: atom, Count: int).
+schema limit(int).
+
 person(alice).
 person(bob).
 parent(alice, bob).
@@ -10,6 +17,6 @@ length(H!T, N) :- length(T, M), N = M + 1.
 
 numchildren(X, N) :- children(X, S), length(S, N).
 
-% Mixed numeric identity: the float literal 2.0 is the integer 2.
+% Mixed numeric identity: the float literal 2.0 is the integer 2, so it fits int.
 limit(2.0).
 numchildren(X, N), limit(L), N < L?

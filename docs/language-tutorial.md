@@ -445,8 +445,8 @@ zig build run -- examples/aggregation.dl
 ```
 
 ```text
-X: alice, N: 1
-X: bob, N: 0
+X: alice, N: 1, L: 2
+X: bob, N: 0, L: 2
 ```
 
 ## Schemas

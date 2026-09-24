@@ -1,9 +1,10 @@
 % Fifty famous researchers.
-%
-% researcher(Id, Name).
-% field(Id, Field).               -- one fact per field
-% born(Id, Year).  died(Id, Year).  -- years BCE are negative
-% born_in(Id, City, Country).     -- the country the city belongs to today
+
+schema researcher(Id: atom, Name: atom).
+schema field(Id: atom, Field: atom).               % one fact per field
+schema born(Id: atom, Year: int).                  % years BCE are negative
+schema died(Id: atom, Year: int).
+schema born_in(Id: atom, City: atom, Country: atom). % the country the city belongs to today
 
 researcher(archimedes, "Archimedes").
 field(archimedes, mathematics). field(archimedes, physics).

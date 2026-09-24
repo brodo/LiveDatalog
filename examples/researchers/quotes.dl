@@ -1,6 +1,6 @@
 % Quotes by the researchers in people.dl.
 %
-% quote(Id, Text).  -- some researchers have more than one
+schema quote(Id: atom, Text: atom).  % some researchers have more than one
 
 quote(archimedes, "Give me a place to stand and I will move the earth.").
 quote(galileo, "Philosophy is written in this grand book, the universe, which stands continually open to our gaze.").
