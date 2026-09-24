@@ -583,7 +583,11 @@ pub const Jatalog = struct {
         self: *Jatalog,
         executable: *const folding.Executable,
     ) !database.Database {
-        var staged = try self.viewOnlyCopy();
+        // What the catalog admits and nothing else: the other facts, the
+        // derived closure and the database's own rules all go, since one of
+        // those deriving a withheld relation would put it straight back, and
+        // the plan brings every rule it needs.
+        var staged = try self.state.cloneRetaining(*const Jatalog, readableByPlans, self);
         errdefer staged.deinit();
         for (executable.rules) |rule| {
             const copy = try syntax.cloneRule(staged.allocator, rule);
@@ -727,52 +731,6 @@ pub const Jatalog = struct {
             .rule_generation = self.plans.rule_generation,
             .names = names,
         };
-    }
-
-    /// A copy of this database holding only what a plan is allowed to read.
-    ///
-    /// The extensions are taken from the closure rather than from the base
-    /// facts, because a view the engine maintains stores its tuples there and
-    /// nowhere else; they arrive in the copy as base facts, which is what they
-    /// are to a plan. Everything else goes: the other facts, the derived
-    /// closure, the auxiliary views, and the database's own rules — one of
-    /// those deriving a withheld relation would put it straight back, and the
-    /// plan brings every rule it needs.
-    fn viewOnlyCopy(self: *Jatalog) !database.Database {
-        var copy = try self.state.clone();
-        errdefer copy.deinit();
-
-        var kept: std.ArrayList(relation_store.Fact) = .empty;
-        defer {
-            for (kept.items) |fact| copy.allocator.free(fact.terms);
-            kept.deinit(copy.allocator);
-        }
-        const stored = copy.closureStore();
-        for (0..stored.len()) |index| {
-            const fact = stored.factAt(index);
-            if (!self.readableByPlans(.{ .name = fact.predicate, .arity = fact.terms.len }))
-                continue;
-            try relation_store.appendFactCopy(copy.allocator, &kept, fact);
-        }
-
-        if (copy.closure) |*closure| {
-            closure.deinit();
-            copy.closure = null;
-        }
-        copy.materialization = .uninitialized;
-        // The plan was checked against the schemas when it was folded. The
-        // rules it installs here are its own — inverse rules the caller never
-        // wrote — and hold facts a plan reconstructs rather than asserts.
-        copy.schemas.deinit(copy.allocator);
-        copy.schemas = .{};
-        materialization.dropAuxiliaryViews(&copy);
-        for (copy.eval.rules.items) |rule| syntax.freeRule(copy.allocator, rule);
-        copy.eval.rules.clearRetainingCapacity();
-        copy.eval.invalidateAnalysis();
-        copy.facts.clear();
-        for (kept.items) |fact|
-            try relation_store.copyFactInto(copy.allocator, &copy.facts, fact, false);
-        return copy;
     }
 
     /// Whether a plan may read facts stored under this name and arity: a base

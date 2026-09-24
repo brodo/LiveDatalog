@@ -214,6 +214,58 @@ pub const Database = struct {
         return result;
     }
 
+    /// A copy holding, as base facts, exactly those of this database's facts
+    /// — base or derived — whose name and arity `keep` admits, and nothing
+    /// else: no other fact, no rule, no derived closure, no auxiliary view and
+    /// no schema. The interned values and names all come with it, so an
+    /// identifier means the same in the copy as it does here.
+    ///
+    /// The facts are taken from the closure rather than from the base facts,
+    /// because a predicate the engine maintains stores its tuples there and
+    /// nowhere else; they arrive in the copy as base facts, which is what they
+    /// are to whoever reads the copy. Materialize this database first if a
+    /// derived predicate should be among them.
+    ///
+    /// The rules go because a rule deriving a predicate `keep` refused would
+    /// put it straight back, and the schemas because the copy is for rules the
+    /// caller brings, which were checked against the schemas already and hold
+    /// facts the caller derives rather than asserts. What is left is a
+    /// database whose every fact was admitted, ready for rules to be added.
+    ///
+    /// It is a copy like `clone`'s, so `release` charges back the work done on
+    /// it, and `context` is passed to every call of `keep`.
+    pub fn cloneRetaining(
+        self: *const Database,
+        comptime Context: type,
+        comptime keep: fn (Context, relation_store.PredicateKey) bool,
+        context: Context,
+    ) !Database {
+        var copy = try self.clone();
+        errdefer copy.deinit();
+
+        if (copy.closure) |*closure| {
+            closure.deinit();
+            copy.closure = null;
+        }
+        copy.materialization = .uninitialized;
+        copy.schemas.deinit(copy.allocator);
+        copy.schemas = .{};
+        for (copy.auxiliary.items) |*view| view.deinit(copy.allocator);
+        copy.auxiliary.clearRetainingCapacity();
+        for (copy.eval.rules.items) |rule| syntax.freeRule(copy.allocator, rule);
+        copy.eval.rules.clearRetainingCapacity();
+        copy.eval.invalidateAnalysis();
+
+        copy.facts.clear();
+        const stored = if (self.closure) |*closure| closure else &self.facts;
+        for (0..stored.len()) |index| {
+            const fact = stored.factAt(index);
+            if (!keep(context, .{ .name = fact.predicate, .arity = fact.terms.len })) continue;
+            try relation_store.copyFactInto(copy.allocator, &copy.facts, fact, false);
+        }
+        return copy;
+    }
+
     /// Installs a staged copy in place of this database, leaving the previous
     /// contents in `staging` for the caller's `deinit` to release. Every
     /// operation that can fail stages its work on a clone and ends here, which
@@ -563,4 +615,67 @@ test "charging from a kept copy charges each use only its own share" {
     // Ten of its own, then three and one: the copy's inherited ten and its
     // first use are never charged a second time.
     try testing.expectEqual(@as(u64, 10 + 3 + 1), db.eval.cost.work);
+}
+
+/// Admits the predicates a `cloneRetaining` test names, whatever their arity.
+fn admitsNamed(names: []const syntax.Id, key: relation_store.PredicateKey) bool {
+    return std.mem.indexOfScalar(syntax.Id, names, key.name) != null;
+}
+
+test "a copy retaining some predicates holds their facts as base facts and nothing else" {
+    const allocator = testing.allocator;
+    var db: Database = .init(allocator);
+    defer db.deinit();
+    const kept = try db.strings.intern("kept");
+    const dropped = try db.strings.intern("dropped");
+    const derived = try db.strings.intern("derived");
+    const atom = try db.eval.scalars.internAtom("a");
+
+    var ground = [_]syntax.Term{.{ .scalar = atom }};
+    _ = try db.applyInsertion(.{ .predicate = kept, .terms = &ground });
+    _ = try db.applyInsertion(.{ .predicate = dropped, .terms = &ground });
+    // A closure holding one fact no base fact states, as materializing a rule
+    // deriving it would have left, and the rule itself.
+    db.closure = try db.facts.clone();
+    var values = [_]syntax.ValueId{try db.eval.termToValue(ground[0], null)};
+    try relation_store.copyFactInto(allocator, &db.closure.?, .{
+        .predicate = derived,
+        .terms = &values,
+    }, true);
+    db.materialization = .clean;
+    const x = try db.strings.intern("X");
+    const head_terms = try allocator.dupe(syntax.Term, &.{.{ .variable = x }});
+    const body = allocator.alloc(syntax.Clause, 0) catch |err| {
+        allocator.free(head_terms);
+        return err;
+    };
+    db.eval.rules.append(allocator, .{
+        .head = .{ .predicate = derived, .terms = head_terms },
+        .body = body,
+    }) catch |err| {
+        allocator.free(head_terms);
+        allocator.free(body);
+        return err;
+    };
+
+    var copy = try db.cloneRetaining([]const syntax.Id, admitsNamed, &.{ kept, derived });
+    defer copy.deinit();
+
+    // The derived fact arrives as a base fact, beside the base fact that was
+    // admitted; the one that was not is gone, and so is what derived anything.
+    try testing.expectEqual(@as(usize, 2), copy.facts.len());
+    for (0..copy.facts.len()) |index| {
+        try testing.expect(!copy.facts.isDerived(index));
+        try testing.expect(copy.facts.factAt(index).predicate != dropped);
+    }
+    try testing.expectEqual(@as(?relation_store.RelationStore, null), copy.closure);
+    try testing.expectEqual(Materialization.uninitialized, copy.materialization);
+    try testing.expectEqual(@as(usize, 0), copy.eval.rules.items.len);
+    // The identifiers are the original's, so a name means the same in both.
+    try testing.expectEqualStrings("derived", copy.strings.resolve(derived));
+
+    // And the original is as it was.
+    try testing.expectEqual(@as(usize, 2), db.facts.len());
+    try testing.expectEqual(@as(usize, 3), db.closure.?.len());
+    try testing.expectEqual(@as(usize, 1), db.eval.rules.items.len);
 }
