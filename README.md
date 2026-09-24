@@ -117,6 +117,9 @@ It offers:
 - **Completion** of predicate names wherever a goal can start — not inside a
   relation's arguments — inserting a placeholder per column, named after the
   schema's columns where they have names.
+- **Signature help** while typing a relation's arguments: its schema's
+  columns, or else each arity it is defined with, with the argument being
+  typed marked. `setof` shows its template, goal and result.
 
 What you type is never loaded: everything the listener says about a predicate
 describes the database the saved files built, and a draft that does not parse

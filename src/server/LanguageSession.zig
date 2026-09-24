@@ -378,6 +378,7 @@ pub fn initialize(
             .documentHighlightProvider = .{ .bool = true },
             .workspaceSymbolProvider = .{ .bool = true },
             .completionProvider = .{},
+            .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
         },
     };
 }
@@ -915,9 +916,14 @@ const Defined = struct {
     definer: Definer,
     /// Its first definition in sorted path order.
     location: types.Location,
-    /// The column names of its schema, null where a column has none. Empty
-    /// unless a schema defines it.
-    columns: []const ?[]const u8,
+    /// The columns of its schema. Empty unless a schema defines it.
+    columns: []const Column,
+
+    const Column = struct {
+        name: ?[]const u8,
+        /// As a schema writes it.
+        type: []const u8,
+    };
 };
 
 /// Every predicate with a definition in the loaded files, sorted by label.
@@ -963,14 +969,19 @@ fn definedPredicates(
     const defined = try arena.alloc(Defined, firsts.count());
     for (defined, firsts.values()) |*to, first| {
         const source = engine.files.getPtr(first.path).?;
-        var columns: []const ?[]const u8 = &.{};
+        var columns: []const Defined.Column = &.{};
         if (first.definer == .schema) {
             const schema = source.parsed.value.statements[first.statement].schema;
-            const names = try arena.alloc(?[]const u8, schema.columns.len);
-            for (names, schema.columns) |*column_name, column| {
-                column_name.* = if (column.name) |n| try arena.dupe(u8, n) else null;
+            const copied = try arena.alloc(Defined.Column, schema.columns.len);
+            for (copied, schema.columns) |*to_column, column| {
+                var column_type: Io.Writer.Allocating = .init(arena);
+                try writeColumnType(&column_type.writer, column.type);
+                to_column.* = .{
+                    .name = if (column.name) |name| try arena.dupe(u8, name) else null,
+                    .type = column_type.written(),
+                };
             }
-            columns = names;
+            columns = copied;
         }
         var ranges: Ranges = .{ .text = source.text, .encoding = encoding };
         to.* = .{
@@ -1053,25 +1064,53 @@ const Place = enum {
     schema_name,
 };
 
-/// What completion may insert where the word ending at byte `offset` of
-/// `text` starts. Decided by the text alone, since a draft being typed rarely
-/// parses: it is read from the start, skipping comments and quoted atoms and
-/// keeping a stack of open parentheses, each either a relation's arguments,
-/// `setof`'s arguments, or a group of goals.
+/// The relation or `setof` whose arguments a place in a draft is among.
+const Call = struct {
+    /// As written, quotes included.
+    name: []const u8,
+    /// Which argument, from 0.
+    argument: usize,
+};
+
+/// What a draft's text says about a place in it; see `scan`.
+const Scan = struct {
+    place: Place,
+    call: ?Call,
+};
+
 fn completionPlace(text: []const u8, offset: usize) Place {
+    return scan(text, offset).place;
+}
+
+/// What completion may insert where the word ending at byte `offset` of
+/// `text` starts, and which call's arguments that is among. Decided by the
+/// text alone, since a draft being typed rarely parses: it is read from the
+/// start, skipping comments and quoted atoms and keeping a stack of open
+/// parentheses, each either a relation's arguments, `setof`'s arguments, or a
+/// group of goals.
+fn scan(text: []const u8, offset: usize) Scan {
     const end = @min(offset, text.len);
     var cursor = end;
     while (cursor > 0 and isWordByte(text[cursor - 1])) cursor -= 1;
-    if (cursor < end and !(std.ascii.isLower(text[cursor]) or text[cursor] == '_')) return .none;
+    // A variable or a number is being typed.
+    const typing_value = cursor < end and !(std.ascii.isLower(text[cursor]) or text[cursor] == '_');
 
-    const Frame = union(enum) { arguments, group, list, setof: usize };
+    const Frame = struct {
+        kind: enum { arguments, group, list, setof },
+        name: []const u8 = "",
+        argument: usize = 0,
+    };
     var stack: [64]Frame = undefined;
     var depth: usize = 0;
     var goal = true;
     var statement_start = true;
     var schema_name = false;
+    // Whether the statement is a schema, whose parentheses hold columns.
+    var in_schema = false;
+    var in_quote = false;
     // The word just before, if the last token was one.
     var word: ?[]const u8 = null;
+    const nothing: Scan = .{ .place = .none, .call = null };
 
     var i: usize = 0;
     while (i < cursor) {
@@ -1081,13 +1120,13 @@ fn completionPlace(text: []const u8, offset: usize) Place {
             continue;
         }
         if (c == '%' or std.mem.startsWith(u8, text[i..], "//")) {
-            i = std.mem.findScalarPos(u8, text, i, '\n') orelse return .none;
-            if (i >= cursor) return .none;
+            i = std.mem.findScalarPos(u8, text, i, '\n') orelse return nothing;
+            if (i >= cursor) return nothing;
             continue;
         }
         if (std.mem.startsWith(u8, text[i..], "/*")) {
-            const close = std.mem.findPos(u8, text, i + 2, "*/") orelse return .none;
-            if (close + 2 > cursor) return .none;
+            const close = std.mem.findPos(u8, text, i + 2, "*/") orelse return nothing;
+            if (close + 2 > cursor) return nothing;
             i = close + 2;
             continue;
         }
@@ -1102,7 +1141,11 @@ fn completionPlace(text: []const u8, offset: usize) Place {
             if (c == '"' or c == '\'') {
                 i += 1;
                 while (i < text.len and text[i] != c) i += if (text[i] == '\\') 2 else 1;
-                if (i >= cursor) return .none;
+                // Inside a quoted atom, which may still be an argument.
+                if (i >= cursor) {
+                    in_quote = true;
+                    break;
+                }
                 i += 1;
             } else {
                 i = wordEnd(text, i);
@@ -1111,6 +1154,7 @@ fn completionPlace(text: []const u8, offset: usize) Place {
             word = token;
             if (was_statement_start and std.mem.eql(u8, token, "schema")) {
                 schema_name = true;
+                in_schema = true;
                 goal = false;
             } else if (schema_name) {
                 schema_name = false;
@@ -1123,18 +1167,18 @@ fn completionPlace(text: []const u8, offset: usize) Place {
         i += 1;
         switch (c) {
             '(' => {
-                if (depth == stack.len) return .none;
+                if (depth == stack.len) return nothing;
                 const frame: Frame = if (previous) |name|
-                    if (std.mem.eql(u8, name, "setof")) .{ .setof = 0 } else .arguments
+                    .{ .kind = if (std.mem.eql(u8, name, "setof")) .setof else .arguments, .name = name }
                 else
-                    .group;
+                    .{ .kind = .group };
                 stack[depth] = frame;
                 depth += 1;
-                goal = frame == .group;
+                goal = frame.kind == .group;
             },
             '[' => {
-                if (depth == stack.len) return .none;
-                stack[depth] = .list;
+                if (depth == stack.len) return nothing;
+                stack[depth] = .{ .kind = .list };
                 depth += 1;
                 goal = false;
             },
@@ -1144,13 +1188,14 @@ fn completionPlace(text: []const u8, offset: usize) Place {
             },
             ',' => if (depth == 0) {
                 goal = true;
-            } else switch (stack[depth - 1]) {
-                .group => goal = true,
-                .setof => |*argument| {
-                    argument.* += 1;
-                    goal = argument.* == 1;
-                },
-                .arguments, .list => {},
+            } else {
+                const frame = &stack[depth - 1];
+                frame.argument += 1;
+                goal = switch (frame.kind) {
+                    .group => true,
+                    .setof => frame.argument == 1,
+                    .arguments, .list => false,
+                };
             },
             ':' => if (i < text.len and text[i] == '-') {
                 i += 1;
@@ -1163,12 +1208,150 @@ fn completionPlace(text: []const u8, offset: usize) Place {
                 goal = true;
                 statement_start = true;
                 schema_name = false;
+                in_schema = false;
             },
             else => goal = false,
         }
     }
-    if (schema_name) return .schema_name;
-    return if (goal) .goal else .none;
+
+    // The innermost call, looking through lists and groups of goals.
+    const call: ?Call = if (in_schema) null else for (0..depth) |n| {
+        const frame = stack[depth - 1 - n];
+        switch (frame.kind) {
+            .arguments, .setof => break .{ .name = frame.name, .argument = frame.argument },
+            .group, .list => {},
+        }
+    } else null;
+    const place: Place = if (typing_value or in_quote)
+        .none
+    else if (schema_name)
+        .schema_name
+    else if (goal)
+        .goal
+    else
+        .none;
+    return .{ .place = place, .call = call };
+}
+
+fn writeColumnType(writer: *Io.Writer, column_type: LiveDatalog.input.ColumnType) Io.Writer.Error!void {
+    switch (column_type) {
+        .list => |element| if (element) |element_type| {
+            try writer.writeAll("list(");
+            try writeColumnType(writer, element_type.*);
+            try writer.writeByte(')');
+        } else try writer.writeAll("list"),
+        else => try writer.writeAll(@tagName(column_type)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signature help
+
+/// The columns of the predicate whose arguments are being typed, or of
+/// `setof`. A predicate with a schema has the one signature its schema
+/// declares; one without has one per arity it is defined with, the first
+/// with room for the argument being typed active.
+pub fn @"textDocument/signatureHelp"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.SignatureHelp.Params,
+) !?types.SignatureHelp {
+    const call: Call = call: {
+        const io = self.engine.io;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
+        const offset = offsets.positionToIndex(document.text, params.position, self.encoding);
+        const call = scan(document.text, offset).call orelse return null;
+        break :call .{ .name = try unquote(arena, call.name), .argument = call.argument };
+    };
+    var signature: SignatureBuilder = .{ .arena = arena, .encoding = self.encoding };
+    if (std.mem.eql(u8, call.name, "setof")) {
+        try signature.begin("setof");
+        for ([_][]const u8{ "Template", "Goal", "Result" }) |parameter| try signature.parameter(parameter, null);
+        return .{
+            .signatures = try arena.dupe(types.SignatureHelp.Signature, &.{try signature.end()}),
+            .activeSignature = 0,
+            .activeParameter = @intCast(call.argument),
+        };
+    }
+
+    const defined = try self.onEngine([]const Defined, definedPredicates, .{ arena, self.encoding });
+    var signatures: std.ArrayList(types.SignatureHelp.Signature) = .empty;
+    var active: ?usize = null;
+    for (defined) |predicate| {
+        if (predicate.arity == 0 or !std.mem.eql(u8, predicate.predicate, call.name)) continue;
+        if (predicate.definer == .schema) signatures.clearRetainingCapacity();
+        try signature.begin(try predicateSource(arena, predicate.predicate));
+        for (0..predicate.arity) |index| {
+            if (predicate.columns.len == 0) {
+                try signature.parameter(null, "_");
+            } else {
+                const column = predicate.columns[index];
+                try signature.parameter(column.name, column.type);
+            }
+        }
+        try signatures.append(arena, try signature.end());
+        if (predicate.definer == .schema) {
+            active = 0;
+            break;
+        }
+        if (active == null and predicate.arity > call.argument) active = signatures.items.len - 1;
+    }
+    if (signatures.items.len == 0) return null;
+    return .{
+        .signatures = signatures.items,
+        .activeSignature = @intCast(active orelse signatures.items.len - 1),
+        .activeParameter = @intCast(call.argument),
+    };
+}
+
+/// Writes `name(parameter, ...)`, noting where each parameter is in it.
+const SignatureBuilder = struct {
+    arena: std.mem.Allocator,
+    encoding: offsets.Encoding,
+    label: Io.Writer.Allocating = undefined,
+    parameters: std.ArrayList(types.SignatureHelp.Signature.Parameter) = .empty,
+
+    fn begin(self: *SignatureBuilder, name: []const u8) !void {
+        self.label = .init(self.arena);
+        self.parameters = .empty;
+        try self.label.writer.print("{s}(", .{name});
+    }
+
+    /// `name: type`, or whichever of the two there is.
+    fn parameter(self: *SignatureBuilder, name: ?[]const u8, column_type: ?[]const u8) !void {
+        const writer = &self.label.writer;
+        if (self.parameters.items.len != 0) try writer.writeAll(", ");
+        const start = self.position();
+        if (name) |n| try writer.writeAll(n);
+        if (name != null and column_type != null) try writer.writeAll(": ");
+        if (column_type) |t| try writer.writeAll(t);
+        try self.parameters.append(self.arena, .{ .label = .{ .tuple_1 = .{ start, self.position() } } });
+    }
+
+    fn end(self: *SignatureBuilder) !types.SignatureHelp.Signature {
+        try self.label.writer.writeByte(')');
+        return .{ .label = self.label.written(), .parameters = self.parameters.items };
+    }
+
+    /// Where the label ends, counted as positions are.
+    fn position(self: *SignatureBuilder) u32 {
+        return @intCast(offsets.countCodeUnits(self.label.written(), self.encoding));
+    }
+};
+
+/// A predicate's name as a relation writes it, quotes and escapes removed.
+fn unquote(arena: std.mem.Allocator, written: []const u8) ![]const u8 {
+    if (written.len < 2 or (written[0] != '\'' and written[0] != '"')) return written;
+    const raw = written[1 .. written.len - 1];
+    var name: std.ArrayList(u8) = try .initCapacity(arena, raw.len);
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        if (raw[i] == '\\' and i + 1 < raw.len) i += 1;
+        name.appendAssumeCapacity(raw[i]);
+    }
+    return name.items;
 }
 
 fn isWordByte(c: u8) bool {
@@ -1219,7 +1402,7 @@ fn goalSnippet(arena: std.mem.Allocator, predicate: Defined) ![]const u8 {
     try writer.writeByte('(');
     for (0..predicate.arity) |index| {
         if (index != 0) try writer.writeAll(", ");
-        const column = if (index < predicate.columns.len) predicate.columns[index] else null;
+        const column = if (index < predicate.columns.len) predicate.columns[index].name else null;
         if (column) |name| {
             try writer.print("${{{d}:", .{index + 1});
             try writeSnippetEscaped(writer, name);
@@ -1420,6 +1603,13 @@ const TestSession = struct {
             .position = .{ .line = line, .character = character },
         });
         return result.?.completion_items;
+    }
+
+    fn signatureHelp(self: *TestSession, name: []const u8, line: u32, character: u32) !?types.SignatureHelp {
+        return self.session.@"textDocument/signatureHelp"(self.arena.allocator(), .{
+            .textDocument = .{ .uri = try self.uri(name) },
+            .position = .{ .line = line, .character = character },
+        });
     }
 
     /// Takes what the session has written so far.
@@ -1740,4 +1930,73 @@ test "completion offers predicates where a goal can start" {
 
     try testing.expectEqual(@as(usize, 0), (try t.completions("r.dl", 0, 12)).len);
     try testing.expectEqual(@as(usize, 0), (try t.completions("unopened.dl", 0, 0)).len);
+}
+
+test "the scan finds the call whose arguments are being typed" {
+    const Expected = ?struct { []const u8, usize };
+    const cases = [_]struct { []const u8, Expected }{
+        .{ "q(X) :- age(", .{ "age", 0 } },
+        .{ "q(X) :- age(X, ", .{ "age", 1 } },
+        .{ "q(X) :- age(X, Ye", .{ "age", 1 } },
+        .{ "q(X) :- p(X, [a, b], ", .{ "p", 2 } },
+        .{ "q(X) :- p(X, [a, ", .{ "p", 1 } },
+        .{ "q(X) :- p(X, cons(a, ", .{ "cons", 1 } },
+        .{ "q(X) :- 'my pred'(1, ", .{ "'my pred'", 1 } },
+        .{ "q(X) :- p('a, ", .{ "p", 0 } },
+        .{ "q(S) :- setof(Y, ", .{ "setof", 1 } },
+        .{ "q(S) :- setof(Y, (p(Y), ", .{ "setof", 1 } },
+        .{ "q(S) :- setof(Y, p(Y, ", .{ "p", 1 } },
+        .{ "q(X) :- p(X)", null },
+        .{ "q(X) :- p(X), ", null },
+        .{ "schema age(Person: atom, ", null },
+        .{ "schema age(atom). q(X) :- age(", .{ "age", 0 } },
+        .{ "q(X) :- p(X, % x, ", null },
+    };
+    for (cases) |case| {
+        const text, const expected = case;
+        const call = scan(text, text.len).call;
+        errdefer std.debug.print("at the end of \"{s}\"\n", .{text});
+        if (expected) |e| {
+            try testing.expectEqualStrings(e[0], call.?.name);
+            try testing.expectEqual(e[1], call.?.argument);
+        } else try testing.expectEqual(@as(?Call, null), call);
+    }
+}
+
+test "signature help shows a schema's columns, or each defined arity" {
+    var t: TestSession = undefined;
+    try t.init(&.{
+        .{ "schema.dl", "schema age(Person: atom, list(int)).\n" },
+        .{ "facts.dl", "edge(a, b). edge(a, b, c). 'my pred'(1).\n" },
+    });
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+    try t.open("q.dl", "q(X) :- age(X, \nq(X) :- edge(a, b, \nq(X) :- setof(\nq(X) :- nope(\nq(X) :- 'my pred'(");
+
+    const age = (try t.signatureHelp("q.dl", 0, 15)).?;
+    try testing.expectEqual(@as(usize, 1), age.signatures.len);
+    try testing.expectEqualStrings("age(Person: atom, list(int))", age.signatures[0].label);
+    try testing.expectEqual(@as(?u32, 1), age.activeParameter);
+    const parameters = age.signatures[0].parameters.?;
+    try testing.expectEqual(@as(u32, 4), parameters[0].label.tuple_1[0]);
+    try testing.expectEqual(@as(u32, 16), parameters[0].label.tuple_1[1]);
+    try testing.expectEqual(@as(u32, 18), parameters[1].label.tuple_1[0]);
+    try testing.expectEqual(@as(u32, 27), parameters[1].label.tuple_1[1]);
+
+    // The first arity with room for a third argument is active.
+    const edge = (try t.signatureHelp("q.dl", 1, 19)).?;
+    try testing.expectEqual(@as(usize, 2), edge.signatures.len);
+    try testing.expectEqualStrings("edge(_, _)", edge.signatures[0].label);
+    try testing.expectEqualStrings("edge(_, _, _)", edge.signatures[1].label);
+    try testing.expectEqual(@as(?u32, 1), edge.activeSignature);
+    try testing.expectEqual(@as(?u32, 2), edge.activeParameter);
+
+    const setof = (try t.signatureHelp("q.dl", 2, 14)).?;
+    try testing.expectEqualStrings("setof(Template, Goal, Result)", setof.signatures[0].label);
+    try testing.expectEqual(@as(?u32, 0), setof.activeParameter);
+
+    try testing.expectEqual(@as(?types.SignatureHelp, null), try t.signatureHelp("q.dl", 3, 13));
+    const quoted = (try t.signatureHelp("q.dl", 4, 18)).?;
+    try testing.expectEqualStrings("'my pred'(_)", quoted.signatures[0].label);
+    try testing.expectEqual(@as(?types.SignatureHelp, null), try t.signatureHelp("q.dl", 0, 3));
 }
