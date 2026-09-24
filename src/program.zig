@@ -809,7 +809,7 @@ test "an aggregate round whose removals rebuild still installs its recomputed he
 
 test "an aggregate cascade outlasts a round whose removals rebuild" {
     // The round's stale `held` tuple reaches `other` through negation, so its
-    // removals rebuild from `other`'s stratum, recomputing `all` while `cnt`
+    // removals fall back to a rebuild, which recomputes `all` while `cnt`
     // holds no tuple at all. `held`'s recomputed tuple is a base fact already,
     // so staging skips it, and `cnt`'s is propagated without reaching any
     // negation — the round is `.rebuilt`, yet it leaves `all` stale for a
@@ -828,5 +828,46 @@ test "an aggregate cascade outlasts a round whose removals rebuild" {
     const stats = db.maintenanceStats();
     try std.testing.expectEqual(@as(usize, 1), stats.rebuild_fallbacks);
     try std.testing.expectEqual(@as(usize, 3), stats.maintained_groups);
+    try test_support.expectClosureMatchesRebuild(&db);
+}
+
+test "a rebuild starts low enough to recompute an aggregate the delta reached" {
+    // The round's `cnt` tuples reach `other` through negation, the stale one
+    // as it is removed and the recomputed one as it is propagated, so both
+    // halves of the round fall back to a rebuild. `all` aggregates over `cnt`
+    // a stratum below `other`, and a rebuild starting at `other` would reuse
+    // it as it stood — and with `touched` emptied by the rebuild, no later
+    // round would recompute it either. It is the second rebuild, the one the
+    // additions fall back to, that settles what `all` ends up holding.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\item(a). item(b). tag(t).
+        \\cnt(S) :- setof(X, item(X), S).
+        \\all(T) :- setof(S, cnt(S), T).
+        \\other(Y) :- tag(Y), not cnt(Y), not all(Y).
+        \\cnt(S)?
+    );
+    try runQuietly(&db, "item(b)~");
+    try std.testing.expect(db.maintenanceStats().rebuild_fallbacks > 0);
+    try test_support.expectClosureMatchesRebuild(&db);
+}
+
+test "a retraction's rebuild starts low enough to recompute an aggregate over it" {
+    // The same fault reached by a base delta's removals instead of an
+    // aggregate round's additions: `item(b)` reaches `other` through
+    // negation, and `cnt` aggregates over `item` strata below it. No round
+    // follows a rebuild, so only the rebuild can recompute `cnt`.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\item(a). item(b). tag(t).
+        \\cnt(S) :- setof(X, item(X), S).
+        \\all(T) :- setof(S, cnt(S), T).
+        \\other(Y) :- tag(Y), not item(Y), not all(Y).
+        \\cnt(S)?
+    );
+    try runQuietly(&db, "item(b)~");
+    try std.testing.expectEqual(@as(usize, 1), db.maintenanceStats().rebuild_fallbacks);
     try test_support.expectClosureMatchesRebuild(&db);
 }

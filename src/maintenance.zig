@@ -222,19 +222,16 @@ fn applyStaged(
 /// Propagates a batch of base insertions already appended to the clean
 /// closure at `batch_start`, one stratum at a time. A stratum whose
 /// negated or aggregated dependencies gained facts falls back to the
-/// dirty-stratum rebuild; strata below it keep their incremental state.
+/// dirty-stratum rebuild; strata below it keep their incremental state, save
+/// the aggregates `rebuildFrom` starts the rebuild low enough to recompute.
 fn propagateInsertions(db: *database.Database, batch_start: usize) !Path {
     const start_len = db.closure.?.len();
     const analysis = try db.eval.ensureAnalysis();
     const max_level = analysis.max_level;
     var level: usize = 0;
     while (level <= max_level) : (level += 1) {
-        if (try levelBlocked(db, level, &db.closure.?, batch_start)) {
-            db.rebuild_fallbacks += 1;
-            db.markDirty(level);
-            try materialization.ensureMaterialized(db);
-            return .rebuilt;
-        }
+        if (try levelBlocked(db, level, &db.closure.?, batch_start))
+            return rebuildFrom(db, level, &db.closure.?, batch_start);
         try propagateLevel(db, &db.closure.?, &analysis.strata, level, batch_start);
     }
     db.propagated_facts += db.closure.?.len() - start_len;
@@ -259,6 +256,40 @@ fn levelBlocked(
     defer keys.deinit(db.allocator);
     try relation_store.collectPredicateKeys(db.allocator, changed, from, &keys);
     return try stratumImpact(db, level, &keys) == .rebuild;
+}
+/// Abandons the incremental path at stratum `blocked` for a dirty-stratum
+/// rebuild, given the facts in `changed` from `from` onwards that the delta
+/// has changed so far.
+///
+/// The rebuild reuses every stratum below the one it starts at, which is only
+/// sound for strata the delta has already maintained — and a maintainable
+/// aggregate is one incremental propagation does not maintain. Its groups are
+/// the aggregate phase's to recompute, from the facts the delta hands it in
+/// `touched`, and a rebuild empties `touched`. So an aggregate below
+/// `blocked` that reads a changed predicate would be reused stale, with
+/// nothing left to recompute it. The rebuild starts at the lowest such
+/// aggregate's stratum instead, when that is lower, which makes the fallback
+/// complete on its own.
+fn rebuildFrom(
+    db: *database.Database,
+    blocked: usize,
+    changed: *const relation_store.RelationStore,
+    from: usize,
+) !Path {
+    var keys: std.AutoHashMapUnmanaged(relation_store.PredicateKey, void) = .empty;
+    defer keys.deinit(db.allocator);
+    try relation_store.collectPredicateKeys(db.allocator, changed, from, &keys);
+    const analysis = try db.eval.ensureAnalysis();
+    var level = blocked;
+    for (db.eval.rules.items) |rule| {
+        if (syntax.maintainableAggregateIndex(rule) == null) continue;
+        if (!syntax.clausesReadGrownAnywhere(rule.body, &keys)) continue;
+        level = @min(level, evaluator.ruleStratum(&analysis.strata, rule));
+    }
+    db.rebuild_fallbacks += 1;
+    db.markDirty(level);
+    try materialization.ensureMaterialized(db);
+    return .rebuilt;
 }
 /// Classifies how a batch's changed predicates affect one stratum:
 /// negation over a changed predicate always needs the rebuild path, an
@@ -294,7 +325,8 @@ pub fn stratumImpact(
 /// would be unsound here because cyclic derivations support one another
 /// after their base support disappears. A stratum whose negated or
 /// aggregated dependencies lost facts is invalidated and recomputed
-/// through the dirty-stratum rebuild instead.
+/// through the dirty-stratum rebuild instead, starting low enough to take
+/// in every aggregate the deletion reached (see `rebuildFrom`).
 fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationStore) !Path {
     var old_closure = try db.closure.?.clone();
     defer old_closure.deinit();
@@ -304,12 +336,7 @@ fn propagateDeletions(db: *database.Database, deleted: *relation_store.RelationS
     const analysis = try db.eval.ensureAnalysis();
     var level: usize = 0;
     while (level <= analysis.max_level) : (level += 1) {
-        if (try levelBlocked(db, level, deleted, 0)) {
-            db.rebuild_fallbacks += 1;
-            db.markDirty(level);
-            try materialization.ensureMaterialized(db);
-            return .rebuilt;
-        }
+        if (try levelBlocked(db, level, deleted, 0)) return rebuildFrom(db, level, deleted, 0);
         try overdeleteLevel(db, &old_closure, deleted, &analysis.strata, level);
         try rederiveLevel(db, deleted, &analysis.strata, level);
     }
