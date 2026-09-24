@@ -31,6 +31,8 @@ pub const Message = union(enum) {
     changed: []u8,
     /// A client request; the engine writes the response and sets `done`.
     request: *Request,
+    /// Work to run where the database may be read; see `Call`.
+    call: *Call,
     /// Rescan the directory and rebuild from scratch.
     reload,
 };
@@ -39,6 +41,54 @@ pub const Request = struct {
     line: []const u8,
     response: Io.Writer.Allocating,
     done: Io.Event = .unset,
+};
+
+/// A function run on the engine task, for clients that need more of the
+/// engine than a request line can ask for. Calls run in order with requests,
+/// after the changes that arrived with them.
+pub const Call = struct {
+    run: *const fn (call: *Call, engine: *Engine) void,
+    done: Io.Event = .unset,
+    /// False when the engine stopped before it could run the call.
+    ran: bool = false,
+
+    /// Posts the call and waits until the engine has run it. Returns whether
+    /// it ran.
+    pub fn perform(call: *Call, engine: *Engine) bool {
+        engine.post(.{ .call = call });
+        // Uncancelable: the engine holds a pointer to `call` until done.
+        call.done.waitUncancelable(engine.io);
+        return call.ran;
+    }
+};
+
+/// Why a file, or the directory as a whole, failed to load.
+pub const LoadError = struct {
+    /// As `.status` shows it: where, what, and the offending line.
+    message: []u8,
+    /// What went wrong, without where: `InvalidSyntax, expected a term`.
+    summary: []u8,
+    /// Whether the file failed to parse, rather than to run.
+    syntax: bool = false,
+    /// Where in the file, when the error points into its text.
+    at: ?At = null,
+
+    pub const At = struct {
+        /// 0-based number of the line the error points into.
+        line: u32,
+        /// That line's text, without its newline.
+        text: []u8,
+        /// The offending bytes, as byte columns into `text`.
+        start: usize,
+        end: usize,
+    };
+
+    fn deinit(self: *LoadError, gpa: std.mem.Allocator) void {
+        gpa.free(self.message);
+        gpa.free(self.summary);
+        if (self.at) |at| gpa.free(at.text);
+        self.* = undefined;
+    }
 };
 
 gpa: std.mem.Allocator,
@@ -55,10 +105,13 @@ files: std.array_hash_map.String(Source) = .empty,
 /// Incremented whenever the database changes.
 generation: u64 = 0,
 /// Load errors by path (the root for errors not tied to one file).
-errors: std.array_hash_map.String([]u8) = .empty,
+errors: std.array_hash_map.String(LoadError) = .empty,
 /// Set when bookkeeping could not keep up (out of memory); the engine then
 /// reloads everything.
 needs_reload: bool = false,
+/// Queues told after every change to the files, the database or the load
+/// errors. Only the engine task touches this list; see `subscribe`.
+subscribers: std.ArrayList(*Io.Queue(u64)) = .empty,
 
 pub fn init(self: *Engine, gpa: std.mem.Allocator, io: Io, root: []const u8) void {
     self.* = .{
@@ -74,11 +127,12 @@ pub fn init(self: *Engine, gpa: std.mem.Allocator, io: Io, root: []const u8) voi
 pub fn deinit(self: *Engine) void {
     self.clearFiles();
     self.files.deinit(self.gpa);
-    for (self.errors.keys(), self.errors.values()) |key, value| {
+    for (self.errors.keys(), self.errors.values()) |key, *value| {
         self.gpa.free(key);
-        self.gpa.free(value);
+        value.deinit(self.gpa);
     }
     self.errors.deinit(self.gpa);
+    self.subscribers.deinit(self.gpa);
     self.db.deinit();
     self.* = undefined;
 }
@@ -93,8 +147,32 @@ pub fn post(self: *Engine, message: Message) void {
                 log.err("cannot answer request: {s}", .{@errorName(err)});
             request.done.set(self.io);
         },
+        .call => |call| call.done.set(self.io),
         .reload => {},
     };
+}
+
+/// Has `queue` told the generation after every change to the files, the
+/// database or the load errors, until `unsubscribe`. Only a `Call` may
+/// subscribe, since only the engine task touches the list. A full queue is
+/// not waited for: its reader has a change to catch up with already.
+pub fn subscribe(self: *Engine, queue: *Io.Queue(u64)) error{OutOfMemory}!void {
+    try self.subscribers.append(self.gpa, queue);
+}
+
+pub fn unsubscribe(self: *Engine, queue: *Io.Queue(u64)) void {
+    for (self.subscribers.items, 0..) |subscriber, index| if (subscriber == queue) {
+        _ = self.subscribers.swapRemove(index);
+        return;
+    };
+}
+
+fn notify(self: *Engine) void {
+    for (self.subscribers.items) |queue| {
+        // A closed queue's reader is going away and will unsubscribe.
+        _ = queue.put(self.io, &.{self.generation}, 0) catch |err|
+            log.debug("cannot notify a subscriber: {s}", .{@errorName(err)});
+    }
 }
 
 /// Makes `run` return once the queued messages are handled.
@@ -109,7 +187,7 @@ pub fn run(self: *Engine) void {
         for (dirty.keys()) |path| self.gpa.free(path);
         dirty.deinit(self.gpa);
     }
-    var requests: std.ArrayList(*Request) = .empty;
+    var requests: std.ArrayList(Message) = .empty;
     defer requests.deinit(self.gpa);
 
     while (true) {
@@ -128,6 +206,7 @@ pub fn run(self: *Engine) void {
             }
         }
 
+        var changed = reload or self.needs_reload or dirty.count() != 0;
         if (reload or self.needs_reload) {
             self.reloadAll();
         } else if (dirty.count() != 0) {
@@ -137,12 +216,24 @@ pub fn run(self: *Engine) void {
         dirty.clearRetainingCapacity();
 
         // Requests are answered after the changes that arrived with them.
-        for (requests.items) |request| {
-            protocol.handle(self, request.line, &request.response.writer) catch |err|
-                log.err("cannot answer request: {s}", .{@errorName(err)});
-            request.done.set(self.io);
-        }
+        const generation = self.generation;
+        for (requests.items) |message| switch (message) {
+            .request => |request| {
+                protocol.handle(self, request.line, &request.response.writer) catch |err|
+                    log.err("cannot answer request: {s}", .{@errorName(err)});
+                request.done.set(self.io);
+            },
+            .call => |call| {
+                call.run(call, self);
+                call.ran = true;
+                call.done.set(self.io);
+            },
+            .changed, .reload => unreachable,
+        };
         requests.clearRetainingCapacity();
+        // A `.reload` request rebuilds too.
+        if (self.generation != generation) changed = true;
+        if (changed) self.notify();
     }
 }
 
@@ -150,7 +241,7 @@ fn collect(
     self: *Engine,
     message: Message,
     dirty: *std.array_hash_map.String(void),
-    requests: *std.ArrayList(*Request),
+    requests: *std.ArrayList(Message),
     reload: *bool,
 ) void {
     switch (message) {
@@ -162,11 +253,12 @@ fn collect(
             };
             if (entry.found_existing) self.gpa.free(path);
         },
-        .request => |request| requests.append(self.gpa, request) catch {
+        .request => |request| requests.append(self.gpa, message) catch {
             request.response.writer.writeAll("Error: OutOfMemory\n\n") catch |err|
                 log.err("cannot answer request: {s}", .{@errorName(err)});
             request.done.set(self.io);
         },
+        .call => |call| requests.append(self.gpa, message) catch call.done.set(self.io),
         .reload => reload.* = true,
     }
 }
@@ -271,7 +363,7 @@ fn readChanges(self: *Engine, paths: []const []const u8, changes: *Changes) erro
                 self.gpa.free(text);
                 return error.OutOfMemory;
             }
-            self.setDiagnosticError(path, text, err, parse_error.diagnostic);
+            self.setDiagnosticError(path, text, err, parse_error.diagnostic, .syntax);
             self.gpa.free(text);
             continue;
         };
@@ -339,7 +431,7 @@ fn rebuildWith(self: *Engine, changes: []const Change, failed: *?[]const u8) any
         var result = db.executeStatements(source.runnable, &diagnostic, path) catch |err| {
             if (err != error.OutOfMemory) {
                 const at = if (diagnostic.statement) |position| source.diagnosticFor(position) else diagnostic;
-                self.setDiagnosticError(path, source.text, err, at);
+                self.setDiagnosticError(path, source.text, err, at, .run);
                 failed.* = path;
             }
             return err;
@@ -508,37 +600,73 @@ fn setDiagnosticError(
     text: []const u8,
     err: anyerror,
     diagnostic: LiveDatalog.Diagnostic,
+    kind: enum { syntax, run },
 ) void {
     var message: Io.Writer.Allocating = .init(self.gpa);
     defer message.deinit();
     protocol.writeDiagnostic(&message.writer, self.relative(path), text, err, diagnostic) catch |write_err|
         log.err("cannot format error: {s}", .{@errorName(write_err)});
-    self.setError("{s}", .{message.written()}, path);
+    const summary = (if (diagnostic.expected) |expected|
+        std.fmt.allocPrint(self.gpa, "{s}, expected {s}", .{ @errorName(err), expected })
+    else
+        self.gpa.dupe(u8, @errorName(err))) catch return;
+    var load_error: LoadError = .{
+        .message = self.gpa.dupe(u8, message.written()) catch {
+            self.gpa.free(summary);
+            return;
+        },
+        .summary = summary,
+        .syntax = kind == .syntax,
+    };
+    if (diagnostic.span) |span| if (span.start <= text.len) {
+        const line_start = if (std.mem.findScalarLast(u8, text[0..span.start], '\n')) |newline| newline + 1 else 0;
+        const line_end = std.mem.findScalarPos(u8, text, span.start, '\n') orelse text.len;
+        if (self.gpa.dupe(u8, text[line_start..line_end])) |line_text| {
+            load_error.at = .{
+                .line = @intCast(std.mem.count(u8, text[0..line_start], "\n")),
+                .text = line_text,
+                .start = span.start - line_start,
+                // A span running past the line is cut at its end.
+                .end = @max(@min(span.end, line_end), span.start) - line_start,
+            };
+        } else |_| {}
+    };
+    self.putError(path, load_error);
 }
 
 fn setError(self: *Engine, comptime fmt: []const u8, args: anytype, path: []const u8) void {
     const message = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-    log.warn("{s}", .{message});
-    const entry = self.errors.getOrPut(self.gpa, path) catch {
+    const summary = self.gpa.dupe(u8, message) catch {
         self.gpa.free(message);
         return;
     };
+    self.putError(path, .{ .message = message, .summary = summary });
+}
+
+/// Records `load_error`, taking ownership of it.
+fn putError(self: *Engine, path: []const u8, load_error: LoadError) void {
+    var owned = load_error;
+    log.warn("{s}", .{owned.message});
+    const entry = self.errors.getOrPut(self.gpa, path) catch {
+        owned.deinit(self.gpa);
+        return;
+    };
     if (entry.found_existing) {
-        self.gpa.free(entry.value_ptr.*);
+        entry.value_ptr.deinit(self.gpa);
     } else {
         entry.key_ptr.* = self.gpa.dupe(u8, path) catch {
             self.errors.swapRemoveAt(entry.index);
-            self.gpa.free(message);
+            owned.deinit(self.gpa);
             return;
         };
     }
-    entry.value_ptr.* = message;
+    entry.value_ptr.* = owned;
 }
 
 fn clearError(self: *Engine, path: []const u8) void {
-    const removed = self.errors.fetchSwapRemove(path) orelse return;
+    var removed = self.errors.fetchSwapRemove(path) orelse return;
     self.gpa.free(removed.key);
-    self.gpa.free(removed.value);
+    removed.value.deinit(self.gpa);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,9 +679,9 @@ pub fn writeStatus(self: *Engine, writer: *Io.Writer) !void {
         self.files.count(),
         self.db.state.facts.len(),
     });
-    for (self.errors.values()) |message| {
+    for (self.errors.values()) |load_error| {
         try writer.writeAll("error: ");
-        try protocol.writeIndented(writer, message);
+        try protocol.writeIndented(writer, load_error.message);
     }
 }
 

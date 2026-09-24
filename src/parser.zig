@@ -104,6 +104,30 @@ pub const Program = struct {
     statements: []const input.Statement,
     /// `spans[i]` covers `statements[i]`, terminator included.
     spans: []const Span,
+    /// Every place a predicate is named, in source order: fact and rule
+    /// heads, goals in bodies, queries and retractions, and schemas.
+    names: []const Name = &.{},
+
+    /// The predicate named at byte `offset`, if any. An offset just past a
+    /// name's end still names it, as a cursor after the last letter does.
+    pub fn nameAt(self: Program, offset: usize) ?Name {
+        for (self.names) |name| {
+            if (name.span.start > offset) break;
+            if (offset <= name.span.end) return name;
+        }
+        return null;
+    }
+};
+
+/// One place a predicate is named. `span` covers the name as written,
+/// quotes included, and `arity` is the number of terms or columns it is
+/// named with.
+pub const Name = struct {
+    predicate: []const u8,
+    arity: usize,
+    span: Span,
+    /// The index of the statement it is named in.
+    statement: usize,
 };
 
 /// Parses every statement of `source`. A syntax error anywhere fails the
@@ -171,10 +195,18 @@ const Parser = struct {
     diagnostic: ?*Diagnostic,
     /// The statement being parsed, when parsing a program.
     statement: ?usize = null,
+    /// Where predicates are named, recorded only when parsing a program.
+    names: ?*std.ArrayList(Name) = null,
+    /// Where the last bare word or quoted atom ended, so that a name's span
+    /// leaves out the space and comments after it.
+    token_end: usize = 0,
 
     fn program(self: *Parser) Error!Program {
         var statements: std.ArrayList(input.Statement) = .empty;
         var spans: std.ArrayList(Span) = .empty;
+        var names: std.ArrayList(Name) = .empty;
+        self.names = &names;
+        defer self.names = null;
         while (true) {
             self.skipSpace();
             if (self.index == self.source.len) break;
@@ -183,7 +215,7 @@ const Parser = struct {
             try statements.append(self.arena, try self.parseStatement());
             try spans.append(self.arena, .{ .start = start, .end = self.index });
         }
-        return .{ .statements = statements.items, .spans = spans.items };
+        return .{ .statements = statements.items, .spans = spans.items, .names = names.items };
     }
 
     fn wholeRule(self: *Parser) Error!input.Rule {
@@ -260,6 +292,7 @@ const Parser = struct {
                 "a predicate name",
             ),
         };
+        const name_span: Span = .{ .start = name_start, .end = self.token_end };
         try self.expect("(");
         var columns: std.ArrayList(input.Column) = .empty;
         if (!self.consume(")")) {
@@ -269,6 +302,7 @@ const Parser = struct {
                 try self.expect(",");
             }
         }
+        try self.noteName(predicate, columns.items.len, name_span);
         try self.expect(".");
         return input.schema(predicate, columns.items);
     }
@@ -395,6 +429,7 @@ const Parser = struct {
         self.skipSpace();
         const first_start = self.index;
         const first = try self.parseTerm();
+        const first_end = self.token_end;
         const first_span: Span = .{ .start = first_start, .end = self.index };
         if (self.consumeTypeColon()) {
             const tested: input.TypeTest = .{ .term = first, .type = try self.parseType() };
@@ -449,10 +484,21 @@ const Parser = struct {
                 try self.expect(",");
             }
         }
+        try self.noteName(predicate, terms.items.len, .{ .start = first_start, .end = first_end });
         return if (negated)
             input.not(predicate, terms.items)
         else
             input.relation(predicate, terms.items);
+    }
+
+    fn noteName(self: *Parser, predicate: []const u8, arity: usize, span: Span) Error!void {
+        const names = self.names orelse return;
+        try names.append(self.arena, .{
+            .predicate = predicate,
+            .arity = arity,
+            .span = span,
+            .statement = self.statement.?,
+        });
     }
 
     fn parseTerm(self: *Parser) Error!input.Term {
@@ -506,6 +552,7 @@ const Parser = struct {
         );
         const raw = self.source[content_start..self.index];
         self.index += 1;
+        self.token_end = self.index;
         if (!escaped) return input.atom(raw);
         var text: std.ArrayList(u8) = .empty;
         var cursor: usize = 0;
@@ -553,6 +600,7 @@ const Parser = struct {
             break;
         }
         if (self.index == start) return self.failHere(error.InvalidSyntax, "a term");
+        self.token_end = self.index;
         return self.source[start..self.index];
     }
 
@@ -683,6 +731,42 @@ test "every kind of statement parses to the descriptors it names" {
         .{ .query = .{ .goals = &.{input.relation("parent", &.{ input.atom("alice"), x })} } },
         .{ .retraction = &.{input.relation("parent", &.{ x, input.atom("bob") })} },
     });
+}
+
+test "a program records where each predicate is named" {
+    const source =
+        \\schema edge(atom, atom).
+        \\path(X, Z) :- edge (X, Y), 'path' /* spaced */ (Y, Z).
+        \\n(C) :- setof(X, not edge(X, _), C).
+        \\p(1, 2
+    ;
+    try testing.expectError(error.InvalidSyntax, parseProgram(testing.allocator, source, null));
+
+    const complete = source[0 .. std.mem.findScalarLast(u8, source, '\n').? + 1];
+    const parsed = try parseProgram(testing.allocator, complete, null);
+    defer parsed.deinit();
+    const names = parsed.value.names;
+    const expected = [_]struct { []const u8, usize, []const u8, usize }{
+        .{ "edge", 2, "edge", 0 },
+        .{ "path", 2, "path", 1 },
+        .{ "edge", 2, "edge", 1 },
+        .{ "path", 2, "'path'", 1 },
+        .{ "n", 1, "n", 2 },
+        .{ "edge", 2, "edge", 2 },
+    };
+    try testing.expectEqual(expected.len, names.len);
+    for (expected, names) |want, name| {
+        try testing.expectEqualStrings(want[0], name.predicate);
+        try testing.expectEqual(want[1], name.arity);
+        try testing.expectEqualStrings(want[2], source[name.span.start..name.span.end]);
+        try testing.expectEqual(want[3], name.statement);
+    }
+
+    const second_path = std.mem.find(u8, source, "'path'").?;
+    try testing.expectEqual(names[3], parsed.value.nameAt(second_path).?);
+    try testing.expectEqual(names[3], parsed.value.nameAt(second_path + "'path'".len).?);
+    try testing.expectEqual(@as(?Name, null), parsed.value.nameAt(second_path + "'path' ".len));
+    try testing.expectEqual(@as(?Name, null), parsed.value.nameAt(std.mem.find(u8, source, "X, Z").?));
 }
 
 test "built-ins, negation and arithmetic parse without normalizing" {

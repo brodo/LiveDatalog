@@ -61,38 +61,73 @@ lists, and aggregation, read the [LiveDatalog language tutorial](docs/language-t
 
 [`tree-sitter-livedatalog`](tree-sitter-livedatalog) is a tree-sitter grammar
 for `.dl` files. It includes highlighting, scope and folding queries for
-editors that use tree-sitter.
+editors that use tree-sitter. For diagnostics, hover and go to definition,
+connect the editor to the development server's language listener.
 
-### Query server
+### Development server
 
 `zig build` installs a second binary, `LiveDatalogServer`, for local
 development. It loads every `*.dl` file under a directory, reloads them as
-they change, and answers queries over TCP:
+they change, and serves the database on two TCP ports: the query listener
+(`--port`, default 7070) and the language listener (`--lsp-port`, default
+7071). The data comes only from the files: neither listener can change it.
 
 ```sh
-zig build run-server -- --port 7070 examples/researchers
-printf 'researcher(X, N), field(X, physics), quote(X, Q)?\n' | nc 127.0.0.1 7070
+zig build run-server -- --port 7070 --lsp-port 7071 examples/researchers
 ```
 
 [`examples/researchers`](examples/researchers) holds 50 famous researchers
 (`people.dl`) and quotes by them (`quotes.dl`).
 
+#### Query listener
+
+```sh
+printf 'researcher(X, N), field(X, physics), quote(X, Q)?\n' | nc 127.0.0.1 7070
+```
+
 Send one request per line; every response ends with an empty line. A request
 is a query (the trailing `?` is optional) or a command: `.explain goals`,
 `.status` (counts and load errors), `.files`, `.reload`, `.help`, `.quit`.
-Answers use the REPL's format. The data comes only from the files: facts,
-rules, retractions and schemas sent over the connection are rejected, and
-queries inside the files are ignored.
+Answers use the REPL's format. Facts, rules, retractions and schemas sent over
+the connection are rejected, and queries inside the files are ignored.
 
-The server uses three threads on one `std.Io.Threaded`:
+#### Language listener
 
-- The **engine** task owns the database. File changes and client requests
-  arrive on one `Io.Queue`, so no other thread touches the database.
+The language listener speaks the Language Server Protocol over TCP, so an
+editor can connect to the running server instead of starting one of its own.
+It offers:
+
+- **Diagnostics.** Every file that failed to load is reported, whether or not
+  it is open, and cleared once it loads. An open document is also parsed as
+  you type, and its syntax errors replace those of the saved file.
+- **Hover** on a predicate name: whether its facts are base, derived or both,
+  how many of each the database holds, its schema, and the files defining it.
+- **Go to definition**: the predicate's schema, or else the rules whose head
+  it is, or else its facts, in every loaded file.
+
+What you type is never loaded: hover and definition describe the database the
+saved files built, and a draft that does not parse is read at the positions of
+its last version that did. Files outside the watched directory get hover and
+definition too. Positions are counted in UTF-8 when the editor offers it, and
+in UTF-16 otherwise.
+
+An editor that can only launch a language server over stdio can bridge to the
+port, for example with `nc 127.0.0.1 7071` as the server command.
+
+#### How it works
+
+The server runs on one `std.Io.Threaded`:
+
+- The **engine** task owns the database. File changes, query requests and the
+  language listener's lookups arrive on one `Io.Queue`, so no other thread
+  touches the database. After each change it tells every editor connection,
+  which then republishes its diagnostics.
 - **Nightwatch**'s thread watches the directory and reports changed `.dl`
   paths. Hidden directories, `zig-out`, `node_modules` and `target` are
   ignored.
-- The **TCP** task accepts clients. Each connection runs as a small task that
-  passes its requests to the engine.
+- Each listener has a task that accepts clients. Each connection runs as a
+  small task that passes its requests to the engine; an editor connection has
+  a second task that follows the engine's changes.
 
 The engine waits 40 ms after a change so that bursts of saves become one
 reload. Each file is a contributor to the database, named by its path, so a

@@ -56,6 +56,11 @@ pub const MaintenancePolicy = cost_model.MaintenancePolicy;
 pub const PlanPolicy = planner.PlanPolicy;
 pub const MaintenanceStats = database.MaintenanceStats;
 pub const InternStats = database.InternStats;
+/// What `Jatalog.countFacts` reports for one predicate.
+pub const FactCount = struct {
+    base: usize = 0,
+    derived: usize = 0,
+};
 /// The transaction a front end stages a run of assertions in.
 pub const Transaction = transaction.Transaction;
 
@@ -501,6 +506,18 @@ pub const Jatalog = struct {
     /// which is what makes a change to how they are searched reportable.
     pub fn internStats(self: *const Jatalog) InternStats {
         return self.state.internStats();
+    }
+
+    /// How many facts `predicate` of `arity` holds: its base facts, and the
+    /// facts only its rules derive. A base fact a rule also derives counts
+    /// once, as base. Brings the closure up to date first, as a query would.
+    pub fn countFacts(self: *Jatalog, predicate: []const u8, arity: usize) !FactCount {
+        if (self.state.materialization != .clean) try self.materialize();
+        const name = self.state.strings.get(predicate) orelse return .{};
+        const key: relation_store.PredicateKey = .{ .name = name, .arity = arity };
+        const base = (try self.state.facts.predicateEntries(key)).len;
+        const all = (try self.state.closureStore().predicateEntries(key)).len;
+        return .{ .base = base, .derived = all - base };
     }
 
     /// Parses `source` and runs it, returning the last statement's result.
@@ -5042,4 +5059,25 @@ test "declareSchema enforces a schema through every interface that adds facts" {
         errors.Error.SchemaViolation,
         copy.addFact("age", &.{ input.atom("dan"), input.atom("old") }),
     );
+}
+
+test "countFacts separates base facts from the facts only rules derive" {
+    var db = Jatalog.init(std.testing.allocator);
+    defer db.deinit();
+    var result = try db.execute(
+        \\edge(a, b). edge(b, c). path(a, b).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+    , null);
+    result.deinit();
+
+    try std.testing.expectEqual(FactCount{ .base = 2 }, try db.countFacts("edge", 2));
+    // path(a, b) is base and derived, and counts once, as base.
+    try std.testing.expectEqual(FactCount{ .base = 1, .derived = 2 }, try db.countFacts("path", 2));
+    try std.testing.expectEqual(FactCount{}, try db.countFacts("path", 3));
+    try std.testing.expectEqual(FactCount{}, try db.countFacts("unknown", 1));
+
+    // An update leaves the closure dirty; counting brings it up to date.
+    try db.addFact("edge", &.{ input.atom("c"), input.atom("d") });
+    try std.testing.expectEqual(FactCount{ .base = 1, .derived = 5 }, try db.countFacts("path", 2));
 }

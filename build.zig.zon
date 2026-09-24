@@ -44,6 +44,10 @@
             .url = "git+https://github.com/neurocyte/nightwatch#4cef501981369bdc09ab66f19837b957db6c14f0",
             .hash = "nightwatch-1.0.0-uXzeH2MLAwAij-fvvYoxhHpdaxWOL59lZXRaQ28Ng5KC",
         },
+        .lsp_kit = .{
+            .url = "git+https://github.com/zigtools/lsp-kit.git?ref=0.16.x#e61d6fdf0e498a7aa71c5946c3052e5be9f16343",
+            .hash = "lsp_kit-0.1.0-bi_PL84xDAB33s_-DZPmYwprEqgi-dEjp1qAs36F96TA",
+        },
     },
     .paths = .{
         "build.zig",

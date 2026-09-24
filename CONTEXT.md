@@ -596,3 +596,33 @@ A schema can be declared once a predicate already has facts or rules, as long
 as they all fit it; otherwise the declaration fails and changes nothing. A
 schema cannot change: declaring the identical schema again does nothing, and
 any other declaration for the same name is an error.
+
+### Development server
+
+The process that loads a directory of `.dl` files, each file a contributor,
+keeps one database in step with them as they change, and serves that database
+to clients through two listeners on separate ports. The database comes only
+from the files: neither listener can change it.
+
+The *query listener* answers Datalog queries and commands in the REPL's line
+format. The *language listener* speaks the Language Server Protocol to
+editors: it reports what the directory's files say about each predicate and
+what went wrong loading them.
+
+### Draft
+
+The text an editor holds for a document it has open, saved or not. A draft is
+never a contributor: what one editor has typed does not change what any other
+client sees. The language listener reads a draft only to find its syntax
+errors and to know which predicate a position names; everything it says about
+a predicate comes from the database the files built. While a draft does not
+parse, positions are read from the last version of it that did, so they may be
+off by whatever has been typed since.
+
+### Definition
+
+Where a predicate is defined, for going to it from any place it is named. A
+predicate with a schema is defined by its schema, which says what it holds;
+otherwise by the rules whose head it is; otherwise by its facts. Each of
+these may be several statements in several files — including identical
+schemas, which the engine accepts — and every one of them is a definition.
