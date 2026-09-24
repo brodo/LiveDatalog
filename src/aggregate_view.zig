@@ -69,16 +69,17 @@ pub fn maintainAggregates(db: *database.Database, touched: *relation_store.Relat
 
         // This round's stale head tuples and recomputed ones are one delta,
         // and reach the closure the way a base update's do. What it moved
-        // replaces `touched` as the next round's input. A round that falls
-        // back to a rebuild ends the cascade: the rebuild recomputed every
-        // aggregate head from the closure, so there is no next round left to
-        // run.
-        const outcome = try maintenance.applyDelta(db, .{
+        // replaces `touched` as the next round's input, and the cascade ends
+        // when that is nothing. A round that falls back to a rebuild does not
+        // end it by itself: when only its removals rebuilt, its additions
+        // were propagated afterwards, and an aggregate over what they derived
+        // is left for the next round like any other.
+        _ = try maintenance.applyDelta(db, .{
             .removals = &removals,
             .additions = additions.items,
             .kind = .derived,
         }, touched);
-        if (outcome.path == .rebuilt) return;
+        if (touched.len() == 0) return;
     }
 }
 fn maintainAggregateRule(

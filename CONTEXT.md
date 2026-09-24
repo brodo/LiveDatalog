@@ -96,15 +96,22 @@ identifiers. Aggregate group maintenance runs on top of the first two.
 `maintenanceStats` makes the path taken observable, and shadow verification
 checks the result against a rebuild before committing.
 
-One delta reaches the closure through three calls in a fixed order: the
-removals, then staging the insertions, then propagating from the watermark
-staging returned. Delete-and-rederive joins against a snapshot of the
-pre-deletion closure, so a fact staged first would be over-deleted against a
-closure it was never absent from. Each half reports whether it maintained or
-fell back to a rebuild — a distinction the materialization tri-state cannot
-make, because the fallback repairs the closure before returning and leaves it
-`clean` either way. A rebuild retires the watermark and has already recomputed
-every consequence, so it yields nothing for the aggregate phase to reconsider.
+A *delta* is one set of removals and one set of additions reaching the closure
+together, either base facts from an update or the head tuples an aggregate
+round recomputed. It is applied as one step, removals first:
+delete-and-rederive joins against a snapshot of the pre-deletion closure, so a
+fact added first would be over-deleted against a closure it was never absent
+from. A base delta's additions join the base facts only once its removals have
+reached the closure, because a rebuild the removals fall back to reuses the
+strata below where it starts and would never derive from a fact that was
+already there. The delta reports whether it was maintained or fell back to a
+rebuild — a distinction the materialization tri-state cannot make, because the
+fallback repairs the closure before returning and leaves it `clean` either
+way. A delta's additions still go in after its removals fall back to a rebuild,
+whatever the delta's kind: the rebuild reuses the strata below where it starts,
+and that is where they belong — an aggregate's recomputed head tuple sits below
+the stratum that negates it. What the additions derive after a rebuild is still
+for the aggregate phase to reconsider.
 
 Over-deletion runs a rule backwards, from a deleted body fact to the head that
 derivation supported, and how it names that head depends on the rule. An

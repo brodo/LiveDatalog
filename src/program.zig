@@ -784,3 +784,49 @@ test "schemas change nothing about how a program is maintained" {
     try std.testing.expectEqual(untyped.closure.?.len(), typed.closure.?.len());
     try test_support.expectClosureMatchesRebuild(&typed);
 }
+
+test "an aggregate round whose removals rebuild still installs its recomputed head" {
+    // `cnt`'s stale tuple reaches `other` through negation, so the round's
+    // removals fall back to a rebuild from `other`'s stratum. That rebuild
+    // reuses `cnt`'s stratum as it stood, without the recomputed tuple, so the
+    // round still has to stage it afterwards.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\item(a). item(b). tag(t).
+        \\cnt(S) :- setof(X, item(X), S).
+        \\other(Y) :- tag(Y), not cnt(Y).
+        \\cnt(S)?
+    );
+    try runQuietly(&db, "item(b)~");
+    const stats = db.maintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.maintained_groups);
+    // Twice: the recomputed tuple reaches the same negation when it is
+    // propagated, and that rebuild is what finally settles `other`.
+    try std.testing.expectEqual(@as(usize, 2), stats.rebuild_fallbacks);
+    try test_support.expectClosureMatchesRebuild(&db);
+}
+
+test "an aggregate cascade outlasts a round whose removals rebuild" {
+    // The round's stale `held` tuple reaches `other` through negation, so its
+    // removals rebuild from `other`'s stratum, recomputing `all` while `cnt`
+    // holds no tuple at all. `held`'s recomputed tuple is a base fact already,
+    // so staging skips it, and `cnt`'s is propagated without reaching any
+    // negation — the round is `.rebuilt`, yet it leaves `all` stale for a
+    // next round to recompute.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\item(a). item(b). tag(t). held([a]).
+        \\held(S) :- setof(X, item(X), S).
+        \\cnt(S) :- setof(X, item(X), S).
+        \\all(T) :- setof(S, cnt(S), T).
+        \\other(Y) :- tag(Y), not held(Y).
+        \\cnt(S)?
+    );
+    try runQuietly(&db, "item(b)~");
+    const stats = db.maintenanceStats();
+    try std.testing.expectEqual(@as(usize, 1), stats.rebuild_fallbacks);
+    try std.testing.expectEqual(@as(usize, 3), stats.maintained_groups);
+    try test_support.expectClosureMatchesRebuild(&db);
+}

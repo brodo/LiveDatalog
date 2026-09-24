@@ -19,7 +19,8 @@
 //! base addition that joins the base facts before the removals have reached
 //! the closure is invisible to the rebuild they may fall back to. `update.zig`
 //! and `aggregate_view.zig` are the two callers, and both read what moved from
-//! the `touched` store it fills.
+//! the `touched` store it fills: what the delta moved by maintenance after any
+//! rebuild, which is what the aggregate phase has left to reconsider.
 
 const std = @import("std");
 const evaluator = @import("evaluator.zig");
@@ -72,7 +73,10 @@ pub const Delta = struct {
 
 /// What applying a delta did.
 ///
-/// `path` is `.rebuilt` when either half fell back to a rebuild. `removed`
+/// `path` is `.rebuilt` when either half fell back to a rebuild. It says
+/// nothing about whether `touched` is empty: when only the removals rebuilt,
+/// the additions were propagated afterwards and what they derived is there.
+/// `removed`
 /// and `added` count the base facts that really left and joined `db.facts`,
 /// which is fewer than the delta names whenever it removes an absent fact or
 /// adds a present one; the update path teaches the cost model with them. A
@@ -97,19 +101,20 @@ pub const Outcome = struct {
 /// derived from it — and staging it afterwards would find it present and
 /// propagate nothing.
 ///
-/// What a rebuild means for the additions depends on the kind. A base
-/// delta's still go in and propagate, because nothing has derived from them
-/// yet. A derived delta's are dropped: they are head tuples the rebuild
-/// recomputed from the closure it rebuilt, so staging them again would stage
-/// facts the closure already holds.
+/// A rebuild the removals fall back to does not settle the additions, of
+/// either kind. It reuses the strata below the one it starts at, and that is
+/// where the additions belong: a base fact sits below every rule, and an
+/// aggregate round's recomputed head tuple sits below the stratum whose
+/// negation of it made the removals rebuild. So they are still staged and
+/// propagated afterwards. A derived addition the rebuild did derive is found
+/// already present and skipped, so nothing is counted twice.
 ///
-/// `touched` is cleared first, and a rebuild clears it again, so it only ever
-/// holds what the delta moved after its last rebuild — nothing, when the last
-/// half to run rebuilt, since the rebuild recomputed every consequence. A base
-/// delta whose removals rebuilt and whose additions were then maintained
-/// reports `.rebuilt` and still hands back what the additions derived: the
-/// propagation that derived it does not maintain aggregate groups, so the
-/// aggregate phase has to see it.
+/// `touched` is cleared first, and a rebuild clears it again, so it holds what
+/// the delta moved by maintenance after any rebuild. That is nothing when the
+/// additions' own propagation rebuilt, since the rebuild recomputed every
+/// consequence — but when only the removals rebuilt it is everything the
+/// additions derived, and the aggregate phase still has to see it: the
+/// propagation that derived it does not maintain aggregate groups.
 pub fn applyDelta(
     db: *database.Database,
     delta: Delta,
@@ -132,10 +137,7 @@ pub fn applyDelta(
         }
         try relation_store.copyFactInto(db.allocator, &removed, fact, false);
     }
-    if (try applyRemovals(db, &removed, touched) == .rebuilt) {
-        outcome.path = .rebuilt;
-        if (delta.kind == .derived) return outcome;
-    }
+    if (try applyRemovals(db, &removed, touched) == .rebuilt) outcome.path = .rebuilt;
 
     // Facts borrowed from `db.facts`, which owns their terms. Inserting more
     // facts can move the entries holding them but not the terms themselves,
@@ -839,5 +841,58 @@ test "a base delta counts the facts it changed, not the facts it names" {
     }, &touched);
     try testing.expectEqual(@as(usize, 0), derived_outcome.removed);
     try testing.expectEqual(@as(usize, 0), derived_outcome.added);
+    try test_support.expectClosureMatchesRebuild(&db);
+}
+
+test "a derived delta's additions go in after its removals rebuild" {
+    // The state an aggregate round meets: the base facts beneath `linked`
+    // have moved — `edge(a)` gone, `edge(b)` arrived — and the head tuples
+    // above them have not. Removing `linked(a)` reaches `lonely` through
+    // negation and rebuilds from `lonely`'s stratum, reusing `linked`'s as it
+    // stood, which holds neither tuple. `linked(b)` has to be staged anyway.
+    var db: database.Database = .init(testing.allocator);
+    defer db.deinit();
+    try test_support.defineRule(&db, input.relation("linked", &.{input.variable("X")}), &.{
+        input.relation("edge", &.{input.variable("X")}),
+    });
+    try test_support.defineRule(&db, input.relation("lonely", &.{input.variable("X")}), &.{
+        input.relation("node", &.{input.variable("X")}),
+        input.not("linked", &.{input.variable("X")}),
+    });
+    try materializeWith(&db, &.{ .{ "node", "a" }, .{ "node", "b" }, .{ "edge", "a" } });
+    var edges = try atomFacts(&db, &.{ .{ "edge", "a" }, .{ "edge", "b" } });
+    defer edges.deinit();
+    _ = try db.applyRemoval(edges.factAt(0));
+    _ = try db.closure.?.removeFact(edges.factAt(0));
+    _ = try db.applyFactInsertion(edges.factAt(1));
+    try relation_store.copyFactInto(db.allocator, &db.closure.?, edges.factAt(1), false);
+
+    var removals = try atomFacts(&db, &.{.{ "linked", "a" }});
+    defer removals.deinit();
+    var additions = try atomFacts(&db, &.{.{ "linked", "b" }});
+    defer additions.deinit();
+    var touched: relation_store.RelationStore = .init(db.allocator);
+    defer touched.deinit();
+    const outcome = try applyDelta(&db, .{
+        .removals = &removals,
+        .additions = &.{additions.factAt(0)},
+        .kind = .derived,
+    }, &touched);
+
+    try testing.expectEqual(Path.rebuilt, outcome.path);
+    try testing.expect(try db.closure.?.contains(additions.factAt(0)));
+    try test_support.expectClosureMatchesRebuild(&db);
+
+    // Staged again, it is found present and skipped rather than counted a
+    // second time.
+    const closure_len = db.closure.?.len();
+    var none: relation_store.RelationStore = .init(db.allocator);
+    defer none.deinit();
+    _ = try applyDelta(&db, .{
+        .removals = &none,
+        .additions = &.{additions.factAt(0)},
+        .kind = .derived,
+    }, &touched);
+    try testing.expectEqual(closure_len, db.closure.?.len());
     try test_support.expectClosureMatchesRebuild(&db);
 }
