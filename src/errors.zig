@@ -18,6 +18,15 @@ pub const Error = error{
     NotAdmissible,
     UnknownVariable,
     TypeMismatch,
+    /// A base fact does not fit its predicate's schema: the wrong number of
+    /// terms, or a value outside its column's type.
+    SchemaViolation,
+    /// A rule, query or retraction the schemas prove wrong: a typed predicate
+    /// used at the wrong arity, a goal that can never match, or a rule that
+    /// could derive a value its head's column does not admit.
+    IllTyped,
+    /// A schema was declared for a predicate that already has a different one.
+    SchemaConflict,
     /// Shadow verification found the maintained closure disagreeing with a
     /// fresh rebuild. Only reachable with `setShadowVerification(true)`.
     MaintenanceMismatch,

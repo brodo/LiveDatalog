@@ -11,6 +11,7 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const relation_store = @import("relation_store.zig");
+const schema = @import("schema.zig");
 
 /// Interned identifier for a name: predicate symbols and variable names.
 pub const Id = u64;
@@ -47,6 +48,8 @@ pub const GoalKind = enum {
     greater_or_equal,
     add,
     subtract,
+    /// `X : T`: one term, and the type it is tested against in `column_type`.
+    type_test,
 };
 
 pub const Expr = struct {
@@ -54,6 +57,8 @@ pub const Expr = struct {
     terms: []Term,
     negated: bool = false,
     kind: GoalKind = .relation,
+    /// The type a `type_test` tests for. Unused by every other kind.
+    column_type: schema.ColumnType = .any,
 
     pub fn arity(self: Expr) usize {
         return self.terms.len;
@@ -242,6 +247,7 @@ pub fn cloneExpr(allocator: std.mem.Allocator, expression: Expr) !Expr {
         .terms = terms,
         .negated = expression.negated,
         .kind = expression.kind,
+        .column_type = expression.column_type,
     };
 }
 
@@ -402,6 +408,7 @@ pub fn goalOperator(kind: GoalKind) []const u8 {
         .greater_or_equal => ">=",
         .add => "+",
         .subtract => "-",
+        .type_test => ":",
     };
 }
 
@@ -433,6 +440,10 @@ pub fn ruleConstructsLists(rule: Rule) bool {
 
 pub fn isBuiltin(value: Expr) bool {
     return value.kind != .relation;
+}
+
+pub fn isTypeTest(value: Expr) bool {
+    return value.kind == .type_test;
 }
 
 pub fn isArithmetic(value: Expr) bool {

@@ -515,3 +515,44 @@ withholds discharges nothing, because the plan cannot read it. A fold records
 which of the two proofs applied — the relation was reconstructed exactly, or
 the query was monotonic — among the transformations it lists, so a plan says
 why it was allowed to exist.
+
+### Schema
+
+An optional declaration of a predicate's shape: its arity and one *column
+type* per position, optionally with column names. A predicate without a schema
+is untyped and accepts any arity and any values, as before. A schema belongs
+to the predicate name, not to a name and arity, so it also rules out every
+other arity of that name. In source: `schema age(Person: atom, Years: int).`,
+or without names, `schema age(atom, int).`
+
+The column types are `atom`, `int`, `number` (integer or float), `list`,
+`list(T)` and `any`. There is no float type: because an integral float
+canonicalizes to the equal integer, `1.0` is the integer `1`, so a column that
+accepted only floats would reject values written as floats.
+
+A schema is enforced, not advisory. Base facts are checked when they are
+asserted. Rules are checked when they are added, by inferring the types their
+variables can take, so a derived fact never needs checking at runtime. A goal
+in a rule, query or retraction that the schema proves can never match is an
+error, not an empty answer. Goals that read no typed predicate are not checked
+at all, so a program without schemas behaves exactly as before.
+
+Types are ordered: `int` is a `number`, `list(T)` is a `list(U)` when `T` is
+a `U`, `list` is `list(any)`, and everything is `any`. A variable in several
+typed positions has the type all of them share, and positions sharing none
+make the goal impossible. Values from an untyped predicate have type `any`,
+and `any` never flows into a narrower column unannounced: a rule deriving into
+a typed column must prove its values fit, from typed goals or from type tests
+that filter, and one that cannot is rejected rather than checked or filtered
+at runtime (see [ADR 0004](docs/adr/0004-static-schema-enforcement.md)).
+An untyped predicate stays `any` even when its rules only ever produce one
+type, because a later untyped fact could break any type inferred for it.
+
+A *type test* `X : T` is a goal that holds when `X`'s value has column type
+`T`; it filters, and after it `X` is known to have type `T`. Under `not` it
+still filters but proves nothing.
+
+A schema can be declared once a predicate already has facts or rules, as long
+as they all fit it; otherwise the declaration fails and changes nothing. A
+schema cannot change: declaring the identical schema again does nothing, and
+any other declaration for the same name is an error.

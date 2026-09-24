@@ -29,11 +29,13 @@ const program_runner = @import("program.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
 const scalar = @import("scalar.zig");
+const schema = @import("schema.zig");
 const update = @import("update.zig");
 const string_table = @import("string_table.zig");
 const transaction = @import("transaction.zig");
 const syntax = @import("syntax.zig");
 const test_support = @import("test_support.zig");
+const typing = @import("typing.zig");
 const validation = @import("validation.zig");
 const view_catalog = @import("view_catalog.zig");
 
@@ -149,6 +151,19 @@ pub const Jatalog = struct {
         var staging = try self.state.clone();
         defer staging.deinit();
         try program_runner.addRule(&staging, input.rule(relation, body));
+        self.state.commit(&staging);
+    }
+
+    /// Declares a predicate's schema: its arity and column types. See
+    /// "Schema" in CONTEXT.md. Declaring the schema a predicate already has
+    /// changes nothing, and any other schema for it is `SchemaConflict`. The
+    /// facts and rules the database already holds must fit it —
+    /// `SchemaViolation` for a fact, `IllTyped` for a rule — or nothing
+    /// changes.
+    pub fn declareSchema(self: *Jatalog, declared: input.Schema) !void {
+        var staging = try self.state.clone();
+        defer staging.deinit();
+        try program_runner.declareSchema(&staging, declared);
         self.state.commit(&staging);
     }
 
@@ -465,6 +480,8 @@ pub const Jatalog = struct {
         }
         const compiled_rules = try compileProgramRules(&staging, rules);
         defer freeProgramRules(staging.allocator, compiled_rules);
+        try typing.checkGoals(&staging, compiled_goals);
+        for (compiled_rules) |rule| try typing.checkRule(&staging, rule.head, rule.body);
 
         const key = try folding.normalizeQuery(allocator, compiled_goals, compiled_rules);
         var key_owned = true;
@@ -824,6 +841,11 @@ pub const Jatalog = struct {
             copy.closure = null;
         }
         copy.materialization = .uninitialized;
+        // The plan was checked against the schemas when it was folded. The
+        // rules it installs here are its own — inverse rules the caller never
+        // wrote — and hold facts a plan reconstructs rather than asserts.
+        copy.schemas.deinit(copy.allocator);
+        copy.schemas = .{};
         materialization.dropAuxiliaryViews(&copy);
         for (copy.eval.rules.items) |rule| syntax.freeRule(copy.allocator, rule);
         copy.eval.rules.clearRetainingCapacity();
@@ -1306,10 +1328,12 @@ test {
     _ = program_runner;
     _ = relation_store;
     _ = scalar;
+    _ = schema;
     _ = string_table;
     _ = syntax;
     _ = test_support;
     _ = transaction;
+    _ = typing;
     _ = validation;
     _ = view_catalog;
 }
@@ -8883,4 +8907,82 @@ test "an allocation failure answering a folded question leaves the next answer c
         defer answers.deinit();
         try std.testing.expectEqual(@as(usize, 2), answers.answers.items.len);
     }
+}
+
+const age_schema = input.schema("age", &.{
+    input.column("Person", .atom),
+    input.column("Years", .int),
+});
+
+test "declareSchema enforces a schema through every interface that adds facts" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try db.declareSchema(age_schema);
+    try db.declareSchema(age_schema);
+    try std.testing.expectError(
+        errors.Error.SchemaConflict,
+        db.declareSchema(input.schema("age", &.{ input.column(null, .atom), input.column(null, .int) })),
+    );
+    try db.addFact("age", &.{ input.atom("alice"), input.integer(36) });
+    try std.testing.expectError(
+        errors.Error.SchemaViolation,
+        db.addFact("age", &.{ input.atom("bob"), input.atom("old") }),
+    );
+
+    // One bad insertion rejects the whole batch, deletions included.
+    try std.testing.expectError(errors.Error.SchemaViolation, db.applyChanges(&.{
+        input.fact("age", &.{ input.atom("bob"), input.integer(17) }),
+        input.fact("age", &.{ input.atom("carol"), input.float(2.5) }),
+    }, &.{
+        input.fact("age", &.{ input.atom("alice"), input.integer(36) }),
+    }));
+    try std.testing.expectEqual(@as(usize, 1), db.state.facts.len());
+    try std.testing.expect(try db.applyChanges(&.{
+        input.fact("age", &.{ input.atom("bob"), input.integer(17) }),
+    }, &.{}));
+
+    try std.testing.expectError(errors.Error.IllTyped, db.addRule(
+        input.relation("age", &.{ input.variable("P"), input.variable("P") }),
+        &.{input.relation("person", &.{input.variable("P")})},
+    ));
+    try std.testing.expectError(errors.Error.IllTyped, db.query(
+        &.{input.relation("age", &.{ input.variable("P"), input.atom("old") })},
+        &.{},
+    ));
+    try std.testing.expectError(errors.Error.IllTyped, db.retract(
+        &.{input.relation("age", &.{input.variable("P")})},
+    ));
+
+    // A copy is a database, and its schemas come with it.
+    var copy = try db.clone();
+    defer copy.deinit();
+    try std.testing.expectError(
+        errors.Error.SchemaViolation,
+        copy.addFact("age", &.{ input.atom("dan"), input.atom("old") }),
+    );
+}
+
+test "a fold's question and program are checked against the schemas" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try declareCopiedView(&db);
+    try db.declareSchema(input.schema("r", &.{ input.column(null, .atom), input.column(null, .atom) }));
+    try db.addFact("copied", &.{ input.atom("a"), input.atom("one") });
+
+    try std.testing.expectError(errors.Error.IllTyped, db.foldQuery(
+        &.{input.relation("r", &.{input.variable("X")})},
+        &.{},
+    ));
+    try std.testing.expectError(errors.Error.IllTyped, db.foldQuery(
+        &.{input.relation("r", &.{ input.variable("X"), input.integer(1) })},
+        &.{},
+    ));
+    const fold = try db.foldQuery(&.{
+        input.relation("r", &.{ input.variable("X"), input.variable("Y") }),
+        input.typeTest(input.variable("Y"), .atom),
+    }, &.{});
+    defer fold.deinit();
+    var answers = try db.answerFolded(fold, &.{});
+    defer answers.deinit();
+    try std.testing.expectEqual(@as(usize, 1), answers.answers.items.len);
 }

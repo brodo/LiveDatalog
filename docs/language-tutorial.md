@@ -252,10 +252,11 @@ person(alice).
 same_person(X) :- person(X), X = alice.
 ```
 
-Equality cannot bind two unbound variables. Integer equality is exact and uses
+Equality cannot bind two unbound variables. Numeric equality is exact and uses
 the same canonical identity as facts, unification, arithmetic checks, and
-`setof`. Numeric comparisons accept integer scalars only; atoms and structural
-values return `NumericType`.
+`setof`. Numeric comparisons accept integers and floats, and compare them
+exactly, without first converting the integer to a float. Atoms and lists
+return `NumericType`.
 
 ## Negation
 
@@ -448,6 +449,84 @@ X: alice, N: 1
 X: bob, N: 0
 ```
 
+## Schemas
+
+By default a predicate accepts facts of any arity holding any values. A
+**schema** declares what a predicate holds: how many terms, and which type
+each one has. Once a predicate has a schema, the schema is enforced.
+
+```datalog
+schema age(Person: atom, Years: int).
+
+age(alice, 36).
+age(bob, old).
+```
+
+The second fact is rejected with `SchemaViolation`, and so would be
+`age(carol)`: a schema fixes the arity as well as the types. Column names such
+as `Person` are optional, so `schema age(atom, int).` declares the same shape
+without names.
+
+The column types are:
+
+| Type | Values |
+| --- | --- |
+| `atom` | atoms such as `alice` or `'Hello'` |
+| `int` | integers, including floats with an integral value such as `1.0` |
+| `number` | integers and floats |
+| `list(T)` | lists whose elements all have type `T`, including `[]` |
+| `list` | any list, the same as `list(any)` |
+| `any` | anything |
+
+Types nest, as in `list(list(int))`.
+
+Rules are checked when you add them. LiveDatalog works out which types each
+variable can have from the goals that use it, and rejects a rule with
+`IllTyped` if it could derive a fact that does not fit the head's schema:
+
+```datalog
+schema adult(atom).
+adult(P) :- age(P, Years), Years >= 18.     % accepted: P is an atom
+schema label(atom, int).
+label(P, grown_up) :- adult(P).             % IllTyped: grown_up is not an int
+```
+
+A goal that the schemas show can never match is also `IllTyped`, rather than
+an empty answer. For example, `age(X, old)?` is `IllTyped` because `old` is
+not an `int`. Queries and retractions are checked the same way.
+
+Values from a predicate without a schema have type `any`. To use one in a
+typed column, test its type with `X : T`. The test keeps only the values that
+have the type:
+
+```datalog
+raw(a). raw(1).
+schema tagged(atom).
+tagged(X) :- raw(X).            % IllTyped: X could be anything
+tagged(X) :- raw(X), X : atom.  % accepted
+tagged(X)?
+```
+
+```text
+X: a
+```
+
+A type test can be negated, as in `not X : int`. It still filters, but it
+doesn't tell the checker what type `X` has. The same applies to structural
+recursion: `H` in `H!T` comes from the list being taken apart, so give it a
+type with a test:
+
+```datalog
+schema sum(list(int), int).
+sum([], 0).
+sum(H!T, N) :- sum(T, M), H : int, N = M + H.
+```
+
+You can declare a schema after a predicate already has facts and rules, as
+long as they all fit it. A schema can't be changed. Declaring the same schema
+again does nothing, and declaring a different one for the same predicate is
+`SchemaConflict`.
+
 ## Comments
 
 LiveDatalog accepts three comment styles:
@@ -500,6 +579,14 @@ cons(H, T)
 % Aggregate
 setof(Template, Goal, Result)
 setof(Template, (Goal1, Goal2), Result)
+
+% Schema, with or without column names
+schema age(Person: atom, Years: int).
+schema scores(atom, list(number)).
+
+% Type test
+X : atom
+not X : list(int)
 ```
 
 When experimenting interactively, start the REPL with `zig build run`. Enter

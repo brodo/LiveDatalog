@@ -409,6 +409,8 @@ pub fn clauseReady(
                     syntax.termVariablesBound(expression.terms[1], bound) and
                     syntax.termVariablesBound(expression.terms[2], bound);
             }
+            if (syntax.isTypeTest(expression))
+                return expression.terms.len == 1 and syntax.termVariablesBound(expression.terms[0], bound);
             if (expression.terms.len != 2) return false;
             const left = syntax.termVariablesBound(expression.terms[0], bound);
             const right = syntax.termVariablesBound(expression.terms[1], bound);

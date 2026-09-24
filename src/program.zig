@@ -76,7 +76,7 @@ pub fn execute(
         if (last) |*result| result.deinit();
         last = null;
         switch (statement) {
-            .fact, .rule => {
+            .fact, .rule, .schema => {
                 if (run == null) run = .{
                     .transaction = try transaction.Transaction.begin(db, .assertion),
                 };
@@ -127,6 +127,7 @@ fn assert(db: *database.Database, statement: input.Statement) !void {
     switch (statement) {
         .fact => |fact| try addFact(db, fact),
         .rule => |rule| try addRule(db, rule),
+        .schema => |declared| try declareSchema(db, declared),
         .query, .retraction => unreachable,
     }
 }
@@ -135,6 +136,15 @@ pub fn addFact(db: *database.Database, fact: input.Relation) !void {
     const expression = try compile.compileRelation(db, fact.predicate, fact.terms, false);
     defer syntax.freeExpr(db.allocator, expression);
     try transaction.addFactExpr(db, expression);
+}
+
+pub fn declareSchema(db: *database.Database, declared: input.Schema) !void {
+    const compiled = try compile.compileSchema(db, declared);
+    const name = db.strings.intern(declared.predicate) catch |err| {
+        compiled.deinit(db.allocator);
+        return err;
+    };
+    try transaction.declareSchema(db, name, compiled);
 }
 
 pub fn addRule(db: *database.Database, rule: input.Rule) !void {
@@ -160,7 +170,7 @@ fn evaluate(
     const goals = switch (statement) {
         .query => |query| query.goals,
         .retraction => |goals| goals,
-        .fact, .rule => unreachable,
+        .fact, .rule, .schema => unreachable,
     };
     const compiled = try compile.compileGoals(target, goals);
     defer {
@@ -490,4 +500,200 @@ test "float extremes format deterministically and round-trip" {
     try std.testing.expectEqualStrings("0.5", spelled);
     try std.testing.expectEqual(results.ResultValue.Kind.float, value.kind());
     try std.testing.expectError(errors.Error.TypeMismatch, value.getInteger());
+}
+
+/// Runs `text` and discards what it returns, for statements run for their
+/// effect.
+fn runQuietly(db: *database.Database, text: []const u8) !void {
+    var result = try runSource(db, text);
+    result.deinit();
+}
+
+test "a schema rejects facts of the wrong arity or type and keeps the rest" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\schema age(Person: atom, Years: int).
+        \\schema scores(atom, list(number)).
+        \\age(alice, 36). age(bob, 1.0).
+        \\scores(alice, [1, 2.5]). scores(bob, []).
+    );
+    try std.testing.expectEqual(@as(usize, 4), db.facts.len());
+    const rejected = [_][]const u8{
+        "age(carol, old).",
+        "age(carol, 2.5).",
+        "age(carol).",
+        "age(carol, 1, 2).",
+        "age(36, 36).",
+        "scores(carol, [1, a]).",
+        "scores(carol, 1).",
+        "scores(carol, cons(1, 2)).",
+    };
+    for (rejected) |text|
+        try std.testing.expectError(errors.Error.SchemaViolation, runQuietly(&db, text));
+    try std.testing.expectEqual(@as(usize, 4), db.facts.len());
+}
+
+test "a typed predicate at the wrong arity is ill-typed wherever it is used" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db, "schema age(atom, int). age(alice, 36).");
+    for ([_][]const u8{
+        "age(X)?",
+        "age(X)~",
+        "young(X) :- age(X).",
+        "age(X) :- person(X).",
+        "p(X) :- person(X), not age(X).",
+        "p(S) :- person(X), setof(A, age(A), S).",
+    }) |text| try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, text));
+    try std.testing.expectEqual(@as(usize, 0), db.eval.rules.items.len);
+}
+
+test "a goal the schema proves impossible is an error, not an empty answer" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db, "schema age(atom, int). schema named(atom). age(alice, 36).");
+    for ([_][]const u8{
+        "age(X, old)?",
+        "age(7, Y)?",
+        "age(X, Y), named(Y)?",
+        "age(X, Y), Y = foo?",
+        "age(X, Y), X < 3?",
+        "age(X, [])?",
+        "age(X, H!T)?",
+        "age(X, old)~",
+        "p(X) :- age(X, Y), Y : atom.",
+    }) |text| try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, text));
+}
+
+test "a rule must prove its head fits, and a type test is how an untyped value does" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\schema tagged(atom).
+        \\raw(a). raw(1). raw([b]).
+    );
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "tagged(X) :- raw(X)."));
+    // A negated test filters, but proves nothing about what passes it.
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "tagged(X) :- raw(X), not X : int."));
+    var result = try runSource(&db,
+        \\tagged(X) :- raw(X), X : atom.
+        \\tagged(X)?
+    );
+    defer result.deinit();
+    try expectColumn(&result, "X", &.{"a"});
+}
+
+test "types flow through equality, arithmetic, lists and setof" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\schema age(atom, int).
+        \\schema next_age(atom, int).
+        \\schema mean(atom, number).
+        \\schema names(list(atom)).
+        \\schema pair(list(int)).
+        \\age(alice, 36). age(bob, 17).
+        \\next_age(P, N) :- age(P, A), N = A + 1.
+        \\mean(P, N) :- age(P, A), N = A + 0.5.
+        \\names(S) :- setof(P, age(P, A), S).
+        \\pair([A, B]) :- age(alice, A), age(bob, B).
+    );
+    // `+ 0.5` may leave the integers, and `setof` collects `list(int)`.
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "next_age(P, N) :- age(P, A), N = A + 0.5."));
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "names(S) :- setof(A, age(P, A), S)."));
+    var result = try runSource(&db, "names(S)?");
+    defer result.deinit();
+    try expectColumn(&result, "S", &.{"[alice, bob]"});
+}
+
+test "structural recursion over a typed list checks its elements with a test" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\schema sum(list(int), int).
+        \\sum([], 0).
+    );
+    // Nothing in the body says what the seed's head is.
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "sum(H!T, N) :- sum(T, M), N = M + H."));
+    var result = try runSource(&db,
+        \\sum(H!T, N) :- sum(T, M), H : int, N = M + H.
+        \\sum([1, 2, 3], N)?
+    );
+    defer result.deinit();
+    try expectColumn(&result, "N", &.{"6"});
+}
+
+test "a schema can be declared over what fits it, and otherwise changes nothing" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\age(alice, 36). age(bob, old).
+        \\adult(P) :- age(P, A).
+    );
+    try std.testing.expectError(errors.Error.SchemaViolation, runQuietly(&db, "schema age(atom, int)."));
+    try std.testing.expectError(errors.Error.SchemaViolation, runQuietly(&db, "schema age(atom)."));
+    try std.testing.expectEqual(@as(usize, 0), db.schemas.count());
+    try runQuietly(&db, "age(bob, old)~");
+    try runQuietly(&db, "schema age(atom, int).");
+    try std.testing.expectEqual(@as(usize, 1), db.schemas.count());
+
+    // A rule already there must fit too.
+    try runQuietly(&db, "label(P, adult) :- adult(P).");
+    try std.testing.expectError(errors.Error.IllTyped, runQuietly(&db, "schema label(atom, int)."));
+    try std.testing.expectEqual(@as(usize, 1), db.schemas.count());
+    try runQuietly(&db, "schema label(any, atom).");
+}
+
+test "a schema cannot change: the same one again is nothing, any other is a conflict" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\schema age(Person: atom, Years: int).
+        \\schema age(Person: atom, Years: int).
+    );
+    for ([_][]const u8{
+        "schema age(atom, int).",
+        "schema age(Who: atom, Years: int).",
+        "schema age(Person: atom, Years: number).",
+        "schema age(Person: atom).",
+    }) |text| try std.testing.expectError(errors.Error.SchemaConflict, runQuietly(&db, text));
+    try std.testing.expectError(errors.Error.InvalidTerm, runQuietly(&db, "schema p(A: int, A: int)."));
+}
+
+test "a type test filters on the value's type" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db, "v(a). v(1). v(2.5). v([]). v([1, 2]). v([1, b]). v(cons(1, 2)).");
+    const cases = [_]struct { []const u8, []const []const u8 }{
+        .{ "v(X), X : atom?", &.{"a"} },
+        .{ "v(X), X : int?", &.{"1"} },
+        .{ "v(X), X : number?", &.{ "1", "2.5" } },
+        .{ "v(X), X : list(int)?", &.{ "[]", "[1, 2]" } },
+        .{ "v(X), X : list?", &.{ "[]", "[1, 2]", "[1, b]" } },
+        .{ "v(X), not X : list?", &.{ "1", "2.5", "a", "cons(1, 2)" } },
+    };
+    for (cases) |case| {
+        var result = try runSource(&db, case[0]);
+        defer result.deinit();
+        try expectColumn(&result, "X", case[1]);
+    }
+}
+
+fn schemaAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: database.Database = .init(allocator);
+    defer db.deinit();
+    var result = try runSource(&db,
+        \\raw(a). raw(1).
+        \\schema tagged(Name: atom).
+        \\tagged(X) :- raw(X), X : atom.
+        \\schema count(list(atom), int).
+        \\count(S, N) :- setof(X, tagged(X), S), N = 0 + 1.
+        \\tagged(X)?
+    );
+    result.deinit();
+}
+
+test "declaring and checking schemas release every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(schemaAllocationScenario);
 }

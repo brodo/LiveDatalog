@@ -357,6 +357,7 @@ const Matcher = struct {
             .relation => |value| other == .relation and try self.relation(value, other.relation),
             .builtin => |value| other == .builtin and other.builtin.operator == value.operator and
                 other.builtin.negated == value.negated and
+                other.builtin.column_type.eql(value.column_type) and
                 try self.terms(value.terms, other.builtin.terms),
             .aggregate => |value| other == .aggregate and try self.aggregate(value, other.aggregate),
         };

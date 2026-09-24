@@ -13,6 +13,7 @@ const evaluator = @import("evaluator.zig");
 const intern_index = @import("intern_index.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
+const schema = @import("schema.zig");
 const string_table = @import("string_table.zig");
 const syntax = @import("syntax.zig");
 
@@ -51,10 +52,11 @@ pub const Savepoint = struct {
     values: usize,
     scalar_counts: intern_index.Counts,
     value_counts: intern_index.Counts,
-    /// Not restored, checked: the two things a statement changes that this
+    /// Not restored, checked: the things a statement changes that this
     /// cannot put back.
     facts: usize,
     rules: usize,
+    schemas: usize,
 };
 
 pub const MaintenanceStats = struct {
@@ -106,6 +108,10 @@ pub const Database = struct {
     /// evaluation on a database with rules.
     closure: ?relation_store.RelationStore = null,
     materialization: Materialization = .uninitialized,
+    /// The declared predicate schemas. Every base fact the database holds
+    /// fits its predicate's, and every rule was checked against them when it
+    /// was added, so no derived fact needs checking.
+    schemas: schema.Registry = .{},
     /// Auxiliary views for maintained aggregate rules with projected heads.
     auxiliary: std.ArrayList(auxiliary_view.AuxiliaryView) = .empty,
     /// Counts facts added to the closure by incremental batch propagation,
@@ -154,6 +160,7 @@ pub const Database = struct {
     pub fn deinit(self: *Database) void {
         for (self.auxiliary.items) |*view| view.deinit(self.allocator);
         self.auxiliary.deinit(self.allocator);
+        self.schemas.deinit(self.allocator);
         if (self.closure) |*closure| closure.deinit();
         self.facts.deinit();
         self.eval.deinit();
@@ -175,6 +182,8 @@ pub const Database = struct {
         errdefer result.facts.deinit();
         if (self.closure) |*closure| result.closure = try closure.clone();
         errdefer if (result.closure) |*closure| closure.deinit();
+        result.schemas = try self.schemas.clone(self.allocator);
+        errdefer result.schemas.deinit(self.allocator);
         result.materialization = self.materialization;
         result.propagated_facts = self.propagated_facts;
         result.removed_facts = self.removed_facts;
@@ -225,12 +234,23 @@ pub const Database = struct {
         var terms_owned = true;
         errdefer if (terms_owned) self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
+        if (!self.fitsSchema(value.predicate, terms)) return error.SchemaViolation;
         const fact: relation_store.Fact = .{ .predicate = value.predicate, .terms = terms };
         const added = try self.facts.insert(fact, false);
         terms_owned = false;
         if (!added) return null;
         self.fact_generation += 1;
         return self.facts.factAt(self.facts.len() - 1);
+    }
+
+    /// Whether a fact with these values fits its predicate's schema. A
+    /// predicate without one takes anything.
+    pub fn fitsSchema(self: *const Database, predicate: syntax.Id, terms: []const syntax.ValueId) bool {
+        const declared = self.schemas.get(predicate) orelse return true;
+        if (declared.columns.len != terms.len) return false;
+        for (terms, declared.columns) |value, column_type|
+            if (!self.eval.valueHasType(value, column_type)) return false;
+        return true;
     }
 
     /// Takes one ground base fact back out, reporting whether the store held
@@ -256,6 +276,7 @@ pub const Database = struct {
             .value_counts = self.eval.values.counts,
             .facts = self.facts.len(),
             .rules = self.eval.rules.items.len,
+            .schemas = self.schemas.count(),
         };
     }
 
@@ -273,6 +294,7 @@ pub const Database = struct {
     pub fn rollback(self: *Database, mark: Savepoint) void {
         std.debug.assert(self.facts.len() == mark.facts);
         std.debug.assert(self.eval.rules.items.len == mark.rules);
+        std.debug.assert(self.schemas.count() == mark.schemas);
         self.strings.truncate(mark.strings);
         self.eval.scalars.truncate(mark.scalars);
         self.eval.values.truncate(mark.values);

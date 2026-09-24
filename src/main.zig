@@ -47,6 +47,14 @@ const help_text =
     \\setof(Template, Goal, Result)
     \\setof(Template, (Goal1, Goal2), Result)
     \\
+    \\% Schema (optional; column names are optional too)
+    \\schema age(Person: atom, Years: int).
+    \\% Types: atom, int, number, any, list, list(T)
+    \\
+    \\% Type test
+    \\X : atom
+    \\X : list(int)
+    \\
     \\REPL commands: .help, .quit, .exit
     \\
 ;

@@ -42,6 +42,36 @@ pub const Rule = struct {
 
 pub const ComparisonGoal = struct { kind: Comparison, operands: Binary };
 
+/// A column type, as a schema declares it and a type test names it. See
+/// "Schema" in CONTEXT.md. `list` holds the element type, and a null element
+/// is `list(any)`, which is what a bare `list` means.
+pub const ColumnType = union(enum) {
+    atom,
+    int,
+    number,
+    any,
+    list: ?*const ColumnType,
+};
+
+/// `X : T` — holds when the term's value has column type `T`.
+pub const TypeTest = struct {
+    term: Term,
+    type: ColumnType,
+};
+
+/// One column of a schema: its type, and optionally a name.
+pub const Column = struct {
+    name: ?[]const u8 = null,
+    type: ColumnType,
+};
+
+/// `schema p(Name: atom, int).` — the arity and column types of every fact
+/// `p` may hold.
+pub const Schema = struct {
+    predicate: []const u8,
+    columns: []const Column,
+};
+
 /// A built-in test under `not`, as in `not X < Y` or `not X = Y`. Only tests
 /// can be negated: arithmetic binds its output, and a negated goal binds
 /// nothing.
@@ -49,6 +79,8 @@ pub const NegatedBuiltin = union(enum) {
     equality: Binary,
     inequality: Binary,
     comparison: ComparisonGoal,
+    /// `not X : T`, which filters without proving anything about `X`.
+    type_test: TypeTest,
 };
 
 pub const Goal = union(enum) {
@@ -60,6 +92,7 @@ pub const Goal = union(enum) {
     comparison: ComparisonGoal,
     arithmetic: struct { kind: Arithmetic, output: Term, left: Term, right: Term },
     aggregate: struct { template: Term, body: []const Goal, output: Term },
+    type_test: TypeTest,
 };
 
 /// Which way a sort key orders its variable's values under the canonical
@@ -91,6 +124,8 @@ pub const Statement = union(enum) {
     query: Query,
     /// `b~` — removes every base fact the goals' relational goals match.
     retraction: []const Goal,
+    /// `schema p(atom, int).` — declares the predicate's schema.
+    schema: Schema,
 };
 
 pub fn atom(value: []const u8) Term {
@@ -186,6 +221,19 @@ pub fn add(output: Term, left: Term, right: Term) Goal {
 
 pub fn subtract(output: Term, left: Term, right: Term) Goal {
     return .{ .arithmetic = .{ .kind = .subtract, .output = output, .left = left, .right = right } };
+}
+
+/// `X : T`: `typeTest(input.variable("X"), .int)`.
+pub fn typeTest(term: Term, column_type: ColumnType) Goal {
+    return .{ .type_test = .{ .term = term, .type = column_type } };
+}
+
+pub fn column(name: ?[]const u8, column_type: ColumnType) Column {
+    return .{ .name = name, .type = column_type };
+}
+
+pub fn schema(predicate: []const u8, columns: []const Column) Schema {
+    return .{ .predicate = predicate, .columns = columns };
 }
 
 pub fn setof(template: Term, body: []const Goal, output: Term) Goal {

@@ -10,6 +10,7 @@ const database = @import("database.zig");
 const input = @import("input.zig");
 const syntax = @import("syntax.zig");
 const input_compiler = @import("input_compiler.zig");
+const schema = @import("schema.zig");
 
 pub const InputBuilder = struct {
     database: *database.Database,
@@ -99,6 +100,7 @@ fn compileGoalValidated(db: *database.Database, descriptor: input.Goal) anyerror
                     comparisonKind(comparison.kind),
                     &.{ comparison.operands.left, comparison.operands.right },
                 ),
+                .type_test => |type_test| try compileTypeTest(db, type_test),
             };
             expression.negated = true;
             break :blk .{ .negated = expression };
@@ -112,6 +114,7 @@ fn compileGoalValidated(db: *database.Database, descriptor: input.Goal) anyerror
             .add => .add,
             .subtract => .subtract,
         }, &.{ arithmetic.output, arithmetic.left, arithmetic.right }) },
+        .type_test => |type_test| .{ .builtin = try compileTypeTest(db, type_test) },
         .aggregate => |aggregate| blk: {
             var builder: InputBuilder = .{ .database = db };
             const template = try input_compiler.compileTerm(&builder, aggregate.template);
@@ -136,6 +139,55 @@ pub fn compileBuiltin(db: *database.Database, kind: syntax.GoalKind, terms: []co
     result.kind = kind;
     return result;
 }
+fn compileTypeTest(db: *database.Database, type_test: input.TypeTest) !syntax.Expr {
+    const column_type = try compileColumnType(type_test.type);
+    var result = try compileBuiltin(db, .type_test, &.{type_test.term});
+    result.column_type = column_type;
+    return result;
+}
+
+/// Lowers a described column type. One nested too deeply for a type to hold
+/// is `InvalidTerm`, as a cyclic one is.
+pub fn compileColumnType(descriptor: input.ColumnType) !schema.ColumnType {
+    var lists: usize = 0;
+    var current = descriptor;
+    while (true) switch (current) {
+        .list => |element| {
+            lists += 1;
+            if (lists > std.math.maxInt(u8)) return error.InvalidTerm;
+            current = if (element) |inner| inner.* else .any;
+        },
+        else => break,
+    };
+    return .{ .lists = @intCast(lists), .element = switch (current) {
+        .atom => .atom,
+        .int => .int,
+        .number => .number,
+        .any => .any,
+        .list => unreachable,
+    } };
+}
+
+/// Lowers a schema declaration, interning its column names. The caller owns
+/// the result.
+pub fn compileSchema(db: *database.Database, descriptor: input.Schema) !schema.Schema {
+    if (descriptor.predicate.len == 0) return error.InvalidTerm;
+    const columns = try db.allocator.alloc(schema.ColumnType, descriptor.columns.len);
+    errdefer db.allocator.free(columns);
+    const names = try db.allocator.alloc(?u64, descriptor.columns.len);
+    errdefer db.allocator.free(names);
+    for (descriptor.columns, columns, names, 0..) |column, *column_type, *name, index| {
+        column_type.* = try compileColumnType(column.type);
+        name.* = if (column.name) |spelling| blk: {
+            if (spelling.len == 0) return error.InvalidTerm;
+            for (descriptor.columns[0..index]) |earlier| if (earlier.name) |other|
+                if (std.mem.eql(u8, other, spelling)) return error.InvalidTerm;
+            break :blk try db.strings.intern(spelling);
+        } else null;
+    }
+    return .{ .columns = columns, .names = names };
+}
+
 pub fn internGroundStructuresInExpr(db: *database.Database, expression: syntax.Expr) !void {
     for (expression.terms) |term| try internGroundStructuresInTerm(db, term);
 }

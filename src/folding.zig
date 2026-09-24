@@ -473,6 +473,7 @@ const Normalizer = struct {
             value.predicate,
             value.terms.len,
         });
+        if (value.kind == .type_test) try self.writer.print("{f}", .{value.column_type});
         try self.writer.writeByte('(');
         for (value.terms) |term_value| {
             try self.term(term_value);
@@ -1715,6 +1716,7 @@ const Lowering = struct {
                     .negated = builtin.negated,
                 };
                 expression.kind = builtin.operator;
+                expression.column_type = builtin.column_type;
                 break :blk .{ .builtin = expression };
             },
             .aggregate => |aggregate| blk: {

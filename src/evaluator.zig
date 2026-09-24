@@ -21,6 +21,7 @@ const syntax = @import("syntax.zig");
 const planner = @import("planner.zig");
 const relation_store = @import("relation_store.zig");
 const cost_model = @import("cost_model.zig");
+const schema = @import("schema.zig");
 
 const errors = @import("errors.zig");
 
@@ -860,6 +861,11 @@ pub const Evaluator = struct {
     }
 
     fn evalBuiltin(self: *Evaluator, expr_value: syntax.Expr, bindings: *syntax.Binding) !bool {
+        if (expr_value.kind == .type_test) {
+            if (expr_value.terms.len != 1) return errors.Error.InvalidQuery; // ziglint-ignore: Z010
+            const value = try self.termToValue(expr_value.terms[0], bindings);
+            return self.valueHasType(value, expr_value.column_type);
+        }
         if (expr_value.kind == .add or expr_value.kind == .subtract) {
             if (expr_value.terms.len != 3) return errors.Error.InvalidQuery; // ziglint-ignore: Z010
             const left_id = try self.termToValue(expr_value.terms[1], bindings);
@@ -902,6 +908,34 @@ pub const Evaluator = struct {
             .greater_than => order == .gt,
             .greater_or_equal => order != .lt,
             else => errors.Error.UnknownOperator,
+        };
+    }
+
+    /// Whether a ground value has a column type. A list type walks the list,
+    /// so the test costs the list's length; a structure that does not end in
+    /// `[]` is no list type's.
+    pub fn valueHasType(self: *const Evaluator, value: syntax.ValueId, column_type: schema.ColumnType) bool {
+        if (column_type.lists == 0) return switch (column_type.element) {
+            .any => true,
+            .never => false,
+            .atom, .int, .number => switch (self.values.get(value)) {
+                .scalar => |scalar_id| switch (self.scalars.get(scalar_id)) {
+                    .atom => column_type.element == .atom,
+                    .integer => column_type.element != .atom,
+                    .float => column_type.element == .number,
+                },
+                else => false,
+            },
+        };
+        const elements = column_type.elements();
+        var current = value;
+        while (true) switch (self.values.get(current)) {
+            .nil => return true,
+            .cons => |pair| {
+                if (!self.valueHasType(pair.head, elements)) return false;
+                current = pair.tail;
+            },
+            .scalar => return false,
         };
     }
 

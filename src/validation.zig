@@ -152,6 +152,11 @@ pub fn validateClause(
                 try syntax.bindTermVariables(db.allocator, expression.terms[0], bound);
                 return;
             }
+            if (syntax.isTypeTest(expression)) {
+                if (expression.terms.len != 1 or !syntax.termVariablesBound(expression.terms[0], bound))
+                    return safety_error;
+                return;
+            }
             if (expression.terms.len != 2) return safety_error;
             const a_bound = syntax.termVariablesBound(expression.terms[0], bound);
             const b_bound = syntax.termVariablesBound(expression.terms[1], bound);

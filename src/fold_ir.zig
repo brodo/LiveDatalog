@@ -27,6 +27,7 @@ const std = @import("std");
 const relation_store = @import("relation_store.zig");
 const scalar = @import("scalar.zig");
 const string_table = @import("string_table.zig");
+const schema = @import("schema.zig");
 const syntax = @import("syntax.zig");
 
 /// A variable's identity, unique across one `Symbols` table.
@@ -308,6 +309,8 @@ pub const Builtin = struct {
     operator: syntax.GoalKind,
     terms: []Term,
     negated: bool = false,
+    /// What a type test tests for; see `syntax.Expr.column_type`.
+    column_type: schema.ColumnType = .any,
     provenance: Provenance = .source,
 };
 
@@ -430,6 +433,7 @@ pub fn cloneGoal(allocator: std.mem.Allocator, goal: Goal) std.mem.Allocator.Err
             .operator = builtin.operator,
             .terms = try cloneTerms(allocator, builtin.terms),
             .negated = builtin.negated,
+            .column_type = builtin.column_type,
             .provenance = builtin.provenance,
         } },
         .aggregate => |aggregate| blk: {
@@ -565,6 +569,7 @@ pub fn substituteGoal(
             .operator = builtin.operator,
             .terms = try substituteTerms(allocator, builtin.terms, substitution),
             .negated = builtin.negated,
+            .column_type = builtin.column_type,
             .provenance = builtin.provenance,
         } },
         .aggregate => |aggregate| blk: {
@@ -749,6 +754,7 @@ pub fn lowerClause(
             .operator = expression.kind,
             .terms = try lowerTerms(allocator, symbols, scope, expression.terms),
             .negated = expression.negated,
+            .column_type = expression.column_type,
         } },
         .aggregate => |aggregate| blk: {
             const template = try lowerTerm(allocator, symbols, scope, aggregate.template);
@@ -972,6 +978,11 @@ fn writeBuiltin(
     builtin: Builtin,
 ) std.Io.Writer.Error!void {
     if (builtin.negated) try writer.writeAll("not ");
+    if (builtin.operator == .type_test) {
+        try writeTerm(writer, names, builtin.terms[0]);
+        try writer.print(" : {f}", .{builtin.column_type});
+        return;
+    }
     if (builtin.terms.len == 3) {
         try writeTerm(writer, names, builtin.terms[0]);
         try writer.writeAll(" = ");

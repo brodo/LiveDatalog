@@ -14,7 +14,9 @@ const input = @import("input.zig");
 const materialization = @import("materialization.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
+const schema = @import("schema.zig");
 const syntax = @import("syntax.zig");
+const typing = @import("typing.zig");
 const update = @import("update.zig");
 const validation = @import("validation.zig");
 
@@ -59,6 +61,7 @@ pub fn addFactExpr(db: *database.Database, value: syntax.Expr) !void {
 /// retains ownership. The body slice itself is only borrowed.
 pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const syntax.Clause) !void {
     const seed_argument = try validation.validateRule(db, head, body);
+    try typing.checkRule(db, head, body);
     const owned_body = try validation.orderClauses(db, body);
     errdefer db.allocator.free(owned_body);
     try db.eval.rules.append(db.allocator, .{
@@ -83,6 +86,30 @@ pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const s
         db.markDirty(analysis.strata.get(syntax.predicateKey(head)) orelse 0);
     }
     db.eval.next_rule_id += 1;
+}
+
+/// Declares `declared` as the schema of the predicate `name`, taking
+/// ownership of it whatever happens. Declaring the schema a predicate already
+/// has changes nothing; any other schema for it is `SchemaConflict`. The
+/// facts and rules the database already holds must fit, or the declaration
+/// fails and the database is as it was.
+pub fn declareSchema(db: *database.Database, name: syntax.Id, declared: schema.Schema) !void {
+    if (db.schemas.get(name)) |existing| {
+        defer declared.deinit(db.allocator);
+        if (!existing.eql(declared)) return errors.Error.SchemaConflict;
+        return;
+    }
+    db.schemas.put(db.allocator, name, declared) catch |err| {
+        declared.deinit(db.allocator);
+        return err;
+    };
+    errdefer db.schemas.remove(db.allocator, name);
+    for (0..db.facts.len()) |index| {
+        const fact = db.facts.factAt(index);
+        if (fact.predicate == name and !db.fitsSchema(name, fact.terms))
+            return errors.Error.SchemaViolation;
+    }
+    try typing.checkRules(db);
 }
 
 /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
@@ -273,6 +300,7 @@ pub fn evaluateClauses(db: *database.Database, goals: []const syntax.Clause) !st
     defer db.allocator.free(ordered);
     for (ordered) |clause|
         try validation.validateClause(db, clause, &bound, &outer_variables, errors.Error.InvalidQuery);
+    try typing.checkGoals(db, goals);
 
     try materialization.ensureMaterialized(db);
     const values_before = db.eval.values.values.items.len;

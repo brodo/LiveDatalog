@@ -207,6 +207,7 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) Error!input.Statement {
+        if (try self.parseSchema()) |declared| return .{ .schema = declared };
         const first = try self.parseClause();
         if (self.consume(":-")) {
             const head = switch (first.goal) {
@@ -236,6 +237,80 @@ const Parser = struct {
         if (self.consume("?")) return .{ .query = input.query(goals.items, &.{}) };
         if (self.consume("~")) return .{ .retraction = goals.items };
         return self.failHere(error.InvalidSyntax, expected);
+    }
+
+    /// `schema p(Name: atom, int).`, or null when the statement is not one.
+    /// `schema` is a keyword only when a predicate name follows it, so
+    /// `schema(x).` is still a fact about a relation named `schema`.
+    fn parseSchema(self: *Parser) Error!?input.Schema {
+        if (!self.peekKeyword("schema")) return null;
+        const keyword_start = self.index;
+        _ = try self.parseBare();
+        self.skipSpace();
+        if (self.index == self.source.len or !startsName(self.source[self.index])) {
+            self.index = keyword_start;
+            return null;
+        }
+        const name_start = self.index;
+        const predicate = switch (try self.parseTermPrimary()) {
+            .atom => |atom| atom,
+            else => return self.fail(
+                error.InvalidSyntax,
+                .{ .start = name_start, .end = self.index },
+                "a predicate name",
+            ),
+        };
+        try self.expect("(");
+        var columns: std.ArrayList(input.Column) = .empty;
+        if (!self.consume(")")) {
+            while (true) {
+                try columns.append(self.arena, try self.parseColumn());
+                if (self.consume(")")) break;
+                try self.expect(",");
+            }
+        }
+        try self.expect(".");
+        return input.schema(predicate, columns.items);
+    }
+
+    /// `Name: type` or a bare `type`.
+    fn parseColumn(self: *Parser) Error!input.Column {
+        self.skipSpace();
+        if (self.index < self.source.len and std.ascii.isUpper(self.source[self.index])) {
+            const name = try self.parseBare();
+            if (!self.consumeTypeColon()) return self.failHere(error.InvalidSyntax, "':'");
+            return input.column(name, try self.parseType());
+        }
+        return input.column(null, try self.parseType());
+    }
+
+    /// A column type: `atom`, `int`, `number`, `any`, `list` or `list(T)`.
+    fn parseType(self: *Parser) Error!input.ColumnType {
+        self.skipSpace();
+        const start = self.index;
+        if (self.index == self.source.len or !std.ascii.isAlphabetic(self.source[self.index]))
+            return self.failHere(error.InvalidSyntax, "a type");
+        const word = try self.parseBare();
+        const simple = [_]struct { []const u8, input.ColumnType }{
+            .{ "atom", .atom }, .{ "int", .int }, .{ "number", .number }, .{ "any", .any },
+        };
+        for (simple) |entry| if (std.mem.eql(u8, word, entry[0])) return entry[1];
+        if (!std.mem.eql(u8, word, "list"))
+            return self.fail(error.InvalidSyntax, .{ .start = start, .end = self.index }, "a type");
+        if (!self.consume("(")) return .{ .list = null };
+        const element = try self.arena.create(input.ColumnType);
+        element.* = try self.parseType();
+        try self.expect(")");
+        return .{ .list = element };
+    }
+
+    /// The `:` of a type test or a named column, which `:-` is not.
+    fn consumeTypeColon(self: *Parser) bool {
+        self.skipSpace();
+        if (!std.mem.startsWith(u8, self.source[self.index..], ":") or
+            std.mem.startsWith(u8, self.source[self.index..], ":-")) return false;
+        self.index += 1;
+        return true;
     }
 
     /// `order by K, ...` after a query's goals, or null when there is none.
@@ -321,6 +396,11 @@ const Parser = struct {
         const first_start = self.index;
         const first = try self.parseTerm();
         const first_span: Span = .{ .start = first_start, .end = self.index };
+        if (self.consumeTypeColon()) {
+            const tested: input.TypeTest = .{ .term = first, .type = try self.parseType() };
+            if (negated) return input.notBuiltin(.{ .type_test = tested });
+            return .{ .type_test = tested };
+        }
         if (self.parseOperator()) |operator| {
             const second = try self.parseTerm();
             if (std.mem.eql(u8, operator, "=")) {
@@ -352,6 +432,7 @@ const Parser = struct {
                 .equality => |binary| .{ .equality = binary },
                 .inequality => |binary| .{ .inequality = binary },
                 .comparison => |comparison| .{ .comparison = comparison },
+                .type_test => unreachable,
             };
         }
         if (!self.consume("(")) return self.failHere(error.InvalidSyntax, "'(' or an operator");
@@ -547,6 +628,12 @@ const Parser = struct {
         return err;
     }
 };
+
+/// Whether a predicate name can start with `c`: a bare lowercase word or a
+/// quoted atom.
+fn startsName(c: u8) bool {
+    return std.ascii.isLower(c) or c == '_' or c == '"' or c == '\'';
+}
 
 fn comparisonKind(operator: []const u8) input.Comparison {
     if (std.mem.eql(u8, operator, "<")) return .less_than;
@@ -824,4 +911,62 @@ fn allocationScenario(allocator: std.mem.Allocator) !void {
 
 test "parsing releases every allocation on failure" {
     try testing.checkAllAllocationFailures(testing.allocator, allocationScenario, .{});
+}
+
+test "schemas parse with and without column names" {
+    const int_element: input.ColumnType = .int;
+    const nested_element: input.ColumnType = .{ .list = &int_element };
+    try expectStatements(
+        \\schema age(Person: atom, Years: int).
+        \\schema scores(atom, list(number), list, list(list(int)), any).
+        \\schema flag().
+    , &.{
+        .{ .schema = input.schema("age", &.{
+            input.column("Person", .atom),
+            input.column("Years", .int),
+        }) },
+        .{ .schema = input.schema("scores", &.{
+            input.column(null, .atom),
+            input.column(null, .{ .list = &@as(input.ColumnType, .number) }),
+            input.column(null, .{ .list = null }),
+            input.column(null, .{ .list = &nested_element }),
+            input.column(null, .any),
+        }) },
+        .{ .schema = input.schema("flag", &.{}) },
+    });
+}
+
+test "schema is a keyword only when a predicate name follows it" {
+    try expectStatements(
+        \\schema(x).
+        \\schema(X)?
+    , &.{
+        .{ .fact = input.fact("schema", &.{input.atom("x")}) },
+        .{ .query = .{ .goals = &.{input.relation("schema", &.{input.variable("X")})} } },
+    });
+}
+
+test "type tests parse, negated or not, and leave rules' ':-' alone" {
+    const x = input.variable("X");
+    const int_element: input.ColumnType = .int;
+    try expectStatements(
+        \\p(X) :- q(X), X : list(int), not X : atom.
+        \\X = 1, X : number?
+    , &.{
+        .{ .rule = input.rule(input.fact("p", &.{x}), &.{
+            input.relation("q", &.{x}),
+            input.typeTest(x, .{ .list = &int_element }),
+            input.notBuiltin(.{ .type_test = .{ .term = x, .type = .atom } }),
+        }) },
+        .{ .query = .{ .goals = &.{ input.equal(x, input.integer(1)), input.typeTest(x, .number) } } },
+    });
+}
+
+test "malformed schemas and type tests say what was expected" {
+    try expectFailure("schema age(atom, integer).", error.InvalidSyntax, 1, 18, "a type");
+    try expectFailure("schema age(Name atom).", error.InvalidSyntax, 1, 17, "':'");
+    try expectFailure("schema age(atom)?", error.InvalidSyntax, 1, 17, "'.'");
+    try expectFailure("schema Age(atom).", error.InvalidSyntax, 1, 8, "'(' or an operator");
+    try expectFailure("p(X), X : 3?", error.InvalidSyntax, 1, 11, "a type");
+    try expectFailure("p(X), X : list(foo)?", error.InvalidSyntax, 1, 16, "a type");
 }

@@ -74,7 +74,9 @@ const Validator = struct {
                     try self.term(comparison.operands.left);
                     try self.term(comparison.operands.right);
                 },
+                .type_test => |type_test| try self.term(type_test.term),
             },
+            .type_test => |type_test| try self.term(type_test.term),
             .comparison => |comparison| {
                 try self.term(comparison.operands.left);
                 try self.term(comparison.operands.right);
