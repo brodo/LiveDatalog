@@ -164,6 +164,27 @@ pub fn build(b: *std.Build) void {
         run_server_cmd.addArgs(args);
     }
 
+    // The browser is built only on request, since it needs dvui and SDL.
+    const browser_step = b.step("browser", "Build the database browser (fetches dvui and SDL)");
+    const run_browser_step = b.step("run-browser", "Run the database browser");
+    if (b.lazyDependency("dvui", .{ .target = target, .optimize = optimize, .backend = .sdl3 })) |dvui_dep| {
+        const browser_exe = b.addExecutable(.{
+            .name = "LiveDatalogBrowser",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/browser/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") }},
+            }),
+        });
+        const install_browser = b.addInstallArtifact(browser_exe, .{});
+        browser_step.dependOn(&install_browser.step);
+        const run_browser_cmd = b.addRunArtifact(browser_exe);
+        run_browser_cmd.step.dependOn(&install_browser.step);
+        if (b.args) |args| run_browser_cmd.addArgs(args);
+        run_browser_step.dependOn(&run_browser_cmd.step);
+    }
+
     const benchmark_exe = b.addExecutable(.{
         .name = "aggregation-benchmark",
         .root_module = b.createModule(.{
@@ -344,6 +365,17 @@ pub fn build(b: *std.Build) void {
 
     const run_server_tests = b.addRunArtifact(server_tests);
 
+    // The browser's protocol client and model draw nothing, so they are
+    // tested without dvui.
+    const browser_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/browser/Model.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_browser_tests = b.addRunArtifact(browser_tests);
+
     // Exercise the installed command-line program against the language
     // tutorial example so documentation and executable behavior cannot drift.
     const run_cli_test = b.addRunArtifact(exe);
@@ -363,6 +395,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_server_tests.step);
+    test_step.dependOn(&run_browser_tests.step);
     test_step.dependOn(&run_cli_test.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.

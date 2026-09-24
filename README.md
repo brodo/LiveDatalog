@@ -13,9 +13,10 @@ interpreter for running files, piping programs, and exploring data in a REPL.
 - Structural lists, deterministic `setof`, and nested aggregates
 - Query folding against declared views, with an explicit answer guarantee
 - Checked integer arithmetic and mixed floating-point addition and subtraction
-- Bare and quoted values with escaped quotes
+- Bare and quoted values with escaped quotes, line breaks and tabs
 - Line and block comments
-- A command-line interpreter and an embeddable Zig API
+- A command-line interpreter, an embeddable Zig API, a file-watching
+  development server and a graphical database browser
 
 ## Requirements
 
@@ -89,11 +90,58 @@ zig build run-server -- --port 7070 --lsp-port 7071 examples/researchers
 printf 'researcher(X, N), field(X, physics), quote(X, Q)?\n' | nc 127.0.0.1 7070
 ```
 
-Send one request per line; every response ends with an empty line. A request
-is a query (the trailing `?` is optional) or a command: `.explain goals`,
-`.status` (counts and load errors), `.files`, `.reload`, `.help`, `.quit`.
-Answers use the REPL's format. Facts, rules, retractions and schemas sent over
-the connection are rejected, and queries inside the files are ignored.
+Send one request per line. A request is a query (the trailing `?` is optional)
+or a command. The protocol is meant for programs, so every response starts
+with a status line that says how many lines follow
+([ADR 0008](docs/adr/0008-counted-tab-separated-protocol.md)):
+
+```text
+ok table 2                      a tab-separated header, then that many rows
+Id	City
+curie	'Warsaw'
+ok text 3                       that many lines of text
+error InvalidSyntax at column 3, expected a term
+```
+
+Each cell holds a value in canonical Datalog syntax, so it never contains a
+tab or a line break and parses back to the same value. A query is answered as
+a table headed by its variables. A query without variables has an empty header,
+and one empty row when it holds.
+
+| Command | Answer |
+| --- | --- |
+| `.predicates` | every predicate: `name`, `arity`, `kind` (`base`, `derived` or `mixed`), `facts`, `typed` |
+| `.schema NAME` | a predicate's schema: `position`, `name`, `type`; no rows if it has none |
+| `.rows NAME/ARITY [OFFSET [LIMIT]] [by POSITION [asc\|desc] ...]` | a predicate's facts, headed by its schema's column names, one page at a time |
+| `.status` | directory, generation and counts |
+| `.errors` | the load errors: `file`, `line`, `column`, `error`, `message` |
+| `.files` | the loaded files |
+| `.explain GOALS` | the join plan, as text |
+| `.reload` | rescans the directory, then answers like `.status` |
+| `.watch` | turns the connection into a stream of `generation N` lines, one now and one after every change |
+| `.help`, `.quit` | the help text; closes the connection |
+
+Facts, rules, retractions and schemas sent over the connection are rejected,
+and queries inside the files are ignored.
+
+#### Browser
+
+`LiveDatalogBrowser` shows a running server's database as tables. It needs
+dvui and SDL3, which `zig build browser` fetches and builds from source (the
+other steps never build them):
+
+```sh
+zig build run-browser -- --host 127.0.0.1 --port 7070
+```
+
+The sidebar lists every predicate with its kind and fact count, including
+those a schema declares with no facts yet. Selecting one opens its facts in a
+grid headed by the schema's column names and types, or by column positions
+for an untyped predicate. Clicking a header sorts by that column on the
+server. Rows are fetched a page at a time as they scroll into view. The
+browser follows `.watch`, so it refreshes when the files change, and it
+reconnects every second while the server is away, greying out what it last
+showed.
 
 #### Language listener
 
@@ -159,7 +207,7 @@ reload. Each file is a contributor to the database, named by its path, so a
 fact stays as long as any file still asserts it. When only facts changed, the
 file's new facts replace its contribution through `setContribution`. Any other
 change rebuilds a fresh database from all files in path order and swaps it in. A change applies completely or not at all: if
-a file fails to parse or load, the previous database stays and `.status`
+a file fails to parse or load, the previous database stays and `.errors`
 shows the error with its location. A full `.reload` skips broken files and
 loads the rest.
 

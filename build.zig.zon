@@ -48,6 +48,12 @@
             .url = "git+https://github.com/zigtools/lsp-kit.git?ref=0.16.x#e61d6fdf0e498a7aa71c5946c3052e5be9f16343",
             .hash = "lsp_kit-0.1.0-bi_PL84xDAB33s_-DZPmYwprEqgi-dEjp1qAs36F96TA",
         },
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui#4070f35565ec84aa0ffc01b0b76967f9f94c85fc",
+            .hash = "dvui-0.5.0-dev-AQFJmYfRAwG8r3FCfCJX2JOysvDSUhyiHdaacUoq9R70",
+            // Only the browser needs it.
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
