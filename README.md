@@ -138,10 +138,16 @@ The sidebar lists every predicate with its kind and fact count, including
 those a schema declares with no facts yet. Selecting one opens its facts in a
 grid headed by the schema's column names and types, or by column positions
 for an untyped predicate. Clicking a header sorts by that column on the
-server. Rows are fetched a page at a time as they scroll into view. The
-browser follows `.watch`, so it refreshes when the files change, and it
-reconnects every second while the server is away, greying out what it last
-showed.
+server. Rows are fetched a page at a time as they scroll into view.
+
+The query bar above the table runs any query the query listener accepts, such
+as `born(Who, Year), Year < 1800` or `p(X, N) order by N desc?`, and shows its
+answers in a grid headed by the query's variables until a predicate is chosen
+again. Commands are not run from there.
+
+The browser follows `.watch`, so the open table and a query's answers
+refresh when the files change. It reconnects every second while the server
+is away, greying out what it last showed.
 
 #### Language listener
 

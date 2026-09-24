@@ -42,8 +42,14 @@ selection: ?Selection = null,
 visible: [2]usize = .{ 0, 0 },
 /// What was fetched for `selection`, once its schema is in.
 table: ?Table = null,
-/// Counts the changes to `table`: a new schema or a new page.
+/// Counts the changes to `table` and `answer`: a new schema, page or
+/// answer.
 table_revision: u64 = 0,
+/// The query the window shows the answers of instead of a predicate, owned
+/// by `gpa`. Set by the window.
+query: ?[]const u8 = null,
+/// What the server last answered to `query`.
+answer: ?Answer = null,
 
 /// Wakes the fetcher. Holds at most one pending wake.
 fetch_signal: Io.Queue(u8),
@@ -116,6 +122,18 @@ pub const Page = struct {
     rows: []const []const Client.Cell,
 };
 
+/// What the server answered to one query, as of one generation.
+pub const Answer = struct {
+    arena: std.heap.ArenaAllocator,
+    query: []const u8,
+    generation: ?u64,
+    /// The query's variables.
+    header: []const []const u8 = &.{},
+    rows: []const []const Client.Cell = &.{},
+    /// Why the server refused the query, when it did.
+    failure: ?[]const u8 = null,
+};
+
 /// The open table: the schema of `selection` as of `generation`, and the
 /// pages fetched so far.
 pub const Table = struct {
@@ -164,12 +182,27 @@ pub fn deinit(self: *Model) void {
     self.catalog.reset();
     if (self.table) |*table| table.deinit(self.gpa);
     if (self.selection) |selection| self.gpa.free(selection.name);
+    if (self.answer) |*answer| answer.arena.deinit();
+    if (self.query) |query| self.gpa.free(query);
     self.* = undefined;
+}
+
+/// Shows the answers to `query` until a predicate is selected again, and
+/// asks again whenever the database changes. Call with `mutex` held.
+pub fn ask(self: *Model, query: []const u8) !void {
+    const owned = try self.gpa.dupe(u8, query);
+    if (self.query) |old| self.gpa.free(old);
+    self.query = owned;
+    self.signalFetch();
 }
 
 /// Opens the table of `name`/`arity`, sorted by `sort`, or does nothing if
 /// it is open already. Call with `mutex` held.
 pub fn select(self: *Model, name: []const u8, arity: usize, sort: ?Sort) !void {
+    if (self.query) |query| {
+        self.gpa.free(query);
+        self.query = null;
+    }
     if (self.selection) |current| {
         if (current.eql(.{ .name = name, .arity = arity, .sort = sort })) return;
     }
@@ -260,6 +293,7 @@ fn fetchOnce(self: *Model) !void {
 const Need = union(enum) {
     nothing,
     catalog: ?u64,
+    query: struct { text: []const u8, generation: ?u64 },
     schema: struct { selection: Selection, generation: ?u64, typed: bool },
     page: struct { selection: Selection, generation: ?u64, page: usize },
 };
@@ -280,6 +314,7 @@ fn fetchNext(self: *Model, client: *Client) !bool {
     switch (need) {
         .nothing => return false,
         .catalog => |generation| try self.fetchCatalog(client, generation),
+        .query => |query| try self.fetchAnswer(client, query.text, query.generation),
         .schema => |schema| try self.fetchSchema(arena, client, schema.selection, schema.generation, schema.typed),
         .page => |page| try self.fetchPage(arena, client, page.selection, page.generation, page.page),
     }
@@ -292,6 +327,15 @@ fn fetchNext(self: *Model, client: *Client) !bool {
 fn decide(self: *Model, arena: std.mem.Allocator) !Need {
     if (self.catalog.arena == null or self.catalog.generation != self.generation)
         return .{ .catalog = self.generation };
+    if (self.query) |query| {
+        const answer = if (self.answer) |*a| a else null;
+        if (answer == null or answer.?.generation != self.catalog.generation or
+            !std.mem.eql(u8, answer.?.query, query))
+        {
+            return .{ .query = .{ .text = try arena.dupe(u8, query), .generation = self.catalog.generation } };
+        }
+        return .nothing;
+    }
     const selection = self.selection orelse return .nothing;
     const copy: Selection = .{
         .name = try arena.dupe(u8, selection.name),
@@ -359,6 +403,44 @@ fn fetchCatalog(self: *Model, client: *Client, generation: ?u64) !void {
     defer self.mutex.unlock(self.io);
     self.catalog.reset();
     self.catalog = catalog;
+}
+
+fn fetchAnswer(self: *Model, client: *Client, query: []const u8, generation: ?u64) !void {
+    var answer: Answer = .{ .arena = .init(self.gpa), .query = undefined, .generation = generation };
+    errdefer answer.arena.deinit();
+    const arena = answer.arena.allocator();
+    answer.query = try arena.dupe(u8, query);
+
+    const text = std.mem.trim(u8, query, &std.ascii.whitespace);
+    if (text.len != 0 and text[0] == '.') {
+        // A command could take the connection over, as `.watch` does.
+        answer.failure = "only queries can be run here, not commands";
+    } else if (text.len != 0) switch (try client.request(arena, text)) {
+        .table => |table| {
+            answer.header = table.header;
+            const rows = try arena.alloc([]const Client.Cell, table.rows.len);
+            for (table.rows, rows) |row, *cells| {
+                const out = try arena.alloc(Client.Cell, table.header.len);
+                for (out, 0..) |*cell, index| cell.* = if (index < row.len)
+                    try Client.decodeCell(arena, row[index])
+                else
+                    .{ .kind = .empty, .text = "" };
+                cells.* = out;
+            }
+            answer.rows = rows;
+        },
+        .failure => |failure| answer.failure = try std.fmt.allocPrint(arena, "{s} {s}", .{
+            failure.name,
+            failure.message,
+        }),
+        .text => return error.UnexpectedResponse,
+    };
+
+    try self.mutex.lock(self.io);
+    defer self.mutex.unlock(self.io);
+    if (self.answer) |*old| old.arena.deinit();
+    self.answer = answer;
+    self.table_revision += 1;
 }
 
 fn fetchSchema(
@@ -496,6 +578,90 @@ test "canceling the tasks stops them while they wait on the server" {
     try io.sleep(.fromMilliseconds(50), .awake);
     try testing.expectError(error.Canceled, fetcher.cancel(io));
     try testing.expectError(error.Canceled, watcher.cancel(io));
+}
+
+/// Answers one connection the way the query listener would, from a script:
+/// no predicates, no load errors, generation 1, and two answers to any query.
+fn fakeListener(io: Io, stream: Io.net.Stream) Io.Cancelable!void {
+    defer stream.close(io);
+    var read_buffer: [1024]u8 = undefined;
+    var write_buffer: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var writer = stream.writer(io, &write_buffer);
+    while (true) {
+        const line = (reader.interface.takeDelimiter('\n') catch return) orelse return;
+        const response = if (std.mem.eql(u8, line, ".watch"))
+            "generation 1\n"
+        else if (std.mem.eql(u8, line, ".predicates"))
+            "ok table 0\nname\tarity\tkind\tfacts\ttyped\n"
+        else if (std.mem.eql(u8, line, ".errors"))
+            "ok table 0\nfile\tline\tcolumn\terror\tmessage\n"
+        else if (std.mem.eql(u8, line, "p(X)?"))
+            "ok table 2\nX\n'a b'\n-1\n"
+        else
+            "error InvalidSyntax at column 3, expected a term\n";
+        writer.interface.writeAll(response) catch return;
+        writer.interface.flush() catch return;
+    }
+}
+
+/// Waits until `done` holds of the model, for up to a few seconds.
+fn waitFor(model: *Model, done: *const fn (*Model) bool) !void {
+    for (0..300) |_| {
+        try model.mutex.lock(model.io);
+        const finished = done(model);
+        model.mutex.unlock(model.io);
+        if (finished) return;
+        try model.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.Timeout;
+}
+
+test "a query's answers are fetched, and commands never reach the server" {
+    const io = testing.io;
+    var server = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var model: Model = undefined;
+    model.init(testing.allocator, io, server.socket.address, ignoreWake, null);
+    defer model.deinit();
+    var fetcher = try io.concurrent(runFetcher, .{&model});
+    defer _ = fetcher.cancel(io) catch {};
+    var watcher = try io.concurrent(runWatcher, .{&model});
+    defer _ = watcher.cancel(io) catch {};
+    var connections: Io.Group = .init;
+    defer connections.cancel(io);
+    for (0..2) |_| try connections.concurrent(io, fakeListener, .{ io, try server.accept(io) });
+
+    const Answered = struct {
+        fn check(m: *Model) bool {
+            const answer = m.answer orelse return false;
+            return std.mem.eql(u8, answer.query, m.query.?);
+        }
+    };
+
+    try model.mutex.lock(io);
+    try model.ask("p(X)?");
+    model.mutex.unlock(io);
+    try waitFor(&model, Answered.check);
+    const answer = model.answer.?;
+    try testing.expectEqual(@as(usize, 1), answer.header.len);
+    try testing.expectEqualStrings("X", answer.header[0]);
+    try testing.expectEqual(@as(usize, 2), answer.rows.len);
+    try testing.expectEqualStrings("a b", answer.rows[0][0].text);
+    try testing.expectEqual(Client.Cell.Kind.number, answer.rows[1][0].kind);
+
+    try model.mutex.lock(io);
+    try model.ask("p(");
+    model.mutex.unlock(io);
+    try waitFor(&model, Answered.check);
+    try testing.expectEqualStrings("InvalidSyntax at column 3, expected a term", model.answer.?.failure.?);
+
+    try model.mutex.lock(io);
+    try model.ask(".watch");
+    model.mutex.unlock(io);
+    try waitFor(&model, Answered.check);
+    try testing.expectEqualStrings("only queries can be run here, not commands", model.answer.?.failure.?);
 }
 
 test {

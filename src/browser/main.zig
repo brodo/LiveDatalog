@@ -114,7 +114,12 @@ fn appFrame() !dvui.App.Result {
     }, .{ .expand = .both });
     defer paned.deinit();
     if (paned.showFirst()) try predicateList();
-    if (paned.showSecond()) try table();
+    if (paned.showSecond()) {
+        var pane = dvui.box(@src(), .{}, .{ .expand = .both });
+        defer pane.deinit();
+        try queryBar();
+        if (model.query != null) answers() else try table();
+    }
     return .ok;
 }
 
@@ -179,7 +184,7 @@ fn predicateList() !void {
 
     for (model.catalog.predicates, 0..) |predicate, index| {
         const selected = if (model.selection) |s|
-            s.arity == predicate.arity and std.mem.eql(u8, s.name, predicate.name)
+            model.query == null and s.arity == predicate.arity and std.mem.eql(u8, s.name, predicate.name)
         else
             false;
         var label_buffer: [256]u8 = undefined;
@@ -260,10 +265,78 @@ fn table() !void {
                 dvui.labelNoFmt(@src(), "…", .{}, options);
                 continue;
             };
-            const value: Client.Cell = content[column];
-            if (value.kind == .number) options.gravity_x = 1;
-            if (value.kind == .structure) options.font = .theme(.mono);
-            dvui.labelNoFmt(@src(), value.text, .{}, options);
+            cellLabel(content[column], options);
+        }
+    }
+}
+
+/// Shows one value in a cell: numbers to the right, lists in a fixed-width
+/// font.
+fn cellLabel(value: Client.Cell, base: dvui.Options) void {
+    var options = base;
+    if (value.kind == .number) options.gravity_x = 1;
+    if (value.kind == .structure) options.font = .theme(.mono);
+    dvui.labelNoFmt(@src(), value.text, .{}, options);
+}
+
+/// The longest query the query bar holds.
+const max_query = 4096;
+
+/// A line to type a query into. Return or Run shows its answers in place of
+/// the open predicate, until a predicate is chosen again.
+fn queryBar() !void {
+    var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
+    defer bar.deinit();
+
+    var query_buffer: [max_query]u8 = undefined;
+    var entry = dvui.textEntry(@src(), .{
+        .text = .{ .internal = .{ .limit = max_query } },
+        .placeholder = "Query, e.g. born(Who, Year), Year < 1800",
+    }, .{ .expand = .horizontal, .font = .theme(.mono) });
+    const entered = entry.enter_pressed;
+    const query = query_buffer[0..entry.getText().len];
+    @memcpy(query, entry.getText());
+    entry.deinit();
+
+    const run = dvui.button(@src(), "Run", .{}, .{});
+    if ((entered or run) and std.mem.trim(u8, query, &std.ascii.whitespace).len != 0) try model.ask(query);
+}
+
+/// The answers to the query in the query bar, headed by its variables.
+fn answers() void {
+    const query = model.query.?;
+    const answer = if (model.answer) |*a| (if (std.mem.eql(u8, a.query, query)) a else null) else null;
+    const centered: dvui.Options = .{ .gravity_x = 0.5, .gravity_y = 0.5 };
+    const shown = answer orelse return dvui.label(@src(), "Running…", .{}, centered);
+    if (shown.failure) |failure| {
+        return dvui.labelNoFmt(@src(), failure, .{}, .{ .style = .err, .gravity_x = 0.5, .gravity_y = 0.5 });
+    }
+    // A query without variables only holds or does not.
+    if (shown.header.len == 0) {
+        return dvui.label(@src(), "{s}", .{if (shown.rows.len == 0) "No." else "Yes."}, centered);
+    }
+    dvui.label(@src(), "{d} answer{s}", .{ shown.rows.len, if (shown.rows.len == 1) "" else "s" }, textOptions());
+
+    var grid = dvui.grid(@src(), .{
+        .scroll_opts = .{ .horizontal = .auto },
+        .rows = shown.rows.len,
+    }, .{ .expand = .both, .id_extra = @truncate(std.hash.Wyhash.hash(0, query)) });
+    defer grid.deinit();
+    if (sized_revision != model.table_revision) {
+        grid.autoSize(.both);
+        sized_revision = model.table_revision;
+    }
+    for (shown.header, 0..) |name, column| {
+        const header = grid.colHeader(.{ .col = column }, .{ .border = .all(1) });
+        defer header.deinit();
+        dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5 });
+    }
+    const first, const last = grid.rowsVisible();
+    for (shown.rows[first..last], first..) |row, index| {
+        for (row, 0..) |value, column| {
+            var cell = grid.cell(.{ .col = column, .row = index }, .{ .border = .all(1) });
+            defer cell.deinit();
+            cellLabel(value, textOptions());
         }
     }
 }

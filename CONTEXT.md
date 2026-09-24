@@ -620,8 +620,9 @@ arity, so an untyped name used at two arities is two tables. It lists every
 predicate that has facts, base or derived, and every predicate a schema
 declares, even one with no facts yet. A column is headed by its schema's name
 for it and, for a typed predicate, its column type; a column without a name is
-headed by its 1-based position. Like every client, the browser cannot change
-the database.
+headed by its 1-based position. The browser can also show the answers to a
+query in place of a predicate, headed by the query's variables. Like every
+client, the browser cannot change the database.
 
 ### Kind
 
