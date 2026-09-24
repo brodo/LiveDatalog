@@ -742,7 +742,8 @@ test "a program records where each predicate is named" {
     ;
     try testing.expectError(error.InvalidSyntax, parseProgram(testing.allocator, source, null));
 
-    const parsed = try parseProgram(testing.allocator, source[0 .. std.mem.findScalarLast(u8, source, '\n').? + 1], null);
+    const complete = source[0 .. std.mem.findScalarLast(u8, source, '\n').? + 1];
+    const parsed = try parseProgram(testing.allocator, complete, null);
     defer parsed.deinit();
     const names = parsed.value.names;
     const expected = [_]struct { []const u8, usize, []const u8, usize }{

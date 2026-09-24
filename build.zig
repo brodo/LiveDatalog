@@ -122,12 +122,20 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // The query server: watches a directory of .dl files and answers queries
-    // over TCP. `zig build run-server -- examples/researchers`
+    // The development server: watches a directory of .dl files and serves
+    // queries and the Language Server Protocol over TCP.
+    // `zig build run-server -- examples/researchers`
     const nightwatch = b.dependency("nightwatch", .{
         .target = target,
         .optimize = optimize,
     }).module("nightwatch");
+
+    // The language listener speaks the Language Server Protocol through
+    // lsp-kit's transport, message types and dispatch loop.
+    const lsp = b.dependency("lsp_kit", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lsp");
 
     const server_exe = b.addExecutable(.{
         .name = "LiveDatalogServer",
@@ -138,13 +146,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "LiveDatalog", .module = mod },
                 .{ .name = "nightwatch", .module = nightwatch },
+                .{ .name = "lsp", .module = lsp },
             },
         }),
     });
 
     b.installArtifact(server_exe);
 
-    const run_server_step = b.step("run-server", "Run the file-watching query server");
+    const run_server_step = b.step("run-server", "Run the file-watching development server");
 
     const run_server_cmd = b.addRunArtifact(server_exe);
     run_server_step.dependOn(&run_server_cmd.step);
