@@ -62,6 +62,24 @@ pub const Goal = union(enum) {
     aggregate: struct { template: Term, body: []const Goal, output: Term },
 };
 
+/// Which way a sort key orders its variable's values under the canonical
+/// total order.
+pub const Direction = enum { ascending, descending };
+
+/// One key of a requested answer order: a variable the answers list, and a
+/// direction. See "Answer order" in CONTEXT.md.
+pub const SortKey = struct {
+    variable: []const u8,
+    direction: Direction = .ascending,
+};
+
+/// `b order by K?` — goals to answer, and how to list the answers. An empty
+/// `order` lists them in the default order, which is deterministic too.
+pub const Query = struct {
+    goals: []const Goal,
+    order: []const SortKey = &.{},
+};
+
 /// One top-level item of a program: what a parsed program is a sequence of,
 /// and what `Jatalog.executeStatements` runs. See "Statement" in CONTEXT.md.
 pub const Statement = union(enum) {
@@ -69,8 +87,8 @@ pub const Statement = union(enum) {
     fact: Relation,
     /// `h :- b.` — adds a rule to the program.
     rule: Rule,
-    /// `b?` — answers the goals.
-    query: []const Goal,
+    /// `b?` — answers the goals, in the order the query asks for.
+    query: Query,
     /// `b~` — removes every base fact the goals' relational goals match.
     retraction: []const Goal,
 };
@@ -106,6 +124,18 @@ pub fn relation(predicate: []const u8, terms: []const Term) Goal {
 /// Describes one ground fact for the batch-update interface.
 pub fn fact(predicate: []const u8, terms: []const Term) Relation {
     return .{ .predicate = predicate, .terms = terms };
+}
+
+pub fn query(goals: []const Goal, order: []const SortKey) Query {
+    return .{ .goals = goals, .order = order };
+}
+
+pub fn ascending(variable_name: []const u8) SortKey {
+    return .{ .variable = variable_name, .direction = .ascending };
+}
+
+pub fn descending(variable_name: []const u8) SortKey {
+    return .{ .variable = variable_name, .direction = .descending };
 }
 
 /// Describes one rule of a query program for the folding interface.

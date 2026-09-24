@@ -19,6 +19,9 @@ const help_text =
     \\% Query
     \\derived(X)?
     \\
+    \\% Query with an answer order (asc is the default)
+    \\score(P, S) order by S desc, P?
+    \\
     \\% Retraction
     \\source(X)~
     \\

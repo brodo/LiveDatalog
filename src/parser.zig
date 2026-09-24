@@ -227,11 +227,41 @@ const Parser = struct {
         try goals.append(self.arena, first.goal);
         const expected = if (self.consume(",")) blk: {
             try self.appendClauses(&goals);
-            break :blk "',', '?' or '~'";
-        } else "':-', '.', ',', '?' or '~'";
-        if (self.consume("?")) return .{ .query = goals.items };
+            break :blk "',', 'order by', '?' or '~'";
+        } else "':-', '.', ',', 'order by', '?' or '~'";
+        if (try self.parseOrderBy()) |order| {
+            try self.expect("?");
+            return .{ .query = input.query(goals.items, order) };
+        }
+        if (self.consume("?")) return .{ .query = input.query(goals.items, &.{}) };
         if (self.consume("~")) return .{ .retraction = goals.items };
         return self.failHere(error.InvalidSyntax, expected);
+    }
+
+    /// `order by K, ...` after a query's goals, or null when there is none.
+    /// `order` is a keyword only here, where no goal can follow a goal without
+    /// a comma, so a relation named `order` stays legal everywhere else.
+    fn parseOrderBy(self: *Parser) Error!?[]const input.SortKey {
+        if (!self.peekKeyword("order")) return null;
+        _ = try self.parseBare();
+        if (!self.peekKeyword("by")) return self.failHere(error.InvalidSyntax, "'by'");
+        _ = try self.parseBare();
+        var keys: std.ArrayList(input.SortKey) = .empty;
+        while (true) {
+            self.skipSpace();
+            if (self.index == self.source.len or !std.ascii.isUpper(self.source[self.index]))
+                return self.failHere(error.InvalidSyntax, "a variable");
+            const name = try self.parseBare();
+            const direction: input.Direction = if (self.peekKeyword("desc")) blk: {
+                _ = try self.parseBare();
+                break :blk .descending;
+            } else if (self.peekKeyword("asc")) blk: {
+                _ = try self.parseBare();
+                break :blk .ascending;
+            } else .ascending;
+            try keys.append(self.arena, .{ .variable = name, .direction = direction });
+            if (!self.consume(",")) return keys.items;
+        }
     }
 
     /// One or more clauses separated by commas.
@@ -563,7 +593,7 @@ test "every kind of statement parses to the descriptors it names" {
                 input.relation("parent", &.{ y, input.variable("Z") }),
             },
         ) },
-        .{ .query = &.{input.relation("parent", &.{ input.atom("alice"), x })} },
+        .{ .query = .{ .goals = &.{input.relation("parent", &.{ input.atom("alice"), x })} } },
         .{ .retraction = &.{input.relation("parent", &.{ x, input.atom("bob") })} },
     });
 }
@@ -575,7 +605,7 @@ test "built-ins, negation and arithmetic parse without normalizing" {
         \\p(X), not q(X), X = Y, X != Y, X <> Y, X < Y, X >= Y, Z = X + Y, W = X - 1?
         \\p(X), not X < Y, not X = Y, not X != Y?
     , &.{
-        .{ .query = &.{
+        .{ .query = .{ .goals = &.{
             input.relation("p", &.{x}),
             input.not("q", &.{x}),
             input.equal(x, y),
@@ -585,8 +615,8 @@ test "built-ins, negation and arithmetic parse without normalizing" {
             input.greaterOrEqual(x, y),
             input.add(input.variable("Z"), x, y),
             input.subtract(input.variable("W"), x, input.integer(1)),
-        } },
-        .{ .query = &.{
+        } } },
+        .{ .query = .{ .goals = &.{
             input.relation("p", &.{x}),
             input.notBuiltin(.{ .comparison = .{
                 .kind = .less_than,
@@ -594,7 +624,7 @@ test "built-ins, negation and arithmetic parse without normalizing" {
             } }),
             input.notBuiltin(.{ .equality = .{ .left = x, .right = y } }),
             input.notBuiltin(.{ .inequality = .{ .left = x, .right = y } }),
-        } },
+        } } },
     });
 }
 
@@ -654,6 +684,36 @@ test "aggregates parse with single and parenthesized bodies, and nest" {
     });
 }
 
+test "order by parses to sort keys, and order stays a legal relation name" {
+    const x = input.variable("X");
+    const c = input.variable("C");
+    try expectStatements(
+        \\cost(X, C) order by C desc, X?
+        \\cost(X, C), p(X) order by X asc, C?
+        \\order(X), by(X)?
+    , &.{
+        .{ .query = input.query(
+            &.{input.relation("cost", &.{ x, c })},
+            &.{ input.descending("C"), input.ascending("X") },
+        ) },
+        .{ .query = input.query(
+            &.{ input.relation("cost", &.{ x, c }), input.relation("p", &.{x}) },
+            &.{ input.ascending("X"), input.ascending("C") },
+        ) },
+        .{ .query = input.query(
+            &.{ input.relation("order", &.{x}), input.relation("by", &.{x}) },
+            &.{},
+        ) },
+    });
+}
+
+test "a malformed order by reports what it expected, and a retraction has none" {
+    try expectFailure("p(X) order X?", error.InvalidSyntax, 1, 12, "'by'");
+    try expectFailure("p(X) order by a?", error.InvalidSyntax, 1, 15, "a variable");
+    try expectFailure("p(X) order by X, ?", error.InvalidSyntax, 1, 18, "a variable");
+    try expectFailure("p(X) order by X~", error.InvalidSyntax, 1, 16, "'?'");
+}
+
 test "comments and spans cover each statement" {
     const parsed = try parseProgram(testing.allocator,
         \\% a comment
@@ -681,8 +741,8 @@ test "the parse owns everything it returns" {
 }
 
 test "syntax errors report where they are and what was expected" {
-    try expectFailure("p(a)", error.InvalidSyntax, 1, 5, "':-', '.', ',', '?' or '~'");
-    try expectFailure("p(a), q(b)", error.InvalidSyntax, 1, 11, "',', '?' or '~'");
+    try expectFailure("p(a)", error.InvalidSyntax, 1, 5, "':-', '.', ',', 'order by', '?' or '~'");
+    try expectFailure("p(a), q(b)", error.InvalidSyntax, 1, 11, "',', 'order by', '?' or '~'");
     try expectFailure("p(a).\nq(a b).", error.InvalidSyntax, 2, 5, "','");
     try expectFailure("p(a) :- q(a)", error.InvalidSyntax, 1, 13, "'.'");
     try expectFailure("p([a b]).", error.InvalidSyntax, 1, 6, "',' or ']'");

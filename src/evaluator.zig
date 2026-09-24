@@ -995,7 +995,7 @@ pub const Evaluator = struct {
     }
 
     /// Numbers by value, atoms by spelling, nil, then cons cells recursively.
-    fn compareValues(self: *const Evaluator, left: syntax.ValueId, right: syntax.ValueId) std.math.Order {
+    pub fn compareValues(self: *const Evaluator, left: syntax.ValueId, right: syntax.ValueId) std.math.Order {
         const a = self.values.get(left);
         const b = self.values.get(right);
         const a_rank: u2 = switch (a) {

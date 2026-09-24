@@ -152,7 +152,14 @@ pub const Jatalog = struct {
         self.state.commit(&staging);
     }
 
-    pub fn query(self: *Jatalog, goals: []const input.Goal) !results.QueryResult {
+    /// Answers `goals`, listed in the order `order` asks for; an empty `order`
+    /// lists them in the default answer order. See "Answer order" in
+    /// CONTEXT.md.
+    pub fn query(
+        self: *Jatalog,
+        goals: []const input.Goal,
+        order: []const input.SortKey,
+    ) !results.QueryResult {
         try materialization.ensureMaterialized(&self.state);
         // The copy is discarded and the instrument is not: a query's
         // candidates are this database's candidates whichever copy examined
@@ -168,7 +175,7 @@ pub const Jatalog = struct {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
             staging.allocator.free(compiled);
         }
-        return transaction.queryClauses(&staging, compiled);
+        return transaction.queryClauses(&staging, compiled, order);
     }
 
     /// Charges this database with what evaluating on a staging copy cost,
@@ -549,6 +556,10 @@ pub const Jatalog = struct {
     /// touching the plans. Conflating the two would re-fold on every
     /// insertion and undo the plan cache to fix a problem the plan cache does
     /// not have.
+    ///
+    /// Answers are listed in the default answer order. A requested order is
+    /// not offered yet, because a folded answer lists the plan's variable
+    /// names rather than the caller's, so a key could not name them.
     pub fn answerFolded(self: *Jatalog, fold: Fold) !results.QueryResult {
         const cached = try self.planAt(fold);
         if (cached.executable == null) return error.PlanNotExecutable;
@@ -589,6 +600,7 @@ pub const Jatalog = struct {
         const answers = try transaction.queryClauses(
             &entry.reconstruction.?,
             entry.executable.?.goals,
+            &.{},
         );
         self.state.eval.cost.work +|=
             entry.reconstruction.?.eval.cost.work -| work_before;
@@ -1306,7 +1318,7 @@ test "repeated queries reuse the persistent closure without expansion" {
     var typed = try db.query(&.{input.relation("path", &.{
         input.atom("a"),
         input.variable("target"),
-    })});
+    })}, &.{});
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 3), typed.answers.items.len);
     try std.testing.expectEqual(after_first, db.state.eval.expansions);
@@ -1413,7 +1425,7 @@ test "a database without rules allocates no derived machinery" {
     defer db.deinit();
     try db.addFact("kept", &.{input.integer(1)});
     try expectAnswerCount(&db, "kept(1)?", 1);
-    var typed = try db.query(&.{input.relation("kept", &.{input.variable("n")})});
+    var typed = try db.query(&.{input.relation("kept", &.{input.variable("n")})}, &.{});
     defer typed.deinit();
     try std.testing.expectEqual(@as(usize, 1), typed.answers.items.len);
     try std.testing.expect(db.state.closure == null);
@@ -1951,7 +1963,7 @@ test "ground list query inputs seed recursive evaluation" {
     var query_result = try db.query(&.{input.relation("sum", &.{
         input.list(&.{ input.integer(4), input.integer(5) }),
         input.variable("total"),
-    })});
+    })}, &.{});
     defer query_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), query_result.answers.items.len);
     try std.testing.expectEqual(@as(i64, 9), try query_result.answers.items[0].getInteger("total"));
@@ -2127,7 +2139,7 @@ test "embedding API constructs structural aggregate rules and queries" {
         },
     );
 
-    var result = try db.query(&.{input.relation("children", &.{ x, children })});
+    var result = try db.query(&.{input.relation("children", &.{ x, children })}, &.{});
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.answers.items.len);
     for (result.answers.items) |*answer| {
@@ -2161,7 +2173,7 @@ test "typed nested setof matches source aggregate semantics" {
         input.list(&.{ group, values }),
         &outer_body,
         groups,
-    )});
+    )}, &.{});
     defer result.deinit();
     try test_support.expectBindingValue(
         &result.answers.items[0],
@@ -2179,7 +2191,7 @@ fn embeddedAggregateAllocationScenario(allocator: std.mem.Allocator) !void {
     const x = input.variable("x");
     const output = input.variable("output");
     const body = [_]input.Goal{input.relation("item", &.{x})};
-    var result = try db.query(&.{input.setof(input.list(&.{x}), &body, output)});
+    var result = try db.query(&.{input.setof(input.list(&.{x}), &body, output)}, &.{});
     defer result.deinit();
     try test_support.expectBindingValue(&result.answers.items[0], "output", "[[a], [b]]");
 }
@@ -2227,7 +2239,7 @@ test "public errors distinguish each aggregation failure boundary" {
     );
     try std.testing.expectError(
         errors.Error.InvalidQuery,
-        db.query(&.{input.add(input.variable("x"), input.variable("y"), input.integer(1))}),
+        db.query(&.{input.add(input.variable("x"), input.variable("y"), input.integer(1))}, &.{}),
     );
     try std.testing.expectError(errors.Error.NotAdmissible, db.execute("grow([X]) :- grow(X).", null));
 }
@@ -2423,7 +2435,7 @@ test "source and typed mixed numeric operations produce identical answers" {
         input.compare(.less_than, v, input.integer(3)),
         input.add(s, v, input.integer(1)),
         input.subtract(d, v, input.integer(2)),
-    });
+    }, &.{});
     defer typed.deinit();
 
     var source = try db.execute("measure(X, V), V < 3, S = V + 1, D = V - 2?", null);
@@ -2466,7 +2478,7 @@ test "typed float descriptors canonicalize and getters never coerce" {
 
     var fractional = try db.query(&.{
         input.relation("measure", &.{ input.atom("a"), input.variable("v") }),
-    });
+    }, &.{});
     defer fractional.deinit();
     const value = try fractional.answers.items[0].getValue("v");
     try std.testing.expectEqual(results.ResultValue.Kind.float, value.kind());
@@ -2479,7 +2491,7 @@ test "typed float descriptors canonicalize and getters never coerce" {
     // reports TypeMismatch and the integer getter succeeds.
     var canonical = try db.query(&.{
         input.relation("measure", &.{ input.atom("b"), input.variable("v") }),
-    });
+    }, &.{});
     defer canonical.deinit();
     try std.testing.expectEqual(@as(i64, 1), try canonical.answers.items[0].getInteger("v"));
     try std.testing.expectError(errors.Error.TypeMismatch, canonical.answers.items[0].getFloat("v"));
@@ -2520,7 +2532,7 @@ test "non-finite typed floats fail compilation transactionally" {
     );
     try std.testing.expectError(
         errors.Error.NumericOverflow,
-        db.query(&.{input.relation("kept", &.{input.float(std.math.inf(f64))})}),
+        db.query(&.{input.relation("kept", &.{input.float(std.math.inf(f64))})}, &.{}),
     );
     const v = input.variable("v");
     try std.testing.expectError(
@@ -2547,7 +2559,7 @@ fn typedFloatAllocationScenario(allocator: std.mem.Allocator) !void {
         input.relation("measure", &.{ input.variable("x"), input.variable("v") }),
         input.compare(.less_than, input.variable("v"), input.integer(3)),
         input.add(input.variable("s"), input.variable("v"), input.float(0.25)),
-    });
+    }, &.{});
     result.deinit();
     db.addFact("bad", &.{input.float(std.math.inf(f64))}) catch |err| switch (err) {
         error.NumericOverflow => return,
@@ -2612,7 +2624,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
         },
     );
 
-    var result = try db.query(&.{input.relation("adult", &.{person})});
+    var result = try db.query(&.{input.relation("adult", &.{person})}, &.{});
     try std.testing.expectEqual(@as(usize, 1), result.answers.items.len);
     try std.testing.expectEqualStrings("alice", try result.answers.items[0].getAtom("person"));
     result.deinit();
@@ -2621,7 +2633,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
     const tail = input.atom("tail");
     const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
     try db.addFact("improper", &.{input.cons(&pair)});
-    result = try db.query(&.{input.relation("improper", &.{input.variable("value")})});
+    result = try db.query(&.{input.relation("improper", &.{input.variable("value")})}, &.{});
     try test_support.expectBindingValue(&result.answers.items[0], "value", "cons(head, tail)");
     result.deinit();
 
@@ -2633,7 +2645,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
         input.relation("tail", &.{list_tail}),
         &.{input.relation("items", &.{input.cons(&list_pair)})},
     );
-    result = try db.query(&.{input.relation("tail", &.{input.variable("result")})});
+    result = try db.query(&.{input.relation("tail", &.{input.variable("result")})}, &.{});
     try test_support.expectBindingValue(&result.answers.items[0], "result", "[2]");
     result.deinit();
 
@@ -2641,7 +2653,7 @@ test "typed descriptors cover scalars lists rules builtins negation and retracti
         input.atom("bob"),
         input.integer(17),
     })}));
-    result = try db.query(&.{input.relation("age", &.{ input.atom("bob"), input.variable("n") })});
+    result = try db.query(&.{input.relation("age", &.{ input.atom("bob"), input.variable("n") })}, &.{});
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.answers.items.len);
 }
@@ -2656,7 +2668,7 @@ test "typed equality inequality and arithmetic use canonical integer identity" {
         input.notEqual(value, input.integer(2)),
         input.add(sum, value, input.integer(2)),
         input.equal(sum, input.integer(3)),
-    });
+    }, &.{});
     defer result.deinit();
     try std.testing.expectEqual(@as(i64, 1), try result.answers.items[0].getInteger("value"));
     try std.testing.expectEqual(@as(i64, 3), try result.answers.items[0].getInteger("sum"));
@@ -2667,25 +2679,25 @@ test "typed equality inequality and arithmetic use canonical integer identity" {
             sum,
             input.integer(std.math.maxInt(i64)),
             input.integer(1),
-        )}),
+        )}, &.{}),
     );
     try std.testing.expectError(
         errors.Error.NumericType,
-        db.query(&.{input.subtract(sum, input.atom("one"), input.integer(1))}),
+        db.query(&.{input.subtract(sum, input.atom("one"), input.integer(1))}, &.{}),
     );
 
     var difference = try db.query(&.{input.subtract(
         input.variable("difference"),
         input.integer(-2),
         input.integer(3),
-    )});
+    )}, &.{});
     try std.testing.expectEqual(
         @as(i64, -5),
         try difference.answers.items[0].getInteger("difference"),
     );
     difference.deinit();
 
-    var mismatch = try db.query(&.{input.add(input.integer(0), input.integer(1), input.integer(2))});
+    var mismatch = try db.query(&.{input.add(input.integer(0), input.integer(1), input.integer(2))}, &.{});
     try std.testing.expectEqual(@as(usize, 0), mismatch.answers.items.len);
     mismatch.deinit();
     try std.testing.expectError(
@@ -2694,7 +2706,7 @@ test "typed equality inequality and arithmetic use canonical integer identity" {
             sum,
             input.integer(std.math.minInt(i64)),
             input.integer(1),
-        )}),
+        )}, &.{}),
     );
 }
 
@@ -2714,19 +2726,19 @@ test "malformed and cyclic typed descriptors are rejected transactionally" {
 
     var cyclic_goals: [1]input.Goal = undefined;
     cyclic_goals[0] = input.setof(input.integer(1), &cyclic_goals, input.variable("values"));
-    try std.testing.expectError(errors.Error.InvalidTerm, db.query(&cyclic_goals));
+    try std.testing.expectError(errors.Error.InvalidTerm, db.query(&cyclic_goals, &.{}));
 
     try std.testing.expectError(errors.Error.InvalidTerm, db.addFact("", &.{input.atom("value")}));
     try std.testing.expectError(
         errors.Error.InvalidTerm,
-        db.query(&.{input.relation("kept", &.{input.variable("")})}),
+        db.query(&.{input.relation("kept", &.{input.variable("")})}, &.{}),
     );
 
     const shared_items = [_]input.Term{input.atom("shared")};
     const shared_list = input.list(&shared_items);
     try db.addFact("shared", &.{ shared_list, shared_list });
 
-    var result = try db.query(&.{input.relation("kept", &.{input.variable("value")})});
+    var result = try db.query(&.{input.relation("kept", &.{input.variable("value")})}, &.{});
     defer result.deinit();
     try std.testing.expectEqualStrings("yes", try result.answers.items[0].getAtom("value"));
 }
@@ -2743,7 +2755,7 @@ test "query results own names scalars and structures after database destruction"
                 input.variable("integer"),
                 input.variable("float"),
             }),
-        });
+        }, &.{});
         db.deinit();
         break :blk query_result;
     };
@@ -2776,7 +2788,7 @@ test "novel typed queries release all query-local storage" {
     for (0..100) |index| {
         var name_buffer: [32]u8 = undefined;
         const novel = try std.fmt.bufPrint(&name_buffer, "novel_{d}", .{index});
-        var result = try db.query(&.{input.relation("missing", &.{input.atom(novel)})});
+        var result = try db.query(&.{input.relation("missing", &.{input.atom(novel)})}, &.{});
         try std.testing.expectEqual(@as(usize, 0), result.answers.items.len);
         result.deinit();
         try std.testing.expectEqual(
@@ -2787,7 +2799,7 @@ test "novel typed queries release all query-local storage" {
 
     for (0..100) |index| {
         const novel = @as(f64, @floatFromInt(index)) + 0.5;
-        var result = try db.query(&.{input.relation("missing", &.{input.float(novel)})});
+        var result = try db.query(&.{input.relation("missing", &.{input.float(novel)})}, &.{});
         try std.testing.expectEqual(@as(usize, 0), result.answers.items.len);
         result.deinit();
         try std.testing.expectEqual(
@@ -2876,7 +2888,7 @@ test "typed persistent operations roll back every allocation failure point" {
                     persistent_bytes,
                     failing.allocated_bytes - failing.freed_bytes,
                 );
-                var absent = try db.query(&.{input.relation("added", &.{input.variable("x")})});
+                var absent = try db.query(&.{input.relation("added", &.{input.variable("x")})}, &.{});
                 defer absent.deinit();
                 try std.testing.expectEqual(@as(usize, 0), absent.answers.items.len);
             },
@@ -2908,10 +2920,10 @@ test "typed persistent operations roll back every allocation failure point" {
                     persistent_bytes,
                     failing.allocated_bytes - failing.freed_bytes,
                 );
-                var kept = try db.query(&.{input.relation("kept", &.{input.variable("x")})});
+                var kept = try db.query(&.{input.relation("kept", &.{input.variable("x")})}, &.{});
                 defer kept.deinit();
                 try std.testing.expectEqual(@as(i64, 1), try kept.answers.items[0].getInteger("x"));
-                var absent = try db.query(&.{input.relation("derived", &.{input.variable("x")})});
+                var absent = try db.query(&.{input.relation("derived", &.{input.variable("x")})}, &.{});
                 defer absent.deinit();
                 try std.testing.expectEqual(@as(usize, 0), absent.answers.items.len);
             },
@@ -2942,7 +2954,7 @@ test "typed persistent operations roll back every allocation failure point" {
                     persistent_bytes,
                     failing.allocated_bytes - failing.freed_bytes,
                 );
-                var present = try db.query(&.{input.relation("removed", &.{input.variable("x")})});
+                var present = try db.query(&.{input.relation("removed", &.{input.variable("x")})}, &.{});
                 defer present.deinit();
                 try std.testing.expectEqualStrings("value", try present.answers.items[0].getAtom("x"));
             },
@@ -2975,7 +2987,7 @@ test "source persistent statements roll back every allocation failure point" {
                     persistent_bytes,
                     failing.allocated_bytes - failing.freed_bytes,
                 );
-                var absent = try db.query(&.{input.relation("added", &.{input.variable("x")})});
+                var absent = try db.query(&.{input.relation("added", &.{input.variable("x")})}, &.{});
                 defer absent.deinit();
                 try std.testing.expectEqual(@as(usize, 0), absent.answers.items.len);
             },
@@ -2989,7 +3001,7 @@ test "source persistent statements roll back every allocation failure point" {
 /// per index. Enough to say exactly which statements of a program reached the
 /// database and which did not.
 fn nodesPresent(db: *Jatalog, count: usize) !u32 {
-    var answers = try db.query(&.{input.relation("node", &.{input.variable("X")})});
+    var answers = try db.query(&.{input.relation("node", &.{input.variable("X")})}, &.{});
     defer answers.deinit();
     var present: u32 = 0;
     var buffer: [8]u8 = undefined;
@@ -3084,7 +3096,7 @@ test "parsed rules and goals feed the descriptor interface" {
     }
     const goals = try parseGoals(std.testing.allocator, "reach(a, X), X != b?", null);
     defer goals.deinit();
-    var result = try db.query(goals.value);
+    var result = try db.query(goals.value, &.{});
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.answers.items.len);
     try std.testing.expectEqualStrings("c", try result.answers.items[0].getAtom("X"));
@@ -3137,7 +3149,7 @@ test "a source program commits and rolls back one statement at a time" {
     , null);
     program.deinit();
     try std.testing.expectEqual(@as(u32, 0b11101), try nodesPresent(&db, 5));
-    var derived = try db.query(&.{input.relation("reachable", &.{input.variable("X")})});
+    var derived = try db.query(&.{input.relation("reachable", &.{input.variable("X")})}, &.{});
     defer derived.deinit();
     try std.testing.expectEqual(@as(usize, 4), derived.answers.items.len);
 
@@ -3337,12 +3349,12 @@ test "indexed lookups match every structural binding pattern deterministically" 
     try expectAnswerCount(&db, "edge(a, b)?", 1);
     try expectAnswerCount(&db, "edge(c, X)?", 0);
 
-    // Answers arrive in fact insertion order.
+    // Answers arrive in the default answer order, not fact insertion order.
     var ordered = try db.execute("edge(X, c)?", null);
     defer ordered.deinit();
     try std.testing.expectEqual(@as(usize, 2), ordered.query.answers.items.len);
-    try std.testing.expectEqualStrings("b", try ordered.query.answers.items[0].getAtom("X"));
-    try std.testing.expectEqualStrings("a", try ordered.query.answers.items[1].getAtom("X"));
+    try std.testing.expectEqualStrings("a", try ordered.query.answers.items[0].getAtom("X"));
+    try std.testing.expectEqualStrings("b", try ordered.query.answers.items[1].getAtom("X"));
 
     // Bound structural values: proper, nested, improper, and empty lists.
     var proper = try db.execute("holds([1, 2], X)?", null);
@@ -5467,7 +5479,7 @@ fn installPlan(db: *database.Database, executable: *folding.Executable) !void {
 
 fn runPlan(db: *database.Database, executable: *folding.Executable) !results.QueryResult {
     try installPlan(db, executable);
-    return transaction.queryClauses(db, executable.goals);
+    return transaction.queryClauses(db, executable.goals, &.{});
 }
 
 /// Adds one fact without staging a copy of the database, which is what the
@@ -5747,7 +5759,7 @@ test "every answer a folded plan returns is one the query would have returned" {
                 try addAtomPair(&folded.state, "v", names[from], names[to]);
         };
 
-        var produced = try transaction.queryClauses(&folded.state, executable.goals);
+        var produced = try transaction.queryClauses(&folded.state, executable.goals, &.{});
         defer produced.deinit();
         for (produced.answers.items) |answer| {
             const from = (try answer.bindings.items[0].value.getAtom())[0] - 'a';
@@ -6778,7 +6790,7 @@ test "bounded exhaustive models find no counterexample to either discharge" {
                     try Model.addCollected(&folded.state, "v", edges, key);
             }
 
-            var produced = try transaction.queryClauses(&folded.state, executable.goals);
+            var produced = try transaction.queryClauses(&folded.state, executable.goals, &.{});
             defer produced.deinit();
             for (produced.answers.items) |answer| {
                 const column = try Model.indexOf(answer, 0);
@@ -6849,7 +6861,7 @@ test "bounded exhaustive models find no counterexample to either discharge" {
             if (holds) try Model.addCollected(&folded.state, "c", edges, key);
         }
 
-        var produced = try transaction.queryClauses(&folded.state, counted.goals);
+        var produced = try transaction.queryClauses(&folded.state, counted.goals, &.{});
         defer produced.deinit();
         var empty = true;
         for (0..Model.size) |column| empty = empty and !Model.relates(edges, 0, column);
@@ -7562,7 +7574,7 @@ test "bounded exhaustive models find no counterexample to the folded list functi
             defer folded.deinit();
             try ExcessModel.extend(&folded.state, keys, edges);
 
-            var produced = try transaction.queryClauses(&folded.state, executable.goals);
+            var produced = try transaction.queryClauses(&folded.state, executable.goals, &.{});
             defer produced.deinit();
             var seen: usize = 0;
             for (produced.answers.items) |answer| {
@@ -7932,6 +7944,56 @@ fn evenPathQuery(db: *Jatalog) !Fold {
     });
 }
 
+/// The answers' values, one line per answer, in the order they are listed.
+fn orderedTuples(result: *const results.QueryResult) ![][]u8 {
+    const allocator = std.testing.allocator;
+    const lines = try allocator.alloc([]u8, result.answers.items.len);
+    var written: usize = 0;
+    errdefer {
+        for (lines[0..written]) |line| allocator.free(line);
+        allocator.free(lines);
+    }
+    for (result.answers.items, lines) |*answer, *line| {
+        var text: std.Io.Writer.Allocating = .init(allocator);
+        defer text.deinit();
+        for (answer.bindings.items, 0..) |binding, index| {
+            if (index != 0) text.writer.writeByte(' ') catch return error.OutOfMemory;
+            binding.value.write(&text.writer) catch return error.OutOfMemory;
+        }
+        line.* = try text.toOwnedSlice();
+        written += 1;
+    }
+    return lines;
+}
+
+fn expectOrderedTuples(result: *const results.QueryResult, expected: []const []const u8) !void {
+    const tuples = try orderedTuples(result);
+    defer freeLines(tuples);
+    try std.testing.expectEqual(expected.len, tuples.len);
+    for (expected, tuples) |want, actual| try std.testing.expectEqualStrings(want, actual);
+}
+
+test "query lists answers in the order the caller asks for, and a folded plan in the default one" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    _ = try declareEvenPathViews(&db);
+    const fold = try evenPathQuery(&db);
+    var folded = try db.answerFolded(fold);
+    defer folded.deinit();
+    try expectOrderedTuples(&folded, &.{ "a c", "a e", "b d", "c e" });
+
+    var plain: Jatalog = .init(allocator);
+    defer plain.deinit();
+    try plain.addFact("score", &.{ input.atom("ann"), input.integer(3) });
+    try plain.addFact("score", &.{ input.atom("bob"), input.integer(5) });
+    try plain.addFact("score", &.{ input.atom("cat"), input.integer(3) });
+    const goals = [_]input.Goal{input.relation("score", &.{ input.variable("P"), input.variable("S") })};
+    var ranked = try plain.query(&goals, &.{input.descending("S")});
+    defer ranked.deinit();
+    try expectOrderedTuples(&ranked, &.{ "bob 5", "ann 3", "cat 3" });
+}
+
 test "a declared view answers a query about relations the database no longer has" {
     const allocator = std.testing.allocator;
     var db: Jatalog = .init(allocator);
@@ -7985,7 +8047,7 @@ test "a declared view answers a query about relations the database no longer has
     var direct = try db.query(&.{input.relation("v", &.{
         input.variable("X"),
         input.variable("Y"),
-    })});
+    })}, &.{});
     defer direct.deinit();
     try std.testing.expectEqual(@as(usize, 3), direct.answers.items.len);
 }
@@ -8058,7 +8120,7 @@ test "a query inside the availability boundary is its own plan, and a hybrid one
     // all three would have joined the plan's reconstruction of `r` had the
     // plan run against this database rather than against a copy of what the
     // catalog admits.
-    var here = try db.query(&.{input.relation("r", &.{ x, y })});
+    var here = try db.query(&.{input.relation("r", &.{ x, y })}, &.{});
     defer here.deinit();
     try std.testing.expectEqual(@as(usize, 3), here.answers.items.len);
 }
@@ -8453,7 +8515,7 @@ test "a maintained predicate published as a view answers without its own base fa
     try std.testing.expectEqualStrings("a c", tuples[0]);
     try std.testing.expectEqualStrings("b d", tuples[1]);
 
-    var real = try db.query(&.{input.relation("two", &.{ x, y })});
+    var real = try db.query(&.{input.relation("two", &.{ x, y })}, &.{});
     defer real.deinit();
     try std.testing.expectEqual(@as(usize, 2), real.answers.items.len);
 

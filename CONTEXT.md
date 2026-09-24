@@ -174,6 +174,34 @@ or rewrite something would make the text and the descriptor two programs, so
 where the source is richer than the descriptors — a negated built-in such as
 `not X < Y` — the descriptors grow rather than the parser normalizing.
 
+### Answer order
+
+The sequence a query's answers are listed in. A query's answers are a set,
+and ordering is how that set is presented, not part of what it means: it
+never changes which answers exist, so the planner, folding, the plan cache and
+maintenance don't see it, and a fold's guarantee holds whatever order its
+plan's answers are listed in.
+
+Answers always have a deterministic order. With no ordering requested, they
+are sorted by the canonical total order over the answer tuple, with variables
+in the order the query first mentions them. So the same question over the same
+facts lists its answers the same way, whatever join order the planner picked
+or whatever order the facts arrived in. An ordering a query asks for is a
+sequence of *sort keys*: each key names one of the query's variables and a
+direction, ascending or descending, and compares values by the canonical total
+order. No other comparison is offered, so a column mixing numbers, atoms and
+lists sorts without an error. Answers the keys consider equal fall back to the
+default order, so a requested ordering is exactly as deterministic as the
+default one.
+
+A key can only name a variable the answers list. Anything else, including
+names that only appear inside an aggregate's body, is `UnknownVariable` when the
+statement runs, for the same reason asking an answer for that name is. In
+source, the keys go before the terminator: `cost(X, C) order by C desc, X?`.
+Only a query has an order. A retraction removes a set, so neither its source
+nor its descriptor can express one. See
+[ADR 0003](docs/adr/0003-deterministic-answer-order.md).
+
 ### Transaction
 
 The unit a statement runs in (`transaction.zig`): a staging copy of the

@@ -93,14 +93,14 @@ pub fn execute(
                 run.?.staged = true;
                 last = .none;
             },
-            .query, .retraction => |goals| {
+            .query, .retraction => {
                 Run.close(&run);
                 var evaluation = try transaction.Transaction.begin(db, switch (statement) {
                     .query => .query,
                     else => .retraction,
                 });
                 defer evaluation.deinit();
-                var result = try evaluate(&evaluation, statement == .query, goals);
+                var result = try evaluate(&evaluation, statement);
                 errdefer result.deinit();
                 try evaluation.commit(result);
                 last = result;
@@ -154,17 +154,23 @@ pub fn addRule(db: *database.Database, rule: input.Rule) !void {
 
 fn evaluate(
     evaluation: *transaction.Transaction,
-    is_query: bool,
-    goals: []const input.Goal,
+    statement: input.Statement,
 ) !results.ExecutionResult {
     const target = evaluation.target();
+    const goals = switch (statement) {
+        .query => |query| query.goals,
+        .retraction => |goals| goals,
+        .fact, .rule => unreachable,
+    };
     const compiled = try compile.compileGoals(target, goals);
     defer {
         for (compiled) |clause| syntax.freeClauseTree(target.allocator, clause);
         target.allocator.free(compiled);
     }
-    if (is_query) return .{ .query = try transaction.queryClauses(target, compiled) };
-    return .{ .changed = try evaluation.retract(compiled) };
+    return switch (statement) {
+        .query => |query| .{ .query = try transaction.queryClauses(target, compiled, query.order) },
+        else => .{ .changed = try evaluation.retract(compiled) },
+    };
 }
 
 /// Parses and runs a source program against `db`, which is what
@@ -212,7 +218,7 @@ test "a semantic failure keeps earlier statements and names the failing one" {
     var unlocated: parser.Diagnostic = .{};
     const statements = [_]input.Statement{
         .{ .fact = input.fact("r", &.{input.atom("a")}) },
-        .{ .query = &.{input.relation("r", &.{input.variable("X")})} },
+        .{ .query = .{ .goals = &.{input.relation("r", &.{input.variable("X")})} } },
         .{ .rule = input.rule(input.fact("h", &.{input.variable("Y")}), &.{
             input.relation("r", &.{input.variable("X")}),
         }) },
@@ -224,6 +230,72 @@ test "a semantic failure keeps earlier statements and names the failing one" {
     try std.testing.expectEqual(@as(?usize, 2), unlocated.statement);
     try std.testing.expectEqual(@as(?parser.Span, null), unlocated.span);
     try std.testing.expectEqual(@as(usize, 3), db.facts.len());
+}
+
+/// Checks that `variable` takes the values `expected` across the answers, in
+/// the order the answers are listed.
+fn expectColumn(result: *const results.ExecutionResult, variable: []const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, result.query.answers.items.len);
+    for (result.query.answers.items, expected) |*answer, value|
+        try test_support.expectBindingValue(answer, variable, value);
+}
+
+test "answers list in the default answer order whatever order the facts arrived in" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    var result = try runSource(&db,
+        \\v(b, 2). v([a], 1). v(a, 3). v(10, 0). v(2.5, 9). v([], 4).
+        \\v(X, N)?
+    );
+    defer result.deinit();
+    try expectColumn(&result, "X", &.{ "2.5", "10", "a", "b", "[]", "[a]" });
+}
+
+test "sort keys order answers, and ties fall back to the default order" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    var facts = try runSource(&db, "score(dan, 5). score(ann, 3). score(eve, 1). score(bob, 5). score(cat, 3).");
+    facts.deinit();
+
+    var descending = try runSource(&db, "score(P, S) order by S desc?");
+    defer descending.deinit();
+    try expectColumn(&descending, "P", &.{ "bob", "dan", "ann", "cat", "eve" });
+
+    var mixed = try runSource(&db, "score(P, S) order by S, P desc?");
+    defer mixed.deinit();
+    try expectColumn(&mixed, "P", &.{ "eve", "cat", "ann", "dan", "bob" });
+
+    // A repeated key only decides what the keys before it left tied, and the
+    // same key never leaves anything tied.
+    var repeated = try runSource(&db, "score(P, S) order by S desc, S?");
+    defer repeated.deinit();
+    try expectColumn(&repeated, "P", &.{ "bob", "dan", "ann", "cat", "eve" });
+
+    // A hand-built statement carries the same keys the source does.
+    const p = input.variable("P");
+    const s = input.variable("S");
+    var built = try execute(&db, &.{.{ .query = input.query(
+        &.{input.relation("score", &.{ p, s })},
+        &.{ input.ascending("S"), input.descending("P") },
+    ) }}, null, null);
+    defer built.deinit();
+    try expectColumn(&built, "P", &.{ "eve", "cat", "ann", "dan", "bob" });
+}
+
+test "a sort key must name a variable the answers list" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    var facts = try runSource(&db, "score(ann, 3). score(bob, 5).");
+    facts.deinit();
+    try std.testing.expectError(
+        errors.Error.UnknownVariable,
+        runSource(&db, "score(P, S) order by Q?"),
+    );
+    // A variable inside an aggregate's body is not one the answers list.
+    try std.testing.expectError(
+        errors.Error.UnknownVariable,
+        runSource(&db, "score(P, S), setof(X, score(X, S), L) order by X?"),
+    );
 }
 
 test "head tail patterns work in rules and cons syntax is equivalent" {

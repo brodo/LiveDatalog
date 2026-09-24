@@ -126,6 +126,33 @@ Child: bob, Grandchild: carol
 
 The same variable always represents the same value within a query or rule.
 
+### Ordering answers
+
+Answers always come back in the same order, whatever order the facts were
+added in. By default they are sorted by their values: first variable first,
+numbers before atoms, atoms alphabetically, then `[]`, then other lists. That
+is the same order `setof` uses. To choose a different order, add `order by`
+before the `?`:
+
+```datalog
+score(ann, 3).
+score(bob, 5).
+score(cat, 3).
+score(Person, Points) order by Points desc?
+```
+
+```text
+Person: bob, Points: 5
+Person: ann, Points: 3
+Person: cat, Points: 3
+```
+
+Each key is a variable the query binds, followed by `asc` (the default) or
+`desc`. When several answers have the same key values, as `ann` and `cat` do
+here, the default order breaks the tie. A key that names a variable the
+answers don't have reports `UnknownVariable`. Retractions don't take
+`order by`.
+
 ## Rules
 
 Rules derive new relationships from existing ones. `:-` can be read as “if”:
@@ -445,6 +472,9 @@ derived(X) :- source(X), condition(X).
 
 % Query
 derived(X)?
+
+% Query with an answer order (asc is the default)
+score(P, S) order by S desc, P?
 
 % Retraction
 source(X)~

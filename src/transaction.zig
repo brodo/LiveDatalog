@@ -10,6 +10,7 @@ const std = @import("std");
 const compile = @import("compile.zig");
 const database = @import("database.zig");
 const errors = @import("errors.zig");
+const input = @import("input.zig");
 const materialization = @import("materialization.zig");
 const relation_store = @import("relation_store.zig");
 const results = @import("results.zig");
@@ -87,16 +88,84 @@ pub fn addRuleClauses(db: *database.Database, head: syntax.Expr, body: []const s
 /// Evaluates relational, built-in, negated, or aggregate goals. Goals and
 /// their structural terms remain caller-owned and may be freed immediately
 /// after this function returns.
-pub fn queryClauses(db: *database.Database, goals: []const syntax.Clause) !results.QueryResult {
+/// Answers `goals`, listed in the answer order `keys` asks for (see "Answer
+/// order" in CONTEXT.md). A key naming a variable the answers do not list is
+/// `UnknownVariable`, checked before anything is evaluated.
+pub fn queryClauses(
+    db: *database.Database,
+    goals: []const syntax.Clause,
+    keys: []const input.SortKey,
+) !results.QueryResult {
+    const order = try queryVariableOrder(db, goals);
+    defer db.allocator.free(order);
+    const resolved = try resolveSortKeys(db, keys, order);
+    defer db.allocator.free(resolved);
     var internal_answers = try evaluateClauses(db, goals);
     defer {
         for (internal_answers.items) |*answer| answer.deinit(db.allocator);
         internal_answers.deinit(db.allocator);
     }
-    const order = try queryVariableOrder(db, goals);
-    defer db.allocator.free(order);
+    std.sort.pdq(syntax.Binding, internal_answers.items, AnswerOrder{
+        .db = db,
+        .keys = resolved,
+        .variables = order,
+    }, AnswerOrder.lessThan);
     return db.copyQueryResult(internal_answers.items, order);
 }
+
+const ResolvedKey = struct {
+    variable: syntax.Id,
+    direction: input.Direction,
+};
+
+/// The keys as identifiers, each checked against the variables the answers
+/// list. A name the database never interned cannot be one of them.
+fn resolveSortKeys(
+    db: *const database.Database,
+    keys: []const input.SortKey,
+    variables: []const syntax.Id,
+) ![]ResolvedKey {
+    const resolved = try db.allocator.alloc(ResolvedKey, keys.len);
+    errdefer db.allocator.free(resolved);
+    for (keys, resolved) |key, *out| {
+        const id = db.strings.get(key.variable) orelse return errors.Error.UnknownVariable;
+        if (std.mem.indexOfScalar(syntax.Id, variables, id) == null)
+            return errors.Error.UnknownVariable;
+        out.* = .{ .variable = id, .direction = key.direction };
+    }
+    return resolved;
+}
+
+/// The requested keys first, then every listed variable ascending, so that
+/// answers the keys leave tied fall back to the default order and the whole
+/// order is total over distinct answers.
+const AnswerOrder = struct {
+    db: *const database.Database,
+    keys: []const ResolvedKey,
+    variables: []const syntax.Id,
+
+    fn lessThan(self: AnswerOrder, a: syntax.Binding, b: syntax.Binding) bool {
+        for (self.keys) |key| {
+            const order = self.compareAt(a, b, key.variable);
+            if (order != .eq) return if (key.direction == .ascending) order == .lt else order == .gt;
+        }
+        for (self.variables) |variable| {
+            const order = self.compareAt(a, b, variable);
+            if (order != .eq) return order == .lt;
+        }
+        return false;
+    }
+
+    /// An answer that leaves the variable unbound sorts before one that
+    /// binds it.
+    fn compareAt(self: AnswerOrder, a: syntax.Binding, b: syntax.Binding, variable: syntax.Id) std.math.Order {
+        const left = a.values.get(variable);
+        const right = b.values.get(variable);
+        if (left == null or right == null)
+            return std.math.order(@intFromBool(left != null), @intFromBool(right != null));
+        return self.db.eval.compareValues(left.?, right.?);
+    }
+};
 
 /// The query's variables in the order it first mentions them, which is the
 /// order its answers list them in. Built from the goals as written rather than
@@ -359,7 +428,6 @@ pub const Transaction = struct {
 };
 
 const testing = std.testing;
-const input = @import("input.zig");
 
 /// Installs `reachable(X) :- node(X)`, which is enough of a rule for a
 /// retraction to have a derived consequence to lose. Built from descriptors
