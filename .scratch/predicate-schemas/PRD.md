@@ -279,7 +279,8 @@ bad(X) :- raw(X).                               % IllTyped once bad has a schema
     written by the caller.
   - The claim above that a comparison on an `any` operand "is skipped on
     `NumericType`" is only true for seeded structural rules. Ordinary rules
-    and queries raise `NumericType`, as they did before schemas.
+    and queries raise `NumericType`, as they did before schemas. Filed as
+    `.scratch/numeric-type-in-rules/issues/01-numeric-type-poisons-evaluation.md`.
   - `schema Age(...)` (an uppercase name) isn't taken as a schema
     declaration; it parses as a clause and fails there.
 - The view catalog used "schema" internally for a view's column kinds. It

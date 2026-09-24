@@ -697,3 +697,49 @@ fn schemaAllocationScenario(allocator: std.mem.Allocator) !void {
 test "declaring and checking schemas release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(schemaAllocationScenario);
 }
+
+/// Runs one program's statements against `db`, then an update after the
+/// closure exists, so that maintenance has something to maintain.
+fn runMaintained(db: *database.Database, schemas: []const u8) !void {
+    try runQuietly(db, schemas);
+    try runQuietly(db,
+        \\edge(a, b). edge(b, c). weight(a, 1). weight(b, 2).
+        \\reach(X, Y) :- edge(X, Y).
+        \\reach(X, Z) :- reach(X, Y), edge(Y, Z).
+        \\heavier(X, N) :- weight(X, W), N = W + 1.
+        \\targets(X, S) :- weight(X, W), setof(Y, reach(X, Y), S).
+        \\reach(a, Y)?
+    );
+    try runQuietly(db, "edge(c, d). weight(c, 3). reach(X, Y)?");
+    try runQuietly(db, "edge(a, b)~");
+    try runQuietly(db, "targets(X, S)?");
+}
+
+test "schemas change nothing about how a program is maintained" {
+    var untyped: database.Database = .init(std.testing.allocator);
+    defer untyped.deinit();
+    try runMaintained(&untyped, "");
+    var typed: database.Database = .init(std.testing.allocator);
+    defer typed.deinit();
+    try runMaintained(&typed,
+        \\schema edge(atom, atom).
+        \\schema weight(atom, int).
+        \\schema reach(atom, atom).
+        \\schema heavier(atom, int).
+        \\schema targets(atom, list(atom)).
+    );
+    try std.testing.expectEqual(@as(usize, 5), typed.schemas.count());
+    // The retraction did reach incremental maintenance — delete-and-rederive
+    // and a maintained aggregate group — rather than the stats being equal
+    // because both are empty. Fact statements dirty the closure and rebuild
+    // it lazily, which the stratum expansions count.
+    const stats = typed.maintenanceStats();
+    try std.testing.expect(stats.maintain_choices > 0);
+    try std.testing.expect(stats.overdeleted_facts > 0);
+    try std.testing.expect(stats.maintained_groups > 0);
+    try std.testing.expect(stats.stratum_expansions > 1);
+    try std.testing.expectEqual(untyped.maintenanceStats(), typed.maintenanceStats());
+    try std.testing.expectEqual(untyped.eval.cost.work, typed.eval.cost.work);
+    try std.testing.expectEqual(untyped.closure.?.len(), typed.closure.?.len());
+    try test_support.expectClosureMatchesRebuild(&typed);
+}
