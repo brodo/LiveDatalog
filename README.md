@@ -57,6 +57,13 @@ through [linenoize](https://github.com/hazre/linenoize/tree/feat/port-zig-0.16).
 For a guided introduction to facts, queries, rules, recursion, negation,
 lists, and aggregation, read the [LiveDatalog language tutorial](docs/language-tutorial.md).
 
+### Editor support
+
+[`tree-sitter-livedatalog`](tree-sitter-livedatalog) is a tree-sitter grammar
+for `.dl` files. It includes highlighting, scope and folding queries for
+editors that use tree-sitter. For diagnostics, hover and go to definition,
+connect the editor to the development server's language listener.
+
 ### Development server
 
 `zig build` installs a second binary, `LiveDatalogServer`, for local

@@ -1,0 +1,26 @@
+{
+  "name": "tree-sitter-livedatalog",
+  "version": "0.1.0",
+  "description": "LiveDatalog grammar for tree-sitter",
+  "private": true,
+  "keywords": [
+    "incremental",
+    "parsing",
+    "tree-sitter",
+    "livedatalog",
+    "datalog"
+  ],
+  "files": [
+    "grammar.js",
+    "tree-sitter.json",
+    "queries/*",
+    "src/**"
+  ],
+  "devDependencies": {
+    "tree-sitter-cli": "^0.27.0"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test && tree-sitter parse --quiet ../examples/*.dl ../examples/*/*.dl"
+  }
+}

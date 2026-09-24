@@ -1,0 +1,35 @@
+% A comment
+% <- comment
+
+schema age(Person: atom, Years: int).
+% <- keyword
+%      ^ function
+%          ^ variable.parameter
+%                  ^ type.builtin
+
+adult(P) :- age(P, Y), not minor(P), Y >= 18.
+% <- function
+%     ^ variable
+%        ^ operator
+%           ^ function
+%                      ^ keyword
+%                          ^ function
+%                                      ^ operator
+%                                         ^ number
+
+kids(X, S) :- person(X), setof(Y, parent(X, Y), S).
+%                        ^ function.builtin
+
+name(alice, "Alice").
+%    ^ constant
+%           ^ string
+
+score(P, S) order by S desc?
+%           ^ keyword
+%                      ^ keyword
+
+p(schema, cons, [H!T], cons(a, [])).
+% ^ constant
+%         ^ constant
+%                 ^ operator
+%                      ^ function.builtin

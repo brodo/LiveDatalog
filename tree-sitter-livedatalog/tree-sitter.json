@@ -1,0 +1,25 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "livedatalog",
+      "camelcase": "LiveDatalog",
+      "title": "LiveDatalog",
+      "scope": "source.livedatalog",
+      "file-types": [
+        "dl"
+      ],
+      "injection-regex": "^(livedatalog|datalog)$",
+      "class-name": "TreeSitterLiveDatalog",
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "description": "LiveDatalog grammar for tree-sitter",
+    "links": {
+      "repository": "https://github.com/brodo/LiveDatalog"
+    }
+  }
+}
