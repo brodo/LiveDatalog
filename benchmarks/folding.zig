@@ -113,6 +113,7 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     // its own because it happens once and execution happens per call.
     const planning_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     const plan = try folded.foldQuery(&question, &.{});
+    defer plan.deinit();
     const planning: u64 = @intCast(planning_start.untilNow(init.io).raw.nanoseconds);
     if (plan.guarantee != .maximally_contained) return error.UnexpectedGuarantee;
     var reconstructed = try folded.foldReconstructions(plan);
@@ -125,10 +126,11 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
 
     const cached_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     const again = try folded.foldQuery(&question, &.{});
+    defer again.deinit();
     const cached_planning: u64 = @intCast(cached_start.untilNow(init.io).raw.nanoseconds);
     if (!again.reused) return error.PlanNotReused;
 
-    var warmup = try folded.answerFolded(plan);
+    var warmup = try folded.answerFolded(plan, &.{});
     const rows = warmup.answers.items.len;
     warmup.deinit();
     if (rows == 0) return error.UnexpectedResult;
@@ -145,7 +147,7 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
         try applyChange(&folded, workload, round);
         const work_before = folded.evaluationWork();
         const start = std.Io.Clock.Timestamp.now(init.io, .awake);
-        var answers = try folded.answerFolded(plan);
+        var answers = try folded.answerFolded(plan, &.{});
         first += @intCast(start.untilNow(init.io).raw.nanoseconds);
         defer answers.deinit();
         first_work = folded.evaluationWork() - work_before;
@@ -154,13 +156,13 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
 
     // And the same call with nothing changed in between, which finds the
     // reconstruction already derived.
-    var repeated_warmup = try folded.answerFolded(plan);
+    var repeated_warmup = try folded.answerFolded(plan, &.{});
     repeated_warmup.deinit();
     var repeated_work: u64 = 0;
     const repeated_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     for (0..iterations) |_| {
         const work_before = folded.evaluationWork();
-        var answers = try folded.answerFolded(plan);
+        var answers = try folded.answerFolded(plan, &.{});
         defer answers.deinit();
         repeated_work = folded.evaluationWork() - work_before;
         if (answers.answers.items.len != rows) return error.UnexpectedResult;
@@ -173,7 +175,7 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     var plain = LiveDatalog.Jatalog.init(allocator);
     defer plain.deinit();
     try loadRelation(&plain, workload);
-    var plain_warmup = try plain.query(&question);
+    var plain_warmup = try plain.query(&question, &.{});
     const plain_rows = plain_warmup.answers.items.len;
     plain_warmup.deinit();
     if (plain_rows != rows) return error.UnexpectedResult;
@@ -182,7 +184,7 @@ fn run(init: std.process.Init, workload: Workload) !Timings {
     const direct_start = std.Io.Clock.Timestamp.now(init.io, .awake);
     for (0..iterations) |_| {
         const work_before = plain.evaluationWork();
-        var answers = try plain.query(&question);
+        var answers = try plain.query(&question, &.{});
         defer answers.deinit();
         direct_work = plain.evaluationWork() - work_before;
         if (answers.answers.items.len != rows) return error.UnexpectedResult;
