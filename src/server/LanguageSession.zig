@@ -123,6 +123,76 @@ const Document = struct {
     }
 };
 
+/// The ranges of every occurrence of the variable written at `position` in
+/// `document`'s last good parse, or null when no variable is written there.
+fn variableRanges(
+    arena: std.mem.Allocator,
+    document: *const Document,
+    position: types.Position,
+    encoding: offsets.Encoding,
+) !?[]const types.Range {
+    const text = document.parsed_text orelse return null;
+    const program = document.parsed.?.value;
+    const index = program.variableAt(offsets.positionToIndex(text, position, encoding)) orelse return null;
+    var ranges: Ranges = .{ .text = text, .encoding = encoding };
+    var found: std.ArrayList(types.Range) = .empty;
+    var occurrences: VariableOccurrences = .init(program, index);
+    while (occurrences.next()) |variable| try found.append(arena, ranges.of(variable.span));
+    return found.items;
+}
+
+/// The occurrences of one variable in a program, in source order. See
+/// "Variable scope" in CONTEXT.md.
+const VariableOccurrences = struct {
+    program: LiveDatalog.Program,
+    /// The occurrence it was found from.
+    variable: VariableAt,
+    scope: ?usize,
+    index: usize = 0,
+
+    const VariableAt = @typeInfo(@FieldType(LiveDatalog.Program, "variables")).pointer.child;
+
+    fn init(program: LiveDatalog.Program, index: usize) VariableOccurrences {
+        return .{ .program = program, .variable = program.variables[index], .scope = variableScope(program, index) };
+    }
+
+    fn next(self: *VariableOccurrences) ?VariableAt {
+        while (self.index < self.program.variables.len) {
+            const index = self.index;
+            self.index += 1;
+            const variable = self.program.variables[index];
+            if (variable.statement != self.variable.statement) continue;
+            if (!std.mem.eql(u8, variable.name, self.variable.name)) continue;
+            if (variableScope(self.program, index) != self.scope) continue;
+            return variable;
+        }
+        return null;
+    }
+};
+
+/// The `setof` that `program.variables[index]` belongs to, or null for its
+/// statement: the outermost level, out from where it is written, that writes
+/// its name itself. Occurrences in sibling aggregates are not written by an
+/// enclosing level, so they stay apart.
+fn variableScope(program: LiveDatalog.Program, index: usize) ?usize {
+    const variable = program.variables[index];
+    var scope = variable.aggregate;
+    var level = variable.aggregate;
+    while (level) |aggregate| {
+        const parent = program.aggregates[aggregate].parent;
+        for (program.variables) |other| {
+            if (other.statement == variable.statement and other.aggregate == parent and
+                std.mem.eql(u8, other.name, variable.name))
+            {
+                scope = parent;
+                break;
+            }
+        }
+        level = parent;
+    }
+    return scope;
+}
+
 const NameAt = struct {
     predicate: []const u8,
     arity: usize,
@@ -800,9 +870,13 @@ pub fn @"textDocument/documentHighlight"(
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
     const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
-    const name = document.nameAt(params.position, self.encoding) orelse return null;
-
     var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+    const name = document.nameAt(params.position, self.encoding) orelse {
+        const ranges = try variableRanges(arena, document, params.position, self.encoding) orelse return null;
+        for (ranges) |range| try highlights.append(arena, .{ .range = range, .kind = .Text });
+        return highlights.items;
+    };
+
     var ranges: Ranges = .{ .text = document.parsed_text.?, .encoding = self.encoding };
     var occurrences = Occurrences.init(document.parsed.?.value, name.predicate, name.arity);
     while (occurrences.next()) |occurrence| try highlights.append(arena, .{
@@ -820,7 +894,17 @@ pub fn @"textDocument/references"(
     arena: std.mem.Allocator,
     params: types.reference.Params,
 ) !?[]const types.Location {
-    const name = try self.nameAt(arena, params.textDocument.uri, params.position) orelse return null;
+    const name = try self.nameAt(arena, params.textDocument.uri, params.position) orelse {
+        // A variable's references are in its statement, in this document.
+        const io = self.engine.io;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
+        const ranges = try variableRanges(arena, document, params.position, self.encoding) orelse return null;
+        const locations = try arena.alloc(types.Location, ranges.len);
+        for (locations, ranges) |*location, range| location.* = .{ .uri = params.textDocument.uri, .range = range };
+        return locations;
+    };
     const locations = try self.onEngine([]const types.Location, references, .{
         arena,
         name.predicate,
@@ -1016,18 +1100,37 @@ pub fn @"textDocument/completion"(
     arena: std.mem.Allocator,
     params: types.completion.Params,
 ) !?types.completion.Result {
+    var variables: []const []const u8 = &.{};
     const place = place: {
         const io = self.engine.io;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const document = self.documents.getPtr(params.textDocument.uri) orelse break :place .none;
         const offset = offsets.positionToIndex(document.text, params.position, self.encoding);
-        break :place completionPlace(document.text, offset);
+        const found = scan(document.text, offset);
+        if (found.variables) {
+            const names = try statementVariables(arena, document.text, found.statement_start, found.word_start);
+            // The names borrow from the draft, which may change once unlocked.
+            const copied = try arena.alloc([]const u8, names.len);
+            for (copied, names) |*to, name| to.* = try arena.dupe(u8, name);
+            variables = copied;
+        }
+        break :place found.place;
     };
-    if (place == .none) return .{ .completion_items = &.{} };
-
-    const defined = try self.onEngine([]const Defined, definedPredicates, .{ arena, self.encoding });
     var items: std.ArrayList(types.completion.Item) = .empty;
+    if (place != .none) try self.appendPredicates(arena, &items, place);
+    for (variables) |name| try items.append(arena, .{ .label = name, .kind = .Variable });
+    return .{ .completion_items = items.items };
+}
+
+/// The predicates, and in a goal the keywords, completion offers at `place`.
+fn appendPredicates(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    items: *std.ArrayList(types.completion.Item),
+    place: Place,
+) !void {
+    const defined = try self.onEngine([]const Defined, definedPredicates, .{ arena, self.encoding });
     if (place == .goal) try items.appendSlice(arena, &.{
         .{ .label = "not", .kind = .Keyword },
         .{
@@ -1052,7 +1155,6 @@ pub fn @"textDocument/completion"(
         },
         .insertTextFormat = if (place == .goal) .Snippet else .PlainText,
     });
-    return .{ .completion_items = items.items };
 }
 
 /// What completion may insert at a place in a draft.
@@ -1077,6 +1179,12 @@ const Call = struct {
 const Scan = struct {
     place: Place,
     call: ?Call,
+    /// Whether a variable may be typed there.
+    variables: bool = false,
+    /// Where the statement it is in starts, and where the word being typed
+    /// does.
+    statement_start: usize = 0,
+    word_start: usize = 0,
 };
 
 fn completionPlace(text: []const u8, offset: usize) Place {
@@ -1095,6 +1203,9 @@ fn scan(text: []const u8, offset: usize) Scan {
     while (cursor > 0 and isWordByte(text[cursor - 1])) cursor -= 1;
     // A variable or a number is being typed.
     const typing_value = cursor < end and !(std.ascii.isLower(text[cursor]) or text[cursor] == '_');
+    const typing_variable_or_nothing = cursor == end or std.ascii.isUpper(text[cursor]);
+    // Where the statement the cursor is in starts.
+    var statement_begin: usize = 0;
 
     const Frame = struct {
         kind: enum { arguments, group, list, setof },
@@ -1210,6 +1321,7 @@ fn scan(text: []const u8, offset: usize) Scan {
                 statement_start = true;
                 schema_name = false;
                 in_schema = false;
+                statement_begin = i;
             },
             else => goal = false,
         }
@@ -1231,7 +1343,46 @@ fn scan(text: []const u8, offset: usize) Scan {
         .goal
     else
         .none;
-    return .{ .place = place, .call = call };
+    return .{
+        .place = place,
+        .call = call,
+        .variables = typing_variable_or_nothing and !in_quote and !in_schema,
+        .statement_start = statement_begin,
+        .word_start = cursor,
+    };
+}
+
+/// The variable names written in the statement of `text` starting at
+/// `start`, each once, leaving out the word starting at `typed`. Read from
+/// the text alone, like `scan`.
+fn statementVariables(arena: std.mem.Allocator, text: []const u8, start: usize, typed: usize) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var i = start;
+    while (i < text.len) {
+        const c = text[i];
+        if (c == '%' or std.mem.startsWith(u8, text[i..], "//")) {
+            i = std.mem.findScalarPos(u8, text, i, '\n') orelse text.len;
+        } else if (std.mem.startsWith(u8, text[i..], "/*")) {
+            i = if (std.mem.findPos(u8, text, i + 2, "*/")) |close| close + 2 else text.len;
+        } else if (c == '"' or c == '\'') {
+            i += 1;
+            while (i < text.len and text[i] != c) i += if (text[i] == '\\') 2 else 1;
+            i += 1;
+        } else if (isWordByte(c)) {
+            const word_end = wordEnd(text, i);
+            const word = text[i..word_end];
+            const known = for (names.items) |name| {
+                if (std.mem.eql(u8, name, word)) break true;
+            } else false;
+            if (std.ascii.isUpper(c) and i != typed and !known) try names.append(arena, word);
+            i = word_end;
+        } else if (c == '.' or c == '?' or c == '~') {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    return names.items;
 }
 
 fn writeColumnType(writer: *Io.Writer, column_type: LiveDatalog.input.ColumnType) Io.Writer.Error!void {
@@ -1430,25 +1581,30 @@ pub fn @"textDocument/prepareRename"(
     arena: std.mem.Allocator,
     params: types.prepare_rename.Params,
 ) !?types.prepare_rename.Result {
-    const parsed_name: ?NameAt = name: {
+    const Placeholder = types.prepare_rename.Placeholder;
+    const found: ?Placeholder = found: {
         const io = self.engine.io;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
-        if (document.syntax_error != null) break :name null;
-        const name = document.nameAt(params.position, self.encoding) orelse return null;
-        break :name NameAt{
-            .predicate = try arena.dupe(u8, name.predicate),
-            .arity = name.arity,
+        if (document.syntax_error != null) break :found null;
+        if (document.nameAt(params.position, self.encoding)) |name| break :found .{
             .range = name.range,
+            .placeholder = try predicateSource(arena, name.predicate),
+        };
+        const text = document.parsed_text.?;
+        const program = document.parsed.?.value;
+        const offset = offsets.positionToIndex(text, params.position, self.encoding);
+        const variable = program.variables[program.variableAt(offset) orelse return null];
+        var ranges: Ranges = .{ .text = text, .encoding = self.encoding };
+        break :found .{
+            .range = ranges.of(variable.span),
+            .placeholder = try arena.dupe(u8, variable.name),
         };
     };
-    const name = parsed_name orelse
+    const placeholder = found orelse
         return self.refuse("This document does not parse; fix it before renaming.", arena, .{});
-    return .{ .prepare_rename_placeholder = .{
-        .range = name.range,
-        .placeholder = try predicateSource(arena, name.predicate),
-    } };
+    return .{ .prepare_rename_placeholder = placeholder };
 }
 
 pub fn @"textDocument/rename"(
@@ -1456,6 +1612,7 @@ pub fn @"textDocument/rename"(
     arena: std.mem.Allocator,
     params: types.rename.Params,
 ) !?types.WorkspaceEdit {
+    if (try self.renameVariable(arena, params)) |edit| return edit;
     const typed = std.mem.trim(u8, params.newName, " \t\r\n");
     if (typed.len != 0 and std.ascii.isUpper(typed[0]))
         return self.refuse("`{s}` would read as a variable; a predicate's name starts in lowercase.", arena, .{typed});
@@ -1497,9 +1654,6 @@ pub fn @"textDocument/rename"(
     };
 
     const new_text = try predicateSource(arena, new_name);
-    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child)
-        .pointer.child;
-    const TextEdit = @typeInfo(@FieldType(types.TextDocument.Edit, "edits")).pointer.child;
     var changes: std.ArrayList(DocumentChange) = .empty;
     for (texts, programs) |text, program| {
         var edits: std.ArrayList(TextEdit) = .empty;
@@ -1517,6 +1671,58 @@ pub fn @"textDocument/rename"(
     }
     return .{ .documentChanges = changes.items };
 }
+
+/// Renames the variable written at the position within its scope, in that
+/// document alone, since a statement never spans two. Null when no variable
+/// is written there in a draft that parses now.
+fn renameVariable(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.rename.Params,
+) !?types.WorkspaceEdit {
+    const io = self.engine.io;
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
+    if (document.syntax_error != null) return null;
+    const text = document.parsed_text orelse return null;
+    const program = document.parsed.?.value;
+    const index = program.variableAt(offsets.positionToIndex(text, params.position, self.encoding)) orelse
+        return null;
+    const variable = program.variables[index];
+
+    const new_name = std.mem.trim(u8, params.newName, " \t\r\n");
+    const valid = new_name.len != 0 and std.ascii.isUpper(new_name[0]) and for (new_name) |c| {
+        if (!isWordByte(c)) break false;
+    } else true;
+    if (!valid) return self.refuse("`{s}` is not a variable's name, which starts in uppercase.", arena, .{new_name});
+    if (std.mem.eql(u8, new_name, variable.name)) return .{ .documentChanges = &.{} };
+    // Checked across the whole statement, not the scope: a name used in a
+    // nested `setof` would otherwise be captured by the renamed variable.
+    for (program.variables) |other| {
+        if (other.statement == variable.statement and std.mem.eql(u8, other.name, new_name))
+            return self.refuse("`{s}` is already used in this statement.", arena, .{new_name});
+    }
+
+    var edits: std.ArrayList(TextEdit) = .empty;
+    var ranges: Ranges = .{ .text = text, .encoding = self.encoding };
+    var occurrences: VariableOccurrences = .init(program, index);
+    while (occurrences.next()) |occurrence| try edits.append(arena, .{ .text_edit = .{
+        .range = ranges.of(occurrence.span),
+        .newText = try arena.dupe(u8, new_name),
+    } });
+    const changes = try arena.alloc(DocumentChange, 1);
+    changes[0] = .{ .text_document_edit = .{
+        .textDocument = .{ .uri = params.textDocument.uri, .version = document.version },
+        .edits = edits.items,
+    } };
+    return .{ .documentChanges = changes };
+}
+
+/// One document's edits within a `WorkspaceEdit`, and one edit within those.
+const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child)
+    .pointer.child;
+const TextEdit = @typeInfo(@FieldType(types.TextDocument.Edit, "edits")).pointer.child;
 
 /// Whether any of `programs` declares a schema for `predicate`.
 fn hasSchema(programs: []const LiveDatalog.Program, predicate: []const u8) bool {
@@ -2028,7 +2234,7 @@ test "document highlight writes definitions and reads uses, in the draft" {
 
     // `p/2` is another predicate.
     try testing.expectEqual(@as(usize, 1), (try t.highlights("a.dl", 1, 19)).len);
-    try testing.expectEqual(@as(usize, 0), (try t.highlights("a.dl", 1, 3)).len);
+    try testing.expectEqual(@as(usize, 0), (try t.highlights("a.dl", 1, 5)).len);
 }
 
 test "references span the loaded files and can leave out definitions" {
@@ -2175,7 +2381,10 @@ test "completion offers predicates where a goal can start" {
     try testing.expectEqualStrings("age", schema[1].insertText.?);
     try testing.expectEqual(types.InsertTextFormat.PlainText, schema[1].insertTextFormat.?);
 
-    try testing.expectEqual(@as(usize, 0), (try t.completions("r.dl", 0, 12)).len);
+    // Arguments get the statement's variables, not predicates.
+    const arguments = try t.completions("r.dl", 0, 12);
+    try testing.expectEqual(@as(usize, 1), arguments.len);
+    try testing.expectEqualStrings("X", arguments[0].label);
     try testing.expectEqual(@as(usize, 0), (try t.completions("unopened.dl", 0, 0)).len);
 }
 
@@ -2330,4 +2539,82 @@ test "rename edits the working text of every file" {
         .position = .{ .line = 0, .character = 1 },
     }));
     try expectContains(try t.written(), "This document does not parse");
+}
+
+test "variables are highlighted, referenced and renamed within their scope" {
+    var t: TestSession = undefined;
+    try t.init(&.{});
+    defer t.deinit();
+    const arena = t.arena.allocator();
+    _ = t.session.initialize(arena, .{ .capabilities = .{} });
+    try t.open("a.dl",
+        \\r(S, T) :- setof(Y, p(a, Y), S), setof(Y, p(Y, d), T).
+        \\t(Y, S) :- setof(Y, p(Y, Z), S), p(Y, W).
+        \\u(X) :- p(X, W), setof(Y, (q(X, Y), setof(Z, s(Y, Z), L)), S).
+        \\v(X) :- p(X, Z), setof(Y, (q(X, Y), setof(Z, s(Y, Z), L)), S).
+        \\
+    );
+
+    // Sibling aggregates keep their Ys apart; an outer Y joins them.
+    const sibling = try t.highlights("a.dl", 0, 18);
+    try testing.expectEqual(@as(usize, 2), sibling.len);
+    try testing.expectEqual(types.DocumentHighlight.Kind.Text, sibling[0].kind.?);
+    try testing.expectEqual(@as(u32, 17), sibling[0].range.start.character);
+    try testing.expectEqual(@as(u32, 25), sibling[1].range.start.character);
+    try testing.expectEqual(@as(usize, 4), (try t.highlights("a.dl", 1, 2)).len);
+    // Z in the nested setof is its own; X is shared all the way in.
+    try testing.expectEqual(@as(usize, 2), (try t.highlights("a.dl", 2, 43)).len);
+    try testing.expectEqual(@as(usize, 1), (try t.highlights("a.dl", 2, 13)).len);
+    try testing.expectEqual(@as(usize, 3), (try t.highlights("a.dl", 2, 2)).len);
+    // Written by the statement itself, the nested Z is the statement's.
+    try testing.expectEqual(@as(usize, 3), (try t.highlights("a.dl", 3, 43)).len);
+
+    const found = try t.references("a.dl", 1, 2, true);
+    try testing.expectEqual(@as(usize, 4), found.len);
+    try testing.expectEqualStrings(try t.uri("a.dl"), found[0].uri);
+
+    const prepared = (try t.session.@"textDocument/prepareRename"(arena, .{
+        .textDocument = .{ .uri = try t.uri("a.dl") },
+        .position = .{ .line = 0, .character = 18 },
+    })).?.prepare_rename_placeholder;
+    try testing.expectEqualStrings("Y", prepared.placeholder);
+
+    const renamed = try t.rename("a.dl", 0, 18, "Item");
+    try expectEdits(renamed, try t.uri("a.dl"), 1, "Item", &.{ .{ 0, 17, 18 }, .{ 0, 25, 26 } });
+    try t.expectRefused("a.dl", 0, 18, "item", "is not a variable's name");
+    try t.expectRefused("a.dl", 0, 18, "S", "`S` is already used in this statement.");
+    // Renaming X to Z would capture the nested setof's Z.
+    try t.expectRefused("a.dl", 2, 2, "Z", "`Z` is already used in this statement.");
+    try testing.expectEqual(@as(usize, 0), (try t.rename("a.dl", 0, 18, "Y")).documentChanges.?.len);
+}
+
+test "completion offers the statement's variables" {
+    var t: TestSession = undefined;
+    try t.init(&.{});
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+    const text = "p(A). q(Xs, Y) :- p(Xs, ab), Y < X, r('Q', \"Z\") % W\n, s(Y). t(B)?";
+    try t.open("a.dl", text);
+    const after = struct {
+        fn of(needle: []const u8) u32 {
+            return @intCast(std.mem.find(u8, text, needle).? + needle.len);
+        }
+    }.of;
+
+    const labels = struct {
+        fn of(items: []const types.completion.Item) ![]const u8 {
+            var out: Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            for (items) |item| if (item.kind == .Variable) try out.writer.print("{s} ", .{item.label});
+            return testing.allocator.dupe(u8, out.written());
+        }
+    }.of;
+    // After `Y < X`: the statement's names, but not the X being typed.
+    const typed = try labels(try t.completions("a.dl", 0, after("Y < X")));
+    defer testing.allocator.free(typed);
+    try testing.expectEqualStrings("Xs Y ", typed);
+    // A lowercase word in an argument is an atom.
+    const atom = try labels(try t.completions("a.dl", 0, after("ab")));
+    defer testing.allocator.free(atom);
+    try testing.expectEqualStrings("", atom);
 }

@@ -651,3 +651,17 @@ the language listener *says* about a predicate reads the loaded files; a
 *rename*, which changes text rather than describing the database, reads the
 working text of every file in the directory, since its edits land on exactly
 that text (see [ADR 0007](docs/adr/0007-rename-reads-working-text.md)).
+
+### Variable scope
+
+The occurrences of a variable name that are one variable. A variable is
+scoped to its statement, except that one occurring only inside a `setof` —
+its template, goal and nested aggregates, but not its result — belongs to that
+`setof`, and is a different variable from the same name anywhere else. With
+nested aggregates it belongs to the innermost one it does not escape, and
+occurrences in a sibling aggregate do not count as escaping. Where in the
+statement the outside occurrence is makes no difference, since the outer goals
+are bound first: in `t(Y, S) :- setof(Y, p(Y, Z), S), p(Y, W).` the `Y`s are
+one variable, while in `r(S, T) :- setof(Y, p(a, Y), S), setof(Y, p(Y, d), T).`
+they are two. Only a name starting with an uppercase letter is a variable;
+`_` is an atom.

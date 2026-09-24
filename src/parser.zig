@@ -107,6 +107,11 @@ pub const Program = struct {
     /// Every place a predicate is named, in source order: fact and rule
     /// heads, goals in bodies, queries and retractions, and schemas.
     names: []const Name = &.{},
+    /// Every place a variable is written, in source order, `order by` keys
+    /// included. A schema's column names are not variables.
+    variables: []const Variable = &.{},
+    /// Every `setof`, in the order they start.
+    aggregates: []const Aggregate = &.{},
 
     /// The predicate named at byte `offset`, if any. An offset just past a
     /// name's end still names it, as a cursor after the last letter does.
@@ -117,6 +122,34 @@ pub const Program = struct {
         }
         return null;
     }
+
+    /// The index in `variables` of the variable written at byte `offset`, if
+    /// any, read as `nameAt` reads names.
+    pub fn variableAt(self: Program, offset: usize) ?usize {
+        for (self.variables, 0..) |variable, index| {
+            if (variable.span.start > offset) break;
+            if (offset <= variable.span.end) return index;
+        }
+        return null;
+    }
+};
+
+/// One place a variable is written.
+pub const Variable = struct {
+    name: []const u8,
+    span: Span,
+    /// The index of the statement it is written in.
+    statement: usize,
+    /// The index in `aggregates` of the innermost `setof` whose template or
+    /// goal it is written in; null outside every one. A `setof`'s result is
+    /// outside it.
+    aggregate: ?usize,
+};
+
+/// One `setof`.
+pub const Aggregate = struct {
+    /// The `setof` whose template or goal it is written in, if any.
+    parent: ?usize,
 };
 
 /// One place a predicate is named. `span` covers the name as written,
@@ -197,6 +230,12 @@ const Parser = struct {
     statement: ?usize = null,
     /// Where predicates are named, recorded only when parsing a program.
     names: ?*std.ArrayList(Name) = null,
+    /// Where variables are written and where each `setof` sits, recorded
+    /// only when parsing a program.
+    variables: ?*std.ArrayList(Variable) = null,
+    aggregates: ?*std.ArrayList(Aggregate) = null,
+    /// The `setof` whose template or goal is being parsed, if any.
+    aggregate: ?usize = null,
     /// Where the last bare word or quoted atom ended, so that a name's span
     /// leaves out the space and comments after it.
     token_end: usize = 0,
@@ -205,8 +244,16 @@ const Parser = struct {
         var statements: std.ArrayList(input.Statement) = .empty;
         var spans: std.ArrayList(Span) = .empty;
         var names: std.ArrayList(Name) = .empty;
+        var variables: std.ArrayList(Variable) = .empty;
+        var aggregates: std.ArrayList(Aggregate) = .empty;
         self.names = &names;
-        defer self.names = null;
+        self.variables = &variables;
+        self.aggregates = &aggregates;
+        defer {
+            self.names = null;
+            self.variables = null;
+            self.aggregates = null;
+        }
         while (true) {
             self.skipSpace();
             if (self.index == self.source.len) break;
@@ -215,7 +262,13 @@ const Parser = struct {
             try statements.append(self.arena, try self.parseStatement());
             try spans.append(self.arena, .{ .start = start, .end = self.index });
         }
-        return .{ .statements = statements.items, .spans = spans.items, .names = names.items };
+        return .{
+            .statements = statements.items,
+            .spans = spans.items,
+            .names = names.items,
+            .variables = variables.items,
+            .aggregates = aggregates.items,
+        };
     }
 
     fn wholeRule(self: *Parser) Error!input.Rule {
@@ -360,7 +413,9 @@ const Parser = struct {
             self.skipSpace();
             if (self.index == self.source.len or !std.ascii.isUpper(self.source[self.index]))
                 return self.failHere(error.InvalidSyntax, "a variable");
+            const name_start = self.index;
             const name = try self.parseBare();
+            try self.noteVariable(name, .{ .start = name_start, .end = self.index });
             const direction: input.Direction = if (self.peekKeyword("desc")) blk: {
                 _ = try self.parseBare();
                 break :blk .descending;
@@ -400,6 +455,11 @@ const Parser = struct {
     fn parseAggregate(self: *Parser) Error!input.Goal {
         _ = try self.parseBare();
         try self.expect("(");
+        const enclosing = self.aggregate;
+        if (self.aggregates) |aggregates| {
+            self.aggregate = aggregates.items.len;
+            try aggregates.append(self.arena, .{ .parent = enclosing });
+        }
         const template = try self.parseTerm();
         try self.expect(",");
         var body: std.ArrayList(input.Goal) = .empty;
@@ -413,6 +473,8 @@ const Parser = struct {
             try body.append(self.arena, (try self.parseClause()).goal);
         }
         try self.expect(",");
+        // The result is bound where the `setof` is, not inside it.
+        self.aggregate = enclosing;
         const output = try self.parseTerm();
         try self.expect(")");
         return input.setof(template, body.items, output);
@@ -491,6 +553,16 @@ const Parser = struct {
             input.relation(predicate, terms.items);
     }
 
+    fn noteVariable(self: *Parser, name: []const u8, span: Span) Error!void {
+        const variables = self.variables orelse return;
+        try variables.append(self.arena, .{
+            .name = name,
+            .span = span,
+            .statement = self.statement.?,
+            .aggregate = self.aggregate,
+        });
+    }
+
     fn noteName(self: *Parser, predicate: []const u8, arity: usize, span: Span) Error!void {
         const names = self.names orelse return;
         try names.append(self.arena, .{
@@ -522,7 +594,10 @@ const Parser = struct {
             try self.expect(")");
             return self.makeCons(head, tail);
         }
-        if (std.ascii.isUpper(value[0])) return input.variable(value);
+        if (std.ascii.isUpper(value[0])) {
+            try self.noteVariable(value, .{ .start = start, .end = self.index });
+            return input.variable(value);
+        }
         const literal = scalar.classifyBare(value) catch |err|
             return self.fail(err, .{ .start = start, .end = self.index }, null);
         return switch (literal) {
@@ -897,6 +972,35 @@ test "comments and spans cover each statement" {
         .{ .start = 12, .end = 17 },
         .{ .start = 30, .end = 35 },
     }, parsed.value.spans);
+}
+
+test "a program records where each variable is written and each setof sits" {
+    const source =
+        \\schema age(Person: atom, int).
+        \\r(X, S) :- p(X), setof(Y, (q(X, Y), setof(Z, s(Y, Z), L)), S).
+        \\p(X), X < 3 order by X desc?
+    ;
+    const parsed = try parseProgram(testing.allocator, source, null);
+    defer parsed.deinit();
+    const program = parsed.value;
+    try testing.expectEqualDeep(&[_]Aggregate{ .{ .parent = null }, .{ .parent = 0 } }, program.aggregates);
+
+    const expected = [_]struct { []const u8, usize, ?usize }{
+        .{ "X", 1, null }, .{ "S", 1, null }, .{ "X", 1, null }, .{ "Y", 1, 0 },
+        .{ "X", 1, 0 },    .{ "Y", 1, 0 },    .{ "Z", 1, 1 },    .{ "Y", 1, 1 },
+        .{ "Z", 1, 1 },    .{ "L", 1, 0 },    .{ "S", 1, null }, .{ "X", 2, null },
+        .{ "X", 2, null }, .{ "X", 2, null },
+    };
+    try testing.expectEqual(expected.len, program.variables.len);
+    for (expected, program.variables) |e, variable| {
+        try testing.expectEqualStrings(e[0], variable.name);
+        try testing.expectEqualStrings(e[0], source[variable.span.start..variable.span.end]);
+        try testing.expectEqual(e[1], variable.statement);
+        try testing.expectEqual(e[2], variable.aggregate);
+    }
+    const last_x = program.variables[program.variables.len - 1];
+    try testing.expectEqual(program.variables.len - 1, program.variableAt(last_x.span.end).?);
+    try testing.expectEqual(@as(?usize, null), program.variableAt(0));
 }
 
 test "the parse owns everything it returns" {

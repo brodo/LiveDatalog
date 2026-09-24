@@ -117,6 +117,9 @@ It offers:
 - **Completion** of predicate names wherever a goal can start — not inside a
   relation's arguments — inserting a placeholder per column, named after the
   schema's columns where they have names.
+- **Variables**: highlighting, references and rename of a variable cover
+  its occurrences in its statement — or in its `setof`, when it occurs only
+  there — and completion offers the variables the statement already uses.
 - **Signature help** while typing a relation's arguments: its schema's
   columns, or else each arity it is defined with, with the argument being
   typed marked. `setof` shows its template, goal and result.
