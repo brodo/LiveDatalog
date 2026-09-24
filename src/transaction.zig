@@ -98,7 +98,7 @@ fn freeClauses(db: *database.Database, clauses: []syntax.Clause) void {
 /// retraction mentions but the database does not hold stay out of it.
 pub fn commitRetraction(db: *database.Database, removed: *const relation_store.RelationStore) !void {
     var committed = try db.clone();
-    defer committed.deinit();
+    defer db.release(&committed);
     _ = try update.apply(&committed, .{ .resolved = removed }, &.{});
     try materialization.verifyShadow(&committed);
     db.commit(&committed);
@@ -132,7 +132,7 @@ pub fn addFactExpr(db: *database.Database, value: syntax.Expr, contributor: ?[]c
 /// path; see `update.contribute`.
 pub fn contribute(db: *database.Database, contributor: []const u8, facts: []const input.Relation) !bool {
     var staging = try db.clone();
-    defer staging.deinit();
+    defer db.release(&staging);
     const compiled = try staging.allocator.alloc(syntax.Expr, facts.len);
     var built: usize = 0;
     defer {

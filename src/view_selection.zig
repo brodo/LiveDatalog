@@ -90,7 +90,7 @@ pub const ViewSelection = struct {
         availability: Availability,
     ) !ViewId {
         var staging = try db.clone();
-        defer staging.deinit();
+        defer db.release(&staging);
         const compiled = try compileProgramRule(&staging, head, body);
         defer syntax.freeRule(staging.allocator, compiled);
         const id = try self.catalog.define(compiled, availability);
@@ -171,7 +171,7 @@ pub const ViewSelection = struct {
 
         const allocator = db.allocator;
         var staging = try db.clone();
-        defer staging.deinit();
+        defer db.release(&staging);
         const compiled_goals = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled_goals) |clause| syntax.freeClauseTree(staging.allocator, clause);

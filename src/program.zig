@@ -334,6 +334,34 @@ test "a statement that evaluates charges its work to the database, whatever beco
     try std.testing.expect(db.eval.cost.work > work);
 }
 
+test "a contribution that fails is charged for the maintenance it did first" {
+    // The removal half of the delta reaches the closure before the addition
+    // is checked against the schema, so delete-and-rederive has examined
+    // candidates by the time the contribution fails — on a copy that is then
+    // thrown away, which is still this database's work.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    var loaded = try runSource(&db,
+        \\schema p(atom).
+        \\q(X) :- p(X).
+        \\q(X)?
+    );
+    loaded.deinit();
+    // Pinned, so that the removal is maintained rather than left to a rebuild
+    // at the next read, which would examine nothing now.
+    db.eval.cost.policy = .incremental;
+    _ = try transaction.contribute(&db, "a.dl", &.{input.fact("p", &.{input.atom("a")})});
+    const facts = db.facts.len();
+
+    const work = db.eval.cost.work;
+    try std.testing.expectError(
+        errors.Error.SchemaViolation,
+        transaction.contribute(&db, "a.dl", &.{input.fact("p", &.{input.integer(1)})}),
+    );
+    try std.testing.expectEqual(facts, db.facts.len());
+    try std.testing.expect(db.eval.cost.work > work);
+}
+
 test "head tail patterns work in rules and cons syntax is equivalent" {
     var db: database.Database = .init(std.testing.allocator);
     defer db.deinit();

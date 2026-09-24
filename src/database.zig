@@ -283,13 +283,19 @@ pub const Database = struct {
     }
 
     /// Installs a staged copy in place of this database, leaving the previous
-    /// contents in `staging` for the caller's `deinit` to release. Every
+    /// contents in `staging` for the caller's `release` to free. Every
     /// operation that can fail stages its work on a clone and ends here, which
     /// is what makes a failure part-way through leave the database untouched.
+    ///
+    /// The copy's counter comes across with the rest of it, so what is left in
+    /// `staging` is marked as having done nothing since it was cloned: a
+    /// staging copy is then written `defer db.release(&staging)` whether it
+    /// ends up committed or discarded, and is charged exactly once either way.
     pub fn commit(self: *Database, staging: *Database) void {
         const previous = self.*;
         self.* = staging.*;
         staging.* = previous;
+        staging.work_at_clone = staging.eval.cost.work;
     }
 
     /// Charges this database with the work `from` has done since its counter
@@ -314,9 +320,9 @@ pub const Database = struct {
     ///
     /// What is charged is what the copy did since it was cloned, not what it
     /// inherited, which is why `clone` records `work_at_clone`. A copy that is
-    /// committed needs none of this — `commit` installs its counter with the
-    /// rest of it — and after a commit `copy` holds this database's previous
-    /// state, which must not be released through here.
+    /// committed is charged by `commit`, which installs its counter with the
+    /// rest of it; what `commit` leaves behind in `copy` charges nothing here,
+    /// so a staging copy is released the same way whatever became of it.
     ///
     /// Written as `defer db.release(&staging)` straight after the clone, so
     /// that a statement that fails part-way is charged for what it did before
@@ -665,6 +671,20 @@ test "releasing a copy charges what the copy did, not what it inherited" {
     db.eval.cost.noteCandidates(1);
     db.release(&copy);
     try testing.expectEqual(@as(u64, 10 + 2 + 5), db.eval.cost.work);
+}
+
+test "releasing a committed copy charges nothing twice" {
+    var db: Database = .init(testing.allocator);
+    defer db.deinit();
+    db.eval.cost.noteCandidates(9);
+
+    var staging = try db.clone();
+    staging.eval.cost.noteCandidates(4);
+    db.commit(&staging);
+    // The commit brought the copy's five across; what it left behind is the
+    // previous state, which has done nothing since the clone.
+    db.release(&staging);
+    try testing.expectEqual(@as(u64, 10 + 5), db.eval.cost.work);
 }
 
 test "charging from a kept copy charges each use only its own share" {

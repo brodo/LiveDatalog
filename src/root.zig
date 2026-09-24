@@ -146,7 +146,7 @@ pub const Jatalog = struct {
 
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const input.Term) !void {
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         try program_runner.addFact(&staging, input.fact(predicate, terms), null);
         self.state.commit(&staging);
     }
@@ -157,7 +157,7 @@ pub const Jatalog = struct {
             else => return errors.Error.InvalidRule,
         };
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         try program_runner.addRule(&staging, input.rule(relation, body));
         self.state.commit(&staging);
     }
@@ -170,7 +170,7 @@ pub const Jatalog = struct {
     /// changes.
     pub fn declareSchema(self: *Jatalog, declared: input.Schema) !void {
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         try program_runner.declareSchema(&staging, declared);
         self.state.commit(&staging);
     }
@@ -213,7 +213,7 @@ pub const Jatalog = struct {
         deletions: []const input.Relation,
     ) !bool {
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         const compiled_deletions = try compileRelations(&staging, deletions);
         defer freeRelations(staging.allocator, compiled_deletions);
         const compiled_insertions = try compileRelations(&staging, insertions);
@@ -234,7 +234,7 @@ pub const Jatalog = struct {
     /// database without rules is a no-op and allocates nothing.
     pub fn materialize(self: *Jatalog) !void {
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         try materialization.ensureMaterialized(&staging);
         try materialization.verifyShadow(&staging);
         self.state.commit(&staging);
@@ -246,7 +246,7 @@ pub const Jatalog = struct {
     /// available and always correct, at the cost of full recomputation.
     pub fn rebuild(self: *Jatalog) !void {
         var staging = try self.state.clone();
-        defer staging.deinit();
+        defer self.state.release(&staging);
         if (staging.closure) |*closure| {
             closure.deinit();
             staging.closure = null;
