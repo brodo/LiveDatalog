@@ -1427,12 +1427,12 @@ fn examine(
     // cannot be read wrongly.
     for (wanted.items) |id| {
         const view = catalog.view(id);
-        const key: relation_store.PredicateKey = .{ .name = view.name, .arity = view.schema.arity() };
+        const key: relation_store.PredicateKey = .{ .name = view.name, .arity = view.column_kinds.arity() };
         var ambiguous = catalog.baseAvailable(key);
         for (wanted.items) |other| {
             if (other == id) continue;
             const rival = catalog.view(other);
-            if (rival.name == view.name and rival.schema.arity() == key.arity) ambiguous = true;
+            if (rival.name == view.name and rival.column_kinds.arity() == key.arity) ambiguous = true;
         }
         if (ambiguous) try note(allocator, unmet, .{
             .kind = .predicate_name_ambiguous,

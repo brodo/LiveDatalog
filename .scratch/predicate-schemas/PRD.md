@@ -282,6 +282,6 @@ bad(X) :- raw(X).                               % IllTyped once bad has a schema
     and queries raise `NumericType`, as they did before schemas.
   - `schema Age(...)` (an uppercase name) isn't taken as a schema
     declaration; it parses as a clause and fails there.
-- The view catalog already uses "schema" internally for a view's column
-  kinds (`view_catalog.View.schema`). The two are unrelated. Renaming the
-  catalog's field is left for a separate change.
+- The view catalog used "schema" internally for a view's column kinds. It
+  is now `view_catalog.ColumnKinds` (field `View.column_kinds`), so "schema"
+  means only a predicate schema.

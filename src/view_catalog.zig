@@ -6,8 +6,8 @@
 //! actually there — so the catalog is the half of the input that says what is
 //! there. A view carries three separate things because a later phase needs
 //! them separately: its *definition*, which is what inversion works on; its
-//! *schema*, which is what the stored extension holds and is not always the
-//! head's shape, since an aggregate column holds a list; and its
+//! *column kinds*, which say what the stored extension holds and are not
+//! always the head's shape, since an aggregate column holds a list; and its
 //! *availability*, which is policy and can be withdrawn without the definition
 //! becoming unknown. Withdrawing one is what turns a fold that had a plan into
 //! one that has none.
@@ -57,10 +57,13 @@ pub const Column = struct {
     kind: enum { value, list },
 };
 
-pub const Schema = struct {
+/// What each column of a view's stored extension holds. Not a predicate
+/// schema (see "Schema" in CONTEXT.md): these are never declared, only read
+/// off the definition.
+pub const ColumnKinds = struct {
     columns: []Column,
 
-    pub fn arity(self: Schema) usize {
+    pub fn arity(self: ColumnKinds) usize {
         return self.columns.len;
     }
 };
@@ -74,7 +77,7 @@ pub const View = struct {
     /// The rule the view is defined by, with its head pointed at the view
     /// itself and every body goal at a base relation.
     definition: fold_ir.Rule,
-    schema: Schema,
+    column_kinds: ColumnKinds,
     availability: Availability,
     source: Source,
 
@@ -83,7 +86,7 @@ pub const View = struct {
         return .{ .view = .{
             .id = self.id,
             .name = self.name,
-            .arity = self.schema.arity(),
+            .arity = self.column_kinds.arity(),
         } };
     }
 
@@ -259,12 +262,12 @@ pub const Catalog = struct {
         for (self.views.items) |defined| {
             const definition = try fold_ir.cloneRule(self.allocator, defined.definition);
             errdefer fold_ir.freeRule(self.allocator, definition);
-            const columns = try self.allocator.dupe(Column, defined.schema.columns);
+            const columns = try self.allocator.dupe(Column, defined.column_kinds.columns);
             result.views.appendAssumeCapacity(.{
                 .id = defined.id,
                 .name = defined.name,
                 .definition = definition,
-                .schema = .{ .columns = columns },
+                .column_kinds = .{ .columns = columns },
                 .availability = defined.availability,
                 .source = defined.source,
             });
@@ -277,7 +280,7 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         for (self.views.items) |defined| {
             fold_ir.freeRule(self.allocator, defined.definition);
-            self.allocator.free(defined.schema.columns);
+            self.allocator.free(defined.column_kinds.columns);
         }
         self.views.deinit(self.allocator);
         self.available_base.deinit(self.allocator);
@@ -322,7 +325,7 @@ pub const Catalog = struct {
             .id = id,
             .name = rule.head.predicate,
             .definition = definition,
-            .schema = .{ .columns = columns },
+            .column_kinds = .{ .columns = columns },
             .availability = availability,
             .source = source,
         });
@@ -371,14 +374,14 @@ pub const Catalog = struct {
             if (!defined.readable()) continue;
             const key: relation_store.PredicateKey = .{
                 .name = defined.name,
-                .arity = defined.schema.arity(),
+                .arity = defined.column_kinds.arity(),
             };
             if (self.available_base.contains(key))
                 return .{ .view = defined.id, .rival = .base };
             for (self.views.items[index + 1 ..]) |rival| {
                 if (!rival.readable()) continue;
                 if (rival.name != defined.name) continue;
-                if (rival.schema.arity() != key.arity) continue;
+                if (rival.column_kinds.arity() != key.arity) continue;
                 return .{ .view = defined.id, .rival = .{ .view = rival.id } };
             }
         }
@@ -395,7 +398,7 @@ pub const Catalog = struct {
     /// How many facts a view's stored extension holds.
     pub fn extent(self: *const Catalog, id: fold_ir.ViewId) !usize {
         const defined = self.view(id);
-        return self.cardinality(.{ .name = defined.name, .arity = defined.schema.arity() });
+        return self.cardinality(.{ .name = defined.name, .arity = defined.column_kinds.arity() });
     }
 
     /// Declares that a plan may read this base relation directly. A caller
@@ -517,9 +520,9 @@ test "an aggregate output is a list column, whatever the head spells it" {
     }, .withheld);
 
     const view = catalog.view(id);
-    try testing.expectEqual(@as(usize, 2), view.schema.arity());
-    try testing.expectEqual(Column{ .kind = .value }, view.schema.columns[0]);
-    try testing.expectEqual(Column{ .kind = .list }, view.schema.columns[1]);
+    try testing.expectEqual(@as(usize, 2), view.column_kinds.arity());
+    try testing.expectEqual(Column{ .kind = .value }, view.column_kinds.columns[0]);
+    try testing.expectEqual(Column{ .kind = .list }, view.column_kinds.columns[1]);
     try testing.expect(!view.readable());
     try testing.expect(catalog.definedByView(.{ .name = score, .arity = 2 }));
 }

@@ -862,7 +862,7 @@ pub const Jatalog = struct {
         if (self.views.baseAvailable(key)) return true;
         for (self.views.views.items) |defined| {
             if (!defined.readable()) continue;
-            if (defined.name == key.name and defined.schema.arity() == key.arity) return true;
+            if (defined.name == key.name and defined.column_kinds.arity() == key.arity) return true;
         }
         return false;
     }
