@@ -379,6 +379,7 @@ pub fn initialize(
             .workspaceSymbolProvider = .{ .bool = true },
             .completionProvider = .{},
             .signatureHelpProvider = .{ .triggerCharacters = &.{ "(", "," } },
+            .renameProvider = .{ .rename_options = .{ .prepareProvider = true } },
         },
     };
 }
@@ -1421,6 +1422,222 @@ fn writeSnippetEscaped(writer: *Io.Writer, text: []const u8) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Rename. Reads the working text, not the loaded files: see "Working text" in
+// CONTEXT.md and ADR 0007.
+
+pub fn @"textDocument/prepareRename"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.prepare_rename.Params,
+) !?types.prepare_rename.Result {
+    const parsed_name: ?NameAt = name: {
+        const io = self.engine.io;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
+        if (document.syntax_error != null) break :name null;
+        const name = document.nameAt(params.position, self.encoding) orelse return null;
+        break :name NameAt{
+            .predicate = try arena.dupe(u8, name.predicate),
+            .arity = name.arity,
+            .range = name.range,
+        };
+    };
+    const name = parsed_name orelse
+        return self.refuse("This document does not parse; fix it before renaming.", arena, .{});
+    return .{ .prepare_rename_placeholder = .{
+        .range = name.range,
+        .placeholder = try predicateSource(arena, name.predicate),
+    } };
+}
+
+pub fn @"textDocument/rename"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.rename.Params,
+) !?types.WorkspaceEdit {
+    const typed = std.mem.trim(u8, params.newName, " \t\r\n");
+    if (typed.len != 0 and std.ascii.isUpper(typed[0]))
+        return self.refuse("`{s}` would read as a variable; a predicate's name starts in lowercase.", arena, .{typed});
+    const new_name = try unquote(arena, typed);
+    if (new_name.len == 0) return self.refuse("A predicate needs a name.", arena, .{});
+
+    const texts = try self.workingTexts(arena);
+    const programs = try arena.alloc(LiveDatalog.Program, texts.len);
+    // The predicate the cursor is on.
+    var target: ?struct { predicate: []const u8, arity: usize } = null;
+    for (texts, programs) |text, *program| {
+        var diagnostic: LiveDatalog.Diagnostic = .{};
+        const parsed = LiveDatalog.parseProgram(arena, text.text, &diagnostic) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.refuse("{s}:{d} does not parse; fix it before renaming.", arena, .{
+                self.engine.relative(text.path),
+                diagnostic.line,
+            });
+        };
+        // The arena owns the parse, so it is never freed on its own.
+        program.* = parsed.value;
+        if (std.mem.eql(u8, text.uri, params.textDocument.uri)) {
+            const offset = offsets.positionToIndex(text.text, params.position, self.encoding);
+            if (program.nameAt(offset)) |name| target = .{ .predicate = name.predicate, .arity = name.arity };
+        }
+    }
+    const old = target orelse return self.refuse("There is no predicate here to rename.", arena, .{});
+    if (std.mem.eql(u8, old.predicate, new_name)) return .{ .documentChanges = &.{} };
+
+    // A schema makes its name one predicate, so the name is renamed at every
+    // arity; without one, only the arity the cursor is on.
+    const has_schema = hasSchema(programs, old.predicate);
+    if (hasSchema(programs, new_name))
+        return self.refuse("`{s}` already has a schema.", arena, .{try predicateSource(arena, new_name)});
+    for (programs) |program| for (program.names) |name| {
+        if (!std.mem.eql(u8, name.predicate, new_name)) continue;
+        if (!(has_schema and namesArity(programs, old.predicate, name.arity)) and name.arity != old.arity) continue;
+        return self.refuse("`{s}/{d}` already exists.", arena, .{ try predicateSource(arena, new_name), name.arity });
+    };
+
+    const new_text = try predicateSource(arena, new_name);
+    const DocumentChange = @typeInfo(@typeInfo(@FieldType(types.WorkspaceEdit, "documentChanges")).optional.child)
+        .pointer.child;
+    const TextEdit = @typeInfo(@FieldType(types.TextDocument.Edit, "edits")).pointer.child;
+    var changes: std.ArrayList(DocumentChange) = .empty;
+    for (texts, programs) |text, program| {
+        var edits: std.ArrayList(TextEdit) = .empty;
+        var ranges: Ranges = .{ .text = text.text, .encoding = self.encoding };
+        for (program.names) |name| {
+            if (!std.mem.eql(u8, name.predicate, old.predicate)) continue;
+            if (!has_schema and name.arity != old.arity) continue;
+            try edits.append(arena, .{ .text_edit = .{ .range = ranges.of(name.span), .newText = new_text } });
+        }
+        if (edits.items.len == 0) continue;
+        try changes.append(arena, .{ .text_document_edit = .{
+            .textDocument = .{ .uri = text.uri, .version = text.version },
+            .edits = edits.items,
+        } });
+    }
+    return .{ .documentChanges = changes.items };
+}
+
+/// Whether any of `programs` declares a schema for `predicate`.
+fn hasSchema(programs: []const LiveDatalog.Program, predicate: []const u8) bool {
+    for (programs) |program| for (program.names, 0..) |name, index| {
+        if (definerAt(program, index) == .schema and std.mem.eql(u8, name.predicate, predicate)) return true;
+    };
+    return false;
+}
+
+/// Whether any of `programs` names `predicate` with `arity`.
+fn namesArity(programs: []const LiveDatalog.Program, predicate: []const u8, arity: usize) bool {
+    for (programs) |program| for (program.names) |name| {
+        if (name.arity == arity and std.mem.eql(u8, name.predicate, predicate)) return true;
+    };
+    return false;
+}
+
+/// A file or open document as the editor holds it.
+const WorkingText = struct {
+    /// As the editor names it, when it has it open.
+    uri: []const u8,
+    /// The file's path; the URI for a document with none.
+    path: []const u8,
+    text: []const u8,
+    /// The draft's version; null for a file read from disk.
+    version: ?i32,
+};
+
+/// The working text of every watched file, followed by every other open
+/// document, in path order.
+fn workingTexts(self: *LanguageSession, arena: std.mem.Allocator) ![]const WorkingText {
+    var paths: std.array_hash_map.String(void) = .empty;
+    defer {
+        for (paths.keys()) |path| self.gpa.free(path);
+        paths.deinit(self.gpa);
+    }
+    self.engine.scan(&paths) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        else => return self.refuse("Cannot list the directory: {s}.", arena, .{@errorName(err)}),
+    };
+    std.mem.sort([]const u8, paths.keys(), {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    var texts: std.ArrayList(WorkingText) = .empty;
+    const io = self.engine.io;
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    const drafts = try arena.alloc(bool, self.documents.count());
+    @memset(drafts, false);
+    for (paths.keys()) |path| {
+        const draft = for (self.documents.keys(), 0..) |uri, index| {
+            const document_path = try uriToPath(arena, uri) orelse continue;
+            if (std.mem.eql(u8, document_path, path)) break index;
+        } else null;
+        if (draft) |index| {
+            drafts[index] = true;
+            const document = self.documents.values()[index];
+            try texts.append(arena, .{
+                .uri = try arena.dupe(u8, self.documents.keys()[index]),
+                .path = try arena.dupe(u8, path),
+                .text = try arena.dupe(u8, document.text),
+                .version = document.version,
+            });
+            continue;
+        }
+        const limit: Io.Limit = .limited(Engine.max_file_size);
+        const text = Io.Dir.cwd().readFileAlloc(io, path, arena, limit) catch |err| switch (err) {
+            // Gone since the directory was listed.
+            error.FileNotFound => continue,
+            error.OutOfMemory => |e| return e,
+            else => {
+                const relative = self.engine.relative(path);
+                return self.refuse("Cannot read {s}: {s}.", arena, .{ relative, @errorName(err) });
+            },
+        };
+        try texts.append(arena, .{
+            .uri = try pathToUri(arena, path),
+            .path = try arena.dupe(u8, path),
+            .text = text,
+            .version = null,
+        });
+    }
+    for (self.documents.keys(), self.documents.values(), drafts) |uri, document, is_file| {
+        if (is_file) continue;
+        const copied_uri = try arena.dupe(u8, uri);
+        try texts.append(arena, .{
+            .uri = copied_uri,
+            .path = try uriToPath(arena, uri) orelse copied_uri,
+            .text = try arena.dupe(u8, document.text),
+            .version = document.version,
+        });
+    }
+    return texts.items;
+}
+
+/// Tells the editor why a request cannot be done, and fails it.
+fn refuse(
+    self: *LanguageSession,
+    comptime format: []const u8,
+    arena: std.mem.Allocator,
+    args: anytype,
+) error{ OutOfMemory, RequestFailed, Canceled } {
+    const message = try std.fmt.allocPrint(arena, format, args);
+    self.transport.writeNotification(
+        self.engine.io,
+        arena,
+        "window/showMessage",
+        types.window.ShowMessageParams,
+        .{ .type = .Error, .message = message },
+        .{ .emit_null_optional_fields = false },
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => |e| return e,
+        else => log.err("cannot tell the editor: {s}", .{message}),
+    };
+    return error.RequestFailed;
+}
+
+// ---------------------------------------------------------------------------
 // URIs
 
 /// `file://` and `path`, percent-encoded.
@@ -1506,7 +1723,10 @@ const TestSession = struct {
     fn init(self: *TestSession, files: []const [2][]const u8) !void {
         self.tmp = testing.tmpDir(.{ .iterate = true });
         errdefer self.tmp.cleanup();
-        for (files) |file| try self.tmp.dir.writeFile(testing.io, .{ .sub_path = file[0], .data = file[1] });
+        for (files) |file| {
+            if (std.fs.path.dirname(file[0])) |dir| try self.tmp.dir.createDirPath(testing.io, dir);
+            try self.tmp.dir.writeFile(testing.io, .{ .sub_path = file[0], .data = file[1] });
+        }
         var buffer: [std.fs.max_path_bytes]u8 = undefined;
         const len = try self.tmp.dir.realPath(testing.io, &buffer);
         self.root = try testing.allocator.dupe(u8, buffer[0..len]);
@@ -1610,6 +1830,33 @@ const TestSession = struct {
             .textDocument = .{ .uri = try self.uri(name) },
             .position = .{ .line = line, .character = character },
         });
+    }
+
+    fn rename(
+        self: *TestSession,
+        name: []const u8,
+        line: u32,
+        character: u32,
+        new_name: []const u8,
+    ) !types.WorkspaceEdit {
+        return (try self.session.@"textDocument/rename"(self.arena.allocator(), .{
+            .textDocument = .{ .uri = try self.uri(name) },
+            .position = .{ .line = line, .character = character },
+            .newName = new_name,
+        })).?;
+    }
+
+    /// Fails unless a rename is refused with a message containing `reason`.
+    fn expectRefused(
+        self: *TestSession,
+        name: []const u8,
+        line: u32,
+        character: u32,
+        new_name: []const u8,
+        reason: []const u8,
+    ) !void {
+        try testing.expectError(error.RequestFailed, self.rename(name, line, character, new_name));
+        try expectContains(try self.written(), reason);
     }
 
     /// Takes what the session has written so far.
@@ -1999,4 +2246,88 @@ test "signature help shows a schema's columns, or each defined arity" {
     const quoted = (try t.signatureHelp("q.dl", 4, 18)).?;
     try testing.expectEqualStrings("'my pred'(_)", quoted.signatures[0].label);
     try testing.expectEqual(@as(?types.SignatureHelp, null), try t.signatureHelp("q.dl", 0, 3));
+}
+
+/// The edits a rename makes to `uri`, as `line:character-character` ranges,
+/// with the version they are for.
+fn expectEdits(
+    edit: types.WorkspaceEdit,
+    uri: []const u8,
+    version: ?i32,
+    new_text: []const u8,
+    expected: []const [3]u32,
+) !void {
+    for (edit.documentChanges.?) |change| {
+        const document = change.text_document_edit;
+        if (!std.mem.eql(u8, document.textDocument.uri, uri)) continue;
+        try testing.expectEqual(version, document.textDocument.version);
+        try testing.expectEqual(expected.len, document.edits.len);
+        for (expected, document.edits) |e, text_edit| {
+            const range = text_edit.text_edit.range;
+            try testing.expectEqualStrings(new_text, text_edit.text_edit.newText);
+            try testing.expectEqual(types.Range{
+                .start = .{ .line = e[0], .character = e[1] },
+                .end = .{ .line = e[0], .character = e[2] },
+            }, range);
+        }
+        return;
+    }
+    if (expected.len != 0) return error.TestExpectedEdits;
+}
+
+test "rename edits the working text of every file" {
+    var t: TestSession = undefined;
+    try t.init(&.{
+        .{ "schema.dl", "schema edge(atom, atom).\n" },
+        .{ "edges.dl", "edge(a, b). edge(b, c).\n" },
+        .{ "rules.dl", "path(X, Y) :- edge(X, Y).\npath(X, Z) :- edge(X, Y), path(Y, Z).\n" },
+        .{ ".hidden/skip.dl", "path(a, b).\n" },
+        .{ "arity.dl", "path(a).\n" },
+    });
+    defer t.deinit();
+    const arena = t.arena.allocator();
+    _ = t.session.initialize(arena, .{ .capabilities = .{} });
+    // A draft outside the directory, and an unsaved draft of a file in it.
+    try t.open("elsewhere/q.dl", "path(a, X)?\n");
+    try t.open("rules.dl", "path(X, Y) :- edge(X, Y).\n");
+    try t.change("rules.dl", 3, "path(X, Y) :- edge(X, Y).\n\n  path(X, Z) :- edge(X, Y), path(Y, Z).\n");
+
+    const prepared = (try t.session.@"textDocument/prepareRename"(arena, .{
+        .textDocument = .{ .uri = try t.uri("elsewhere/q.dl") },
+        .position = .{ .line = 0, .character = 1 },
+    })).?.prepare_rename_placeholder;
+    try testing.expectEqualStrings("path", prepared.placeholder);
+
+    // path/1 and the hidden file are left alone.
+    const path = try t.rename("elsewhere/q.dl", 0, 1, "reach");
+    try testing.expectEqual(@as(usize, 2), path.documentChanges.?.len);
+    try expectEdits(path, try t.uri("rules.dl"), 3, "reach", &.{ .{ 0, 0, 4 }, .{ 2, 2, 6 }, .{ 2, 28, 32 } });
+    try expectEdits(path, try t.uri("elsewhere/q.dl"), 1, "reach", &.{.{ 0, 0, 4 }});
+
+    // A schema makes edge one predicate at every arity; a name needing quotes
+    // gets them.
+    try t.open("typo.dl", "edge(1, 2, 3)?\n");
+    const edge = try t.rename("typo.dl", 0, 0, "my link");
+    try expectEdits(edge, try t.uri("schema.dl"), null, "'my link'", &.{.{ 0, 7, 11 }});
+    try expectEdits(edge, try t.uri("edges.dl"), null, "'my link'", &.{ .{ 0, 0, 4 }, .{ 0, 12, 16 } });
+    try expectEdits(edge, try t.uri("typo.dl"), 1, "'my link'", &.{.{ 0, 0, 4 }});
+    const quoted = try t.rename("typo.dl", 0, 0, "'my link'");
+    try expectEdits(quoted, try t.uri("typo.dl"), 1, "'my link'", &.{.{ 0, 0, 4 }});
+    try testing.expectEqual(@as(usize, 0), (try t.rename("typo.dl", 0, 0, "edge")).documentChanges.?.len);
+
+    try t.expectRefused("elsewhere/q.dl", 0, 1, "edge", "`edge` already has a schema.");
+    try t.expectRefused("elsewhere/q.dl", 0, 1, "Path", "would read as a variable");
+    try t.expectRefused("elsewhere/q.dl", 0, 7, "p", "There is no predicate here");
+    try t.open("other.dl", "hop(a, b).\n");
+    try t.expectRefused("elsewhere/q.dl", 0, 1, "hop", "`hop/2` already exists.");
+
+    // Any file that does not parse stops the rename.
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "broken.dl", .data = "p(a).\nq(" });
+    try t.expectRefused("elsewhere/q.dl", 0, 1, "reach", "broken.dl:2 does not parse");
+    try t.change("elsewhere/q.dl", 2, "path(a, X)");
+    try testing.expectError(error.RequestFailed, t.session.@"textDocument/prepareRename"(arena, .{
+        .textDocument = .{ .uri = try t.uri("elsewhere/q.dl") },
+        .position = .{ .line = 0, .character = 1 },
+    }));
+    try expectContains(try t.written(), "This document does not parse");
 }

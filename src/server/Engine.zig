@@ -24,7 +24,7 @@ const log = std.log.scoped(.engine);
 /// How long to wait for more file events before reloading, so that an
 /// editor's burst of writes and renames becomes one reload.
 const debounce: Io.Duration = .fromMilliseconds(40);
-const max_file_size = 64 * 1024 * 1024;
+pub const max_file_size = 64 * 1024 * 1024;
 
 pub const Message = union(enum) {
     /// An absolute path that may have changed, owned by `gpa`.
@@ -557,7 +557,10 @@ pub fn reloadAll(self: *Engine) void {
     log.info("loaded {d} file(s), {d} fact(s)", .{ self.files.count(), self.db.state.facts.len() });
 }
 
-fn scan(self: *Engine, paths: *std.array_hash_map.String(void)) !void {
+/// Adds the path of every watched `.dl` file under the root to `paths`, as
+/// owned keys. Reads only what never changes after `init`, so any task may
+/// call it.
+pub fn scan(self: *Engine, paths: *std.array_hash_map.String(void)) !void {
     var dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true });
     defer dir.close(self.io);
     var walker = try dir.walk(self.gpa);

@@ -8,7 +8,7 @@ brings two parts of this repository into the editor:
   objects;
 - the development server's [language listener](../README.md#language-listener),
   for diagnostics, hover, go to definition, find references, document
-  highlights, project symbols, completion and signature help.
+  highlights, project symbols, completion, signature help and rename.
 
 ## Install
 

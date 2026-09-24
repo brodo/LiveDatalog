@@ -120,12 +120,18 @@ It offers:
 - **Signature help** while typing a relation's arguments: its schema's
   columns, or else each arity it is defined with, with the argument being
   typed marked. `setof` shows its template, goal and result.
+- **Rename** a predicate across the directory and every open document. A
+  predicate with a schema is renamed at every arity. A rename is refused,
+  with the reason, when the new name is taken or has a schema, or when any
+  file or open document does not parse.
 
 What you type is never loaded: everything the listener says about a predicate
 describes the database the saved files built, and a draft that does not parse
-is read at the positions of its last version that did. Files outside the
-watched directory get these features too. Positions are counted in UTF-8 when the editor offers it, and
-in UTF-16 otherwise.
+is read at the positions of its last version that did. Rename is the
+exception: it changes text rather than describing the database, so it reads
+what the editor holds — open documents as typed, other files as they are on
+disk. Files outside the watched directory get these features too. Positions
+are counted in UTF-8 when the editor offers it, and in UTF-16 otherwise.
 
 An editor that can only launch a language server over stdio can bridge to the
 port, for example with `nc 127.0.0.1 7071` as the server command.

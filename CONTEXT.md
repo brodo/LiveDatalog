@@ -641,3 +641,13 @@ references are those that use the predicate rather than say what it holds,
 which is why a fact of a predicate that has rules is a reference but not a
 definition. Like definitions, references are read from the files as loaded,
 never from a draft.
+
+### Working text
+
+A file as the editor holds it: its draft when the editor has it open, and
+otherwise what is on disk now — not what the engine last loaded, which may be
+older, and may be missing entirely for a file that does not load. Everything
+the language listener *says* about a predicate reads the loaded files; a
+*rename*, which changes text rather than describing the database, reads the
+working text of every file in the directory, since its edits land on exactly
+that text (see [ADR 0007](docs/adr/0007-rename-reads-working-text.md)).
