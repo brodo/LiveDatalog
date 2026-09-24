@@ -324,14 +324,27 @@ pub const Database = struct {
     pub fn applyInsertion(self: *Database, value: syntax.Expr) !?relation_store.Fact {
         if (!value.isGround() or value.negated) return error.InvalidFact;
         const terms = try self.allocator.alloc(syntax.ValueId, value.terms.len);
-        var terms_owned = true;
-        errdefer if (terms_owned) self.allocator.free(terms);
+        errdefer self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
-        if (!self.fitsSchema(value.predicate, terms)) return error.SchemaViolation;
-        const fact: relation_store.Fact = .{ .predicate = value.predicate, .terms = terms };
-        const added = try self.facts.insert(fact, false);
-        terms_owned = false;
-        if (!added) return null;
+        return self.adoptInsertion(.{ .predicate = value.predicate, .terms = terms });
+    }
+
+    /// `applyInsertion` for a fact whose values are already interned, which is
+    /// the form incremental maintenance holds its additions in. `fact` is only
+    /// read: the store keeps a copy of its terms, so the caller may hand over
+    /// terms it is about to free.
+    pub fn applyFactInsertion(self: *Database, fact: relation_store.Fact) !?relation_store.Fact {
+        const terms = try self.allocator.dupe(syntax.ValueId, fact.terms);
+        errdefer self.allocator.free(terms);
+        return self.adoptInsertion(.{ .predicate = fact.predicate, .terms = terms });
+    }
+
+    /// The half of an insertion both spellings share. On success the store
+    /// owns `fact.terms`, whether or not the fact was new; on error the caller
+    /// still does.
+    fn adoptInsertion(self: *Database, fact: relation_store.Fact) !?relation_store.Fact {
+        if (!self.fitsSchema(fact.predicate, fact.terms)) return error.SchemaViolation;
+        if (!try self.facts.insert(fact, false)) return null;
         self.fact_generation += 1;
         return self.facts.factAt(self.facts.len() - 1);
     }

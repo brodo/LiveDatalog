@@ -68,14 +68,17 @@ pub fn maintainAggregates(db: *database.Database, touched: *relation_store.Relat
         if (removals.len() == 0 and additions.items.len == 0) return;
 
         // This round's stale head tuples and recomputed ones are one delta,
-        // and take the same three-call path a base update does. A round that
-        // falls back to a rebuild ends the cascade: the rebuild recomputed
-        // every aggregate head from the closure, so there is no next round
-        // left to run.
-        touched.clear();
-        if (try maintenance.applyRemovals(db, &removals, touched) == .rebuilt) return;
-        const batch_start = try maintenance.stageInsertions(db, additions.items, .derived);
-        if (try maintenance.applyStaged(db, batch_start, touched) == .rebuilt) return;
+        // and reach the closure the way a base update's do. What it moved
+        // replaces `touched` as the next round's input. A round that falls
+        // back to a rebuild ends the cascade: the rebuild recomputed every
+        // aggregate head from the closure, so there is no next round left to
+        // run.
+        const outcome = try maintenance.applyDelta(db, .{
+            .removals = &removals,
+            .additions = additions.items,
+            .kind = .derived,
+        }, touched);
+        if (outcome.path == .rebuilt) return;
     }
 }
 fn maintainAggregateRule(

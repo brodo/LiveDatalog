@@ -10,12 +10,18 @@
 //! must all produce the same database. The other property every module asserts
 //! is that a failed allocation leaves nothing behind, which
 //! `expectEveryAllocationFailureReleased` sweeps for.
+//!
+//! `defineRule` is the one helper that builds rather than asserts: it is how a
+//! module below the program runner installs a rule without the parser.
 
 const builtin = @import("builtin");
 const std = @import("std");
+const compile = @import("compile.zig");
 const database = @import("database.zig");
+const input = @import("input.zig");
 const materialization = @import("materialization.zig");
 const results = @import("results.zig");
+const validation = @import("validation.zig");
 
 /// Runs `scenario` once per allocation site with that allocation forced to
 /// fail, which is the coverage `std.testing.checkAllAllocationFailures` gives,
@@ -195,4 +201,25 @@ pub fn expectBindingValue(
     const formatted = try value.formatAlloc(std.testing.allocator);
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings(expected, formatted);
+}
+
+/// Installs a rule from descriptors, which is the part of
+/// `transaction.addRuleClauses` a test below that layer needs. That function
+/// belongs to `transaction.zig`, above the maintenance and update layers
+/// whose tests use this, so they cannot call it — and the parser is above it
+/// too. Nothing this calls sits above materialization.
+pub fn defineRule(
+    db: *database.Database,
+    head: input.Goal,
+    body: []const input.Goal,
+) !void {
+    const compiled_head = try compile.compileRelation(db, head.relation.predicate, head.relation.terms, false);
+    const compiled_body = try compile.compileGoals(db, body);
+    defer db.allocator.free(compiled_body);
+    const ordered = try validation.orderClauses(db, compiled_body);
+    errdefer db.allocator.free(ordered);
+    const id = db.eval.next_rule_id;
+    db.eval.next_rule_id += 1;
+    try db.eval.rules.append(db.allocator, .{ .id = id, .head = compiled_head, .body = ordered });
+    materialization.invalidateAnalysis(db);
 }
