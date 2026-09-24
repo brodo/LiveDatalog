@@ -95,15 +95,7 @@ pub fn execute(
             },
             .query, .retraction => {
                 Run.close(&run);
-                var evaluation = try transaction.Transaction.begin(db, switch (statement) {
-                    .query => .query,
-                    else => .retraction,
-                });
-                defer evaluation.deinit();
-                var result = try evaluate(&evaluation, statement);
-                errdefer result.deinit();
-                try evaluation.commit(result);
-                last = result;
+                last = try evaluate(db, statement);
             },
         }
     }
@@ -162,24 +154,15 @@ pub fn addRule(db: *database.Database, rule: input.Rule) !void {
     body_owned = false;
 }
 
-fn evaluate(
-    evaluation: *transaction.Transaction,
-    statement: input.Statement,
-) !results.ExecutionResult {
-    const target = evaluation.target();
-    const goals = switch (statement) {
-        .query => |query| query.goals,
-        .retraction => |goals| goals,
-        .fact, .rule, .schema => unreachable,
-    };
-    const compiled = try compile.compileGoals(target, goals);
-    defer {
-        for (compiled) |clause| syntax.freeClauseTree(target.allocator, clause);
-        target.allocator.free(compiled);
-    }
+/// Runs a query or a retraction, each on a copy of `db` of its own, exactly
+/// as `Jatalog.query` and `Jatalog.retract` do: see `transaction.query` and
+/// `transaction.retract`, which is where the copy is made and its work
+/// charged back.
+fn evaluate(db: *database.Database, statement: input.Statement) !results.ExecutionResult {
     return switch (statement) {
-        .query => |query| .{ .query = try transaction.queryClauses(target, compiled, query.order) },
-        else => .{ .changed = try evaluation.retract(compiled) },
+        .query => |query| .{ .query = try transaction.query(db, query.goals, query.order) },
+        .retraction => |goals| .{ .changed = try transaction.retract(db, goals) },
+        .fact, .rule, .schema => unreachable,
     };
 }
 
@@ -306,6 +289,38 @@ test "a sort key must name a variable the answers list" {
         errors.Error.UnknownVariable,
         runSource(&db, "score(P, S), setof(X, score(X, S), L) order by X?"),
     );
+}
+
+test "a statement that evaluates charges its work to the database, whatever becomes of its copy" {
+    // A query and a retraction both evaluate on a copy that is never
+    // committed, so a counter that went with the copy would report nothing
+    // for either — and nothing is what a program used to report, while the
+    // same statements issued through `query` and `retract` counted. See
+    // "Evaluation work" in CONTEXT.md. No rule is involved, so none of this
+    // is materialization, which happens on the database itself.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    var facts = try runSource(&db, "p(a). p(b). n(9223372036854775807).");
+    facts.deinit();
+
+    var work = db.eval.cost.work;
+    var answered = try runSource(&db, "p(X)?");
+    answered.deinit();
+    try std.testing.expect(db.eval.cost.work > work);
+
+    // A retraction naming nothing is evaluation and nothing else: no fact
+    // reaches the update path to be charged there instead.
+    work = db.eval.cost.work;
+    var retracted = try runSource(&db, "p(c)~");
+    defer retracted.deinit();
+    try std.testing.expect(!retracted.changed);
+    try std.testing.expect(db.eval.cost.work > work);
+
+    // Failing does not take the work back: the lookup of `n` was done before
+    // the addition overflowed.
+    work = db.eval.cost.work;
+    try std.testing.expectError(errors.Error.NumericOverflow, runSource(&db, "n(X), Y = X + 1?"));
+    try std.testing.expect(db.eval.cost.work > work);
 }
 
 test "head tail patterns work in rules and cons syntax is equivalent" {

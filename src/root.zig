@@ -175,34 +175,13 @@ pub const Jatalog = struct {
         goals: []const input.Goal,
         order: []const input.SortKey,
     ) !results.QueryResult {
-        try materialization.ensureMaterialized(&self.state);
-        // The copy is discarded and the instrument is not: a query's
-        // candidates are this database's candidates whichever copy examined
-        // them. See `evaluationWork`.
-        var staging = try self.state.clone();
-        defer self.state.release(&staging);
-        const compiled = try compile.compileGoals(&staging, goals);
-        defer {
-            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
-            staging.allocator.free(compiled);
-        }
-        return transaction.queryClauses(&staging, compiled, order);
+        return transaction.query(&self.state, goals, order);
     }
 
+    /// Removes the base facts `goals` resolve to, and whatever was derived
+    /// from them alone. Returns whether the goals named any.
     pub fn retract(self: *Jatalog, goals: []const input.Goal) !bool {
-        try materialization.ensureMaterialized(&self.state);
-        var staging = try self.state.clone();
-        defer self.state.release(&staging);
-        const compiled = try compile.compileGoals(&staging, goals);
-        defer {
-            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
-            staging.allocator.free(compiled);
-        }
-        var removed = try transaction.resolveRetraction(&staging, compiled);
-        defer removed.deinit();
-        if (removed.len() == 0) return false;
-        try transaction.commitRetraction(&self.state, &removed);
-        return true;
+        return transaction.retract(&self.state, goals);
     }
 
     /// Applies one batch of exact ground base-fact insertions and deletions
@@ -302,15 +281,7 @@ pub const Jatalog = struct {
     /// Planning reads the closure's statistics, so this materializes the
     /// database exactly as running the query would, and answers nothing.
     pub fn explainQuery(self: *Jatalog, goals: []const input.Goal) ![]u8 {
-        try materialization.ensureMaterialized(&self.state);
-        var staging = try self.state.clone();
-        defer staging.deinit();
-        const compiled = try compile.compileGoals(&staging, goals);
-        defer {
-            for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
-            staging.allocator.free(compiled);
-        }
-        return transaction.explainClauses(&staging, compiled);
+        return transaction.explain(&self.state, goals);
     }
 
     /// Declares a view a fold may reason about: what it is defined by, and

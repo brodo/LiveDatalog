@@ -210,6 +210,19 @@ statement has succeeded. Consecutive assertions share one transaction, each
 with its own savepoint, because a copy per fact is what loading a program
 from source cannot afford.
 
+A query or a retraction runs on a copy that is never committed: a query
+changes nothing, and a retraction keeps only the base facts it resolved to,
+which then take the update path. However a statement is issued — through
+`query`, `retract` or a program — it runs the same way.
+
+### Evaluation work
+
+Candidate facts examined, counted per database: the cost model's unit, and a
+number that is the same on every machine. Work done on a copy the database
+made for itself is the database's work, whether the copy is committed, kept,
+or thrown away, and whether the statement it ran succeeded — so a query,
+which is evaluation on a copy nobody keeps, still counts.
+
 ### Query fold
 
 A rewrite of a query so that it runs against what is *available* — stored view

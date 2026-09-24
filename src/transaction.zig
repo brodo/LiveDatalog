@@ -20,6 +20,69 @@ const typing = @import("typing.zig");
 const update = @import("update.zig");
 const validation = @import("validation.zig");
 
+/// Answers `goals`, listed in the order `order` asks for, without changing
+/// `db`: what `Jatalog.query` and a program's query statement both are.
+///
+/// The goals are compiled and evaluated on a copy that is never committed, so
+/// that the names and values they mention but `db` does not hold stay out of
+/// it. What evaluating them cost does not stay out: see "Evaluation work" in
+/// CONTEXT.md, which is why the copy goes through `Database.release` whether
+/// or not the query succeeds.
+pub fn query(
+    db: *database.Database,
+    goals: []const input.Goal,
+    order: []const input.SortKey,
+) !results.QueryResult {
+    var staging = try stage(db);
+    defer db.release(&staging);
+    const compiled = try compile.compileGoals(&staging, goals);
+    defer freeClauses(&staging, compiled);
+    return queryClauses(&staging, compiled, order);
+}
+
+/// Removes the base facts `goals` resolve to, returning whether there were
+/// any: what `Jatalog.retract` and a program's retraction both are.
+///
+/// Resolving the goals is a query, run on a copy that is released rather
+/// than committed, and only the facts it finds cross back — through
+/// `commitRetraction`, and so through the ordinary update path.
+pub fn retract(db: *database.Database, goals: []const input.Goal) !bool {
+    var staging = try stage(db);
+    defer db.release(&staging);
+    const compiled = try compile.compileGoals(&staging, goals);
+    defer freeClauses(&staging, compiled);
+    var removed = try resolveRetraction(&staging, compiled);
+    defer removed.deinit();
+    if (removed.len() == 0) return false;
+    try commitRetraction(db, &removed);
+    return true;
+}
+
+/// Renders the plan `goals` would be solved under, on a copy of `db` made
+/// exactly as `query` makes one, and answers nothing. The caller owns the
+/// returned text.
+pub fn explain(db: *database.Database, goals: []const input.Goal) ![]u8 {
+    var staging = try stage(db);
+    defer db.release(&staging);
+    const compiled = try compile.compileGoals(&staging, goals);
+    defer freeClauses(&staging, compiled);
+    return explainClauses(&staging, compiled);
+}
+
+/// The copy a statement that evaluates runs on. `db` is materialized first,
+/// so that the copy starts from a clean closure and shares its value
+/// identifiers: a closure materialized on the copy instead would be rebuilt
+/// by every statement and thrown away with it.
+fn stage(db: *database.Database) !database.Database {
+    try materialization.ensureMaterialized(db);
+    return db.clone();
+}
+
+fn freeClauses(db: *database.Database, clauses: []syntax.Clause) void {
+    for (clauses) |clause| syntax.freeClauseTree(db.allocator, clause);
+    db.allocator.free(clauses);
+}
+
 /// Applies the base facts a retraction resolved its goals to, which
 /// `resolveRetraction` produced against a staging copy of `db`. They are
 /// applied to a fresh clone rather than to `db` itself, so that a failure
@@ -528,11 +591,6 @@ fn compileGoal(db: *database.Database, predicate: []const u8, term: input.Term) 
     return compile.compileGoals(db, &.{input.relation(predicate, &.{term})});
 }
 
-fn freeGoals(db: *database.Database, goals: []syntax.Clause) void {
-    for (goals) |clause| syntax.freeClauseTree(db.allocator, clause);
-    db.allocator.free(goals);
-}
-
 test "the facts a retraction resolves on a copy are the original database's own" {
     // This is the claim the retraction path rests on, and the only place it
     // is visible: a removal set crosses from the database its goals were
@@ -552,7 +610,7 @@ test "the facts a retraction resolves on a copy are the original database's own"
     var staging = try db.clone();
     defer staging.deinit();
     const goals = try compileGoal(&staging, "node", input.atom("a"));
-    defer freeGoals(&staging, goals);
+    defer freeClauses(&staging, goals);
     var removed = try resolveRetraction(&staging, goals);
     defer removed.deinit();
     try testing.expectEqual(@as(usize, 1), removed.len());
@@ -581,7 +639,7 @@ test "a retraction naming a value the database does not hold leaves it uninterne
     var staging = try db.clone();
     defer staging.deinit();
     const goals = try compileGoal(&staging, "node", input.atom("absent"));
-    defer freeGoals(&staging, goals);
+    defer freeClauses(&staging, goals);
     var removed = try resolveRetraction(&staging, goals);
     defer removed.deinit();
 
@@ -602,7 +660,7 @@ test "a listing with names projects answers onto them, lists each once, and sort
     const goals = try compile.compileGoals(&db, &.{
         input.relation("p", &.{ input.variable("X"), input.variable("Y") }),
     });
-    defer freeGoals(&db, goals);
+    defer freeClauses(&db, goals);
     const x = db.strings.get("X").?;
     const listing: Listing = .{ .variables = &.{x}, .names = &.{"Who"} };
 
