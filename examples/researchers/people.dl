@@ -1,0 +1,256 @@
+% Fifty famous researchers.
+%
+% researcher(Id, Name).
+% field(Id, Field).               -- one fact per field
+% born(Id, Year).  died(Id, Year).  -- years BCE are negative
+% born_in(Id, City, Country).     -- the country the city belongs to today
+
+researcher(archimedes, "Archimedes").
+field(archimedes, mathematics). field(archimedes, physics).
+born(archimedes, -287). died(archimedes, -212).
+born_in(archimedes, "Syracuse", italy).
+
+researcher(galileo, "Galileo Galilei").
+field(galileo, physics). field(galileo, astronomy).
+born(galileo, 1564). died(galileo, 1642).
+born_in(galileo, "Pisa", italy).
+
+researcher(kepler, "Johannes Kepler").
+field(kepler, astronomy). field(kepler, mathematics).
+born(kepler, 1571). died(kepler, 1630).
+born_in(kepler, "Weil der Stadt", germany).
+
+researcher(newton, "Isaac Newton").
+field(newton, physics). field(newton, mathematics).
+born(newton, 1643). died(newton, 1727).
+born_in(newton, "Woolsthorpe", united_kingdom).
+
+researcher(lavoisier, "Antoine Lavoisier").
+field(lavoisier, chemistry).
+born(lavoisier, 1743). died(lavoisier, 1794).
+born_in(lavoisier, "Paris", france).
+
+researcher(gauss, "Carl Friedrich Gauss").
+field(gauss, mathematics). field(gauss, physics).
+born(gauss, 1777). died(gauss, 1855).
+born_in(gauss, "Brunswick", germany).
+
+researcher(faraday, "Michael Faraday").
+field(faraday, physics). field(faraday, chemistry).
+born(faraday, 1791). died(faraday, 1867).
+born_in(faraday, "London", united_kingdom).
+
+researcher(darwin, "Charles Darwin").
+field(darwin, biology).
+born(darwin, 1809). died(darwin, 1882).
+born_in(darwin, "Shrewsbury", united_kingdom).
+
+researcher(lovelace, "Ada Lovelace").
+field(lovelace, mathematics). field(lovelace, computer_science).
+born(lovelace, 1815). died(lovelace, 1852).
+born_in(lovelace, "London", united_kingdom).
+
+researcher(pasteur, "Louis Pasteur").
+field(pasteur, chemistry). field(pasteur, microbiology).
+born(pasteur, 1822). died(pasteur, 1895).
+born_in(pasteur, "Dole", france).
+
+researcher(maxwell, "James Clerk Maxwell").
+field(maxwell, physics).
+born(maxwell, 1831). died(maxwell, 1879).
+born_in(maxwell, "Edinburgh", united_kingdom).
+
+researcher(edison, "Thomas Edison").
+field(edison, engineering).
+born(edison, 1847). died(edison, 1931).
+born_in(edison, "Milan, Ohio", usa).
+
+researcher(poincare, "Henri Poincaré").
+field(poincare, mathematics). field(poincare, physics).
+born(poincare, 1854). died(poincare, 1912).
+born_in(poincare, "Nancy", france).
+
+researcher(planck, "Max Planck").
+field(planck, physics).
+born(planck, 1858). died(planck, 1947).
+born_in(planck, "Kiel", germany).
+
+researcher(hilbert, "David Hilbert").
+field(hilbert, mathematics).
+born(hilbert, 1862). died(hilbert, 1943).
+born_in(hilbert, "Königsberg", russia).
+
+researcher(curie, "Marie Curie").
+field(curie, physics). field(curie, chemistry).
+born(curie, 1867). died(curie, 1934).
+born_in(curie, "Warsaw", poland).
+
+researcher(rutherford, "Ernest Rutherford").
+field(rutherford, physics). field(rutherford, chemistry).
+born(rutherford, 1871). died(rutherford, 1937).
+born_in(rutherford, "Brightwater", new_zealand).
+
+researcher(russell, "Bertrand Russell").
+field(russell, mathematics). field(russell, philosophy).
+born(russell, 1872). died(russell, 1970).
+born_in(russell, "Trellech", united_kingdom).
+
+researcher(hardy, "G. H. Hardy").
+field(hardy, mathematics).
+born(hardy, 1877). died(hardy, 1947).
+born_in(hardy, "Cranleigh", united_kingdom).
+
+researcher(meitner, "Lise Meitner").
+field(meitner, physics).
+born(meitner, 1878). died(meitner, 1968).
+born_in(meitner, "Vienna", austria).
+
+researcher(einstein, "Albert Einstein").
+field(einstein, physics).
+born(einstein, 1879). died(einstein, 1955).
+born_in(einstein, "Ulm", germany).
+
+researcher(fleming, "Alexander Fleming").
+field(fleming, microbiology). field(fleming, medicine).
+born(fleming, 1881). died(fleming, 1955).
+born_in(fleming, "Darvel", united_kingdom).
+
+researcher(noether, "Emmy Noether").
+field(noether, mathematics).
+born(noether, 1882). died(noether, 1935).
+born_in(noether, "Erlangen", germany).
+
+researcher(bohr, "Niels Bohr").
+field(bohr, physics).
+born(bohr, 1885). died(bohr, 1962).
+born_in(bohr, "Copenhagen", denmark).
+
+researcher(hubble, "Edwin Hubble").
+field(hubble, astronomy).
+born(hubble, 1889). died(hubble, 1953).
+born_in(hubble, "Marshfield", usa).
+
+researcher(heisenberg, "Werner Heisenberg").
+field(heisenberg, physics).
+born(heisenberg, 1901). died(heisenberg, 1976).
+born_in(heisenberg, "Würzburg", germany).
+
+researcher(fermi, "Enrico Fermi").
+field(fermi, physics).
+born(fermi, 1901). died(fermi, 1954).
+born_in(fermi, "Rome", italy).
+
+researcher(dirac, "Paul Dirac").
+field(dirac, physics).
+born(dirac, 1902). died(dirac, 1984).
+born_in(dirac, "Bristol", united_kingdom).
+
+researcher(mcclintock, "Barbara McClintock").
+field(mcclintock, biology).
+born(mcclintock, 1902). died(mcclintock, 1992).
+born_in(mcclintock, "Hartford", usa).
+
+researcher(popper, "Karl Popper").
+field(popper, philosophy).
+born(popper, 1902). died(popper, 1994).
+born_in(popper, "Vienna", austria).
+
+researcher(vonneumann, "John von Neumann").
+field(vonneumann, mathematics). field(vonneumann, physics). field(vonneumann, computer_science).
+born(vonneumann, 1903). died(vonneumann, 1957).
+born_in(vonneumann, "Budapest", hungary).
+
+researcher(oppenheimer, "J. Robert Oppenheimer").
+field(oppenheimer, physics).
+born(oppenheimer, 1904). died(oppenheimer, 1967).
+born_in(oppenheimer, "New York City", usa).
+
+researcher(hopper, "Grace Hopper").
+field(hopper, computer_science).
+born(hopper, 1906). died(hopper, 1992).
+born_in(hopper, "New York City", usa).
+
+researcher(carson, "Rachel Carson").
+field(carson, biology).
+born(carson, 1907). died(carson, 1964).
+born_in(carson, "Springdale", usa).
+
+researcher(turing, "Alan Turing").
+field(turing, mathematics). field(turing, computer_science).
+born(turing, 1912). died(turing, 1954).
+born_in(turing, "London", united_kingdom).
+
+researcher(salk, "Jonas Salk").
+field(salk, medicine).
+born(salk, 1914). died(salk, 1995).
+born_in(salk, "New York City", usa).
+
+researcher(shannon, "Claude Shannon").
+field(shannon, mathematics). field(shannon, engineering).
+born(shannon, 1916). died(shannon, 2001).
+born_in(shannon, "Petoskey", usa).
+
+researcher(crick, "Francis Crick").
+field(crick, biology).
+born(crick, 1916). died(crick, 2004).
+born_in(crick, "Northampton", united_kingdom).
+
+researcher(feynman, "Richard Feynman").
+field(feynman, physics).
+born(feynman, 1918). died(feynman, 1988).
+born_in(feynman, "New York City", usa).
+
+researcher(johnson, "Katherine Johnson").
+field(johnson, mathematics).
+born(johnson, 1918). died(johnson, 2020).
+born_in(johnson, "White Sulphur Springs", usa).
+
+researcher(franklin, "Rosalind Franklin").
+field(franklin, chemistry).
+born(franklin, 1920). died(franklin, 1958).
+born_in(franklin, "London", united_kingdom).
+
+researcher(higgs, "Peter Higgs").
+field(higgs, physics).
+born(higgs, 1929). died(higgs, 2024).
+born_in(higgs, "Newcastle upon Tyne", united_kingdom).
+
+researcher(dijkstra, "Edsger W. Dijkstra").
+field(dijkstra, computer_science).
+born(dijkstra, 1930). died(dijkstra, 2002).
+born_in(dijkstra, "Rotterdam", netherlands).
+
+researcher(sagan, "Carl Sagan").
+field(sagan, astronomy).
+born(sagan, 1934). died(sagan, 1996).
+born_in(sagan, "New York City", usa).
+
+researcher(goodall, "Jane Goodall").
+field(goodall, primatology).
+born(goodall, 1934). died(goodall, 2025).
+born_in(goodall, "London", united_kingdom).
+
+researcher(knuth, "Donald Knuth").
+field(knuth, computer_science).
+born(knuth, 1938).
+born_in(knuth, "Milwaukee", usa).
+
+researcher(kay, "Alan Kay").
+field(kay, computer_science).
+born(kay, 1940).
+born_in(kay, "Springfield", usa).
+
+researcher(hawking, "Stephen Hawking").
+field(hawking, physics).
+born(hawking, 1942). died(hawking, 2018).
+born_in(hawking, "Oxford", united_kingdom).
+
+researcher(bernerslee, "Tim Berners-Lee").
+field(bernerslee, computer_science).
+born(bernerslee, 1955).
+born_in(bernerslee, "London", united_kingdom).
+
+researcher(mirzakhani, "Maryam Mirzakhani").
+field(mirzakhani, mathematics).
+born(mirzakhani, 1977). died(mirzakhani, 2017).
+born_in(mirzakhani, "Tehran", iran).

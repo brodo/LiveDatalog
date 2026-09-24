@@ -1,0 +1,57 @@
+% Quotes by the researchers in people.dl.
+%
+% quote(Id, Text).  -- some researchers have more than one
+
+quote(archimedes, "Give me a place to stand and I will move the earth.").
+quote(galileo, "Philosophy is written in this grand book, the universe, which stands continually open to our gaze.").
+quote(kepler, "Geometry is one and eternal shining in the mind of God.").
+quote(newton, "If I have seen further it is by standing on the shoulders of Giants.").
+quote(lavoisier, "Nothing is lost, nothing is created, everything is transformed.").
+quote(gauss, "Mathematics is the queen of the sciences and number theory is the queen of mathematics.").
+quote(faraday, "Nothing is too wonderful to be true, if it be consistent with the laws of nature.").
+quote(darwin, "There is grandeur in this view of life.").
+quote(lovelace, "The Analytical Engine weaves algebraical patterns just as the Jacquard-loom weaves flowers and leaves.").
+quote(pasteur, "In the fields of observation chance favours only the prepared mind.").
+quote(maxwell, "The true logic of this world is in the calculus of probabilities.").
+quote(edison, "Genius is one per cent inspiration, ninety-nine per cent perspiration.").
+quote(poincare, "Science is built up with facts, as a house is with stones. But a collection of facts is no more a science than a heap of stones is a house.").
+quote(planck, "A new scientific truth does not triumph by convincing its opponents and making them see the light, but rather because its opponents eventually die, and a new generation grows up that is familiar with it.").
+quote(hilbert, "We must know. We will know.").
+quote(curie, "One never notices what has been done; one can only see what remains to be done.").
+quote(rutherford, "All science is either physics or stamp collecting.").
+quote(russell, "Mathematics may be defined as the subject in which we never know what we are talking about, nor whether what we are saying is true.").
+quote(hardy, "Beauty is the first test: there is no permanent place in the world for ugly mathematics.").
+quote(meitner, "Science makes people reach selflessly for truth and objectivity.").
+quote(einstein, "Imagination is more important than knowledge.").
+quote(fleming, "One sometimes finds what one is not looking for.").
+quote(noether, "My methods are really methods of working and thinking; this is why they have crept in everywhere anonymously.").
+quote(bohr, "The opposite of a correct statement is a false statement. But the opposite of a profound truth may well be another profound truth.").
+quote(hubble, "Equipped with his five senses, man explores the universe around him and calls the adventure Science.").
+quote(heisenberg, "What we observe is not nature itself, but nature exposed to our method of questioning.").
+quote(fermi, "Where is everybody?").
+quote(dirac, "It is more important to have beauty in one's equations than to have them fit experiment.").
+quote(mcclintock, "If you know you are on the right track, if you have this inner knowledge, then nobody can turn you off.").
+quote(popper, "Science must begin with myths, and with the criticism of myths.").
+quote(vonneumann, "In mathematics you don't understand things. You just get used to them.").
+quote(oppenheimer, "Now I am become Death, the destroyer of worlds.").
+quote(hopper, "The most dangerous phrase in the language is, 'We've always done it this way.'").
+quote(hopper, "A ship in port is safe, but that's not what ships are built for.").
+quote(carson, "The more clearly we can focus our attention on the wonders and realities of the universe about us, the less taste we shall have for destruction.").
+quote(turing, "We can only see a short distance ahead, but we can see plenty there that needs to be done.").
+quote(salk, "Could you patent the sun?").
+quote(shannon, "The fundamental problem of communication is that of reproducing at one point either exactly or approximately a message selected at another point.").
+quote(crick, "We have discovered the secret of life.").
+quote(feynman, "The first principle is that you must not fool yourself and you are the easiest person to fool.").
+quote(feynman, "What I cannot create, I do not understand.").
+quote(johnson, "Like what you do, and then you will do your best.").
+quote(franklin, "Science and everyday life cannot and should not be separated.").
+quote(higgs, "Today I wouldn't get an academic job. It's as simple as that.").
+quote(dijkstra, "Program testing can be used to show the presence of bugs, but never to show their absence!").
+quote(dijkstra, "Simplicity is prerequisite for reliability.").
+quote(sagan, "Extraordinary claims require extraordinary evidence.").
+quote(goodall, "What you do makes a difference, and you have to decide what kind of difference you want to make.").
+quote(knuth, "Premature optimization is the root of all evil.").
+quote(kay, "The best way to predict the future is to invent it.").
+quote(hawking, "Remember to look up at the stars and not down at your feet.").
+quote(bernerslee, "This is for everyone.").
+quote(mirzakhani, "The beauty of mathematics only shows itself to more patient followers.").
