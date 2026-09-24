@@ -350,7 +350,10 @@ A definition may also *collect*: `setof` gathers every value satisfying its
 body into one list. Inverting that reads the list back — each value in it is a
 fact the aggregate's body must have had — through `$member`, a relation the
 fold defines itself with three rules rather than a builtin, because a list the
-database holds already holds each of its own tails. What the head must keep is
+database holds already holds each of its own tails. The rules are what a plan
+*says*; what runs is a walk over the one list each membership goal has bound
+(`folding.lowerPlan`), which answers the same without deriving membership in
+every tail of every list the database holds. What the head must keep is
 the *list*, not a variable holding one: a definition that wrote it down fixes
 it just as firmly. Aggregates nest by chaining, since collecting `Y!T` pairs
 means binding one of them binds the inner list `T`; and two aggregates side by

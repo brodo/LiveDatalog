@@ -1638,6 +1638,15 @@ pub const Executable = struct {
 /// Generated predicates are interned into `strings` under spellings no source
 /// program could produce. A view goal is lowered to the view's own name, so
 /// the database this runs against must hold that view's extension under it.
+///
+/// `$member` is the one relation a plan defines that does not reach the
+/// evaluator as the rules defining it. Every goal reading it is lowered to the
+/// evaluator's membership built-in, which walks the one list the goal has
+/// bound, and the three rules are left behind. Run as rules they derive
+/// membership in every tail of every list the value table holds — a relation
+/// quadratic in a list's length, rebuilt on every first call — to answer
+/// goals that only ever ask about lists a stored tuple has already bound.
+/// What each answers is the same: an element of a list ending in `[]`, once.
 pub fn lowerPlan(
     allocator: std.mem.Allocator,
     strings: *string_table.StringTable,
@@ -1645,14 +1654,19 @@ pub fn lowerPlan(
     plan: *const Plan,
 ) !Executable {
     var lowering: Lowering = .{ .allocator = allocator, .strings = strings, .symbols = symbols };
-    const rules = try allocator.alloc(syntax.Rule, plan.rules.len);
+    var kept: usize = 0;
+    for (plan.rules) |rule| {
+        if (!definesMembership(rule)) kept += 1;
+    }
+    const rules = try allocator.alloc(syntax.Rule, kept);
     var built: usize = 0;
     errdefer {
         for (rules[0..built]) |rule| syntax.freeRule(allocator, rule);
         allocator.free(rules);
     }
-    for (plan.rules, rules) |rule, *slot| {
-        slot.* = try lowering.rule(rule);
+    for (plan.rules) |rule| {
+        if (definesMembership(rule)) continue;
+        rules[built] = try lowering.rule(rule);
         built += 1;
     }
     return .{
@@ -1672,6 +1686,13 @@ pub fn executableVariableName(
 ) !syntax.Id {
     var lowering: Lowering = .{ .allocator = allocator, .strings = strings, .symbols = symbols };
     return lowering.variableName(variable);
+}
+
+fn definesMembership(rule: fold_ir.Rule) bool {
+    return switch (rule.head.predicate) {
+        .auxiliary => |relation| relation == .member,
+        else => false,
+    };
 }
 
 const Lowering = struct {
@@ -1705,7 +1726,16 @@ const Lowering = struct {
 
     fn goalClause(self: *Lowering, goal: fold_ir.Goal) anyerror!syntax.Clause {
         return switch (goal) {
-            .relation => |relation| if (relation.negated)
+            .relation => |relation| if (relation.predicate == .auxiliary and
+                relation.predicate.auxiliary == .member)
+            blk: {
+                var expression = try self.expr(relation);
+                expression.kind = .member;
+                break :blk if (relation.negated)
+                    .{ .negated = expression }
+                else
+                    .{ .builtin = expression };
+            } else if (relation.negated)
                 .{ .negated = try self.expr(relation) }
             else
                 .{ .relational = try self.expr(relation) },

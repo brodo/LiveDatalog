@@ -157,6 +157,12 @@ pub fn validateClause(
                     return safety_error;
                 return;
             }
+            if (syntax.isMembership(expression)) {
+                if (expression.terms.len != 2 or
+                    !syntax.termVariablesBound(expression.terms[1], bound)) return safety_error;
+                try syntax.bindTermVariables(db.allocator, expression.terms[0], bound);
+                return;
+            }
             if (expression.terms.len != 2) return safety_error;
             const a_bound = syntax.termVariablesBound(expression.terms[0], bound);
             const b_bound = syntax.termVariablesBound(expression.terms[1], bound);
@@ -220,6 +226,16 @@ pub fn orderClauses(db: *database.Database, clauses: []const syntax.Clause) ![]s
         },
         else => {},
     };
+    // A membership goal reads a list something above bound and binds the
+    // element, which an arithmetic goal after it may consume; the list itself
+    // is never an arithmetic result.
+    for (clauses) |clause| switch (clause) {
+        .builtin => |expression| if (syntax.isMembership(expression)) {
+            result[index] = clause;
+            index += 1;
+        },
+        else => {},
+    };
     for (clauses) |clause| switch (clause) {
         .builtin => |expression| {
             if (syntax.isArithmetic(expression)) {
@@ -239,7 +255,8 @@ pub fn orderClauses(db: *database.Database, clauses: []const syntax.Clause) ![]s
             index += 1;
         },
         .builtin => |expression| if (expression.negated or
-            (expression.kind != .equality and !syntax.isArithmetic(expression)))
+            (expression.kind != .equality and !syntax.isArithmetic(expression) and
+                !syntax.isMembership(expression)))
         {
             result[index] = clause;
             index += 1;

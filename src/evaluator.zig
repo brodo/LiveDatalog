@@ -196,7 +196,7 @@ const StepFingerprint = struct {
 /// Every lookup `plan` performs, recursively through a `setof`'s inner plan,
 /// each with the selectivity `facts` currently reports for its own `(key,
 /// mask)` — what a fresh `PlanCache` entry fingerprints itself with. A
-/// filter step (a builtin) performs no lookup and contributes nothing.
+/// filter or walk step (a builtin) performs no lookup and contributes nothing.
 fn collectStepFingerprints(
     allocator: std.mem.Allocator,
     facts: *relation_store.RelationStore,
@@ -215,7 +215,7 @@ fn collectStepFingerprints(
                     .groups = measured.groups,
                 });
             },
-            .filter => {},
+            .filter, .walk => {},
             .aggregate => try collectStepFingerprints(allocator, facts, step.inner.?, into),
         }
     }
@@ -771,6 +771,28 @@ pub const Evaluator = struct {
             .builtin => |value| value,
             .negated => |value| value,
         };
+        if (syntax.isMembership(expression)) {
+            const list = try self.termToValue(expression.terms[1], bindings);
+            const length = self.properLength(list) orelse return;
+            // Each element is a candidate unified against the goal, exactly as
+            // each `$member` fact over this list would be if membership were a
+            // relation looked up on its list, so the cost model's unit keeps
+            // meaning the same thing.
+            self.cost.noteCandidates(length);
+            var cell = list;
+            while (self.values.get(cell) == .cons) {
+                const pair = self.values.get(cell).cons;
+                cell = pair.tail;
+                // A value the list already held earlier was already answered:
+                // membership is a relation, and a relation holds it once.
+                if (self.listHoldsBefore(list, pair.head, cell)) continue;
+                var next = try bindings.clone(self.allocator);
+                defer next.deinit(self.allocator);
+                if (try self.unifyValueTerm(pair.head, expression.terms[0], &next))
+                    try self.matchClauses(plan, facts, index + 1, &next, answers, constraint);
+            }
+            return;
+        }
         if (syntax.isBuiltin(expression)) {
             var next = try bindings.clone(self.allocator);
             defer next.deinit(self.allocator);
@@ -860,6 +882,41 @@ pub const Evaluator = struct {
         };
     }
 
+    /// How many elements `list` holds when it is a proper list, one ending in
+    /// `[]`; null for anything else. A structure that never reaches `[]` has
+    /// no members at all, which is what `$member`'s three rules said of it:
+    /// the only base case is the one-element list whose tail is `[]`.
+    fn properLength(self: *const Evaluator, list: syntax.ValueId) ?usize {
+        var length: usize = 0;
+        var cell = list;
+        while (true) switch (self.values.get(cell)) {
+            .nil => return length,
+            .cons => |pair| {
+                length += 1;
+                cell = pair.tail;
+            },
+            .scalar => return null,
+        };
+    }
+
+    /// Whether `element` is the head of some cell of `list` before the cell
+    /// whose tail is `stop`. Interning makes an identifier the value, so the
+    /// comparison is the identifier's.
+    fn listHoldsBefore(
+        self: *const Evaluator,
+        list: syntax.ValueId,
+        element: syntax.ValueId,
+        stop: syntax.ValueId,
+    ) bool {
+        var cell = list;
+        while (true) {
+            const pair = self.values.get(cell).cons;
+            if (pair.tail == stop) return false;
+            if (pair.head == element) return true;
+            cell = pair.tail;
+        }
+    }
+
     fn evalBuiltin(self: *Evaluator, expr_value: syntax.Expr, bindings: *syntax.Binding) !bool {
         if (expr_value.kind == .type_test) {
             if (expr_value.terms.len != 1) return errors.Error.InvalidQuery; // ziglint-ignore: Z010
@@ -897,6 +954,18 @@ pub const Evaluator = struct {
         }
         if (left_id == null or right_id == null) return errors.Error.UnboundVariable; // ziglint-ignore: Z010
         if (expr_value.kind == .inequality) return !self.valuesEqual(left_id.?, right_id.?);
+        // Only a negated membership goal gets here, and negation binds
+        // nothing, so the question is only whether the element is there.
+        if (expr_value.kind == .member) {
+            if (self.properLength(right_id.?) == null) return false;
+            var cell = right_id.?;
+            while (self.values.get(cell) == .cons) {
+                const pair = self.values.get(cell).cons;
+                if (pair.head == left_id.?) return true;
+                cell = pair.tail;
+            }
+            return false;
+        }
 
         const order = try self.scalars.compareNumeric(
             try self.valueScalar(left_id.?),

@@ -8344,6 +8344,106 @@ test "cost picks between views that reconstruct one relation exactly, and picks 
     try std.testing.expectEqualStrings(decisions, decisions_again);
 }
 
+test "a folded plan walks a stored list and answers what the membership rules derive" {
+    // `$member` reaches the evaluator as a walk over the one list a stored
+    // tuple bound, not as the three rules the plan renders. The two have to
+    // agree on every list an extension can hold, and an embedder's stored
+    // extension can hold lists no `setof` would have collected: one holding a
+    // value twice, one that never reaches `[]`, one that is empty, and one
+    // whose elements are lists themselves. The same rules, written as a
+    // program over the same tuples, say what the answers must be.
+    const allocator = std.testing.allocator;
+    var folded: Jatalog = .init(allocator);
+    defer folded.deinit();
+    const x1 = input.variable("X1");
+    _ = try folded.defineView(input.fact("narrow", &.{ x1, input.variable("S") }), &.{
+        input.relation("r", &.{ x1, input.variable("X2") }),
+        input.setof(input.variable("Y2"), &.{input.relation("r", &.{
+            x1,
+            input.variable("Y2"),
+        })}, input.variable("S")),
+    }, .materialized);
+    const head = input.atom("a");
+    const tail = input.atom("b");
+    const improper: input.Term.Cons = .{ .head = &head, .tail = &tail };
+    const stored = [_][2]input.Term{
+        .{ input.atom("k1"), input.list(&.{ input.atom("a"), input.atom("b"), input.atom("a") }) },
+        .{ input.atom("k2"), input.cons(&improper) },
+        .{ input.atom("k3"), input.list(&.{}) },
+        .{ input.atom("k4"), input.list(&.{
+            input.list(&.{ input.atom("a"), input.atom("b") }),
+            input.atom("c"),
+        }) },
+        .{ input.atom("k5"), input.list(&.{input.atom("b")}) },
+    };
+    for (stored) |terms| try folded.addFact("narrow", &terms);
+
+    const fold = try folded.foldQuery(&.{input.relation("r", &.{
+        input.variable("K"),
+        input.variable("V"),
+    })}, &.{});
+    defer fold.deinit();
+    var answers = try folded.answerFolded(fold, &.{});
+    defer answers.deinit();
+    const tuples = try answerTuples(&answers);
+    defer freeLines(tuples);
+
+    var direct: Jatalog = .init(allocator);
+    defer direct.deinit();
+    var expected = try direct.execute(
+        \\narrow(k1, [a, b, a]). narrow(k2, a!b). narrow(k3, []).
+        \\narrow(k4, [[a, b], c]). narrow(k5, [b]).
+        \\member(X, X!R) :- R = [].
+        \\member(X, X!R) :- member(O, R).
+        \\member(O, F!R) :- member(O, R).
+        \\r(K, V) :- narrow(K, S), member(V, S).
+        \\r(K, V)?
+    , null);
+    defer expected.deinit();
+    const expected_tuples = try answerTuples(&expected.query);
+    defer freeLines(expected_tuples);
+
+    try std.testing.expectEqual(@as(usize, 5), expected_tuples.len);
+    try std.testing.expectEqual(expected_tuples.len, tuples.len);
+    for (expected_tuples, tuples) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+test "a membership goal answers each element once, and nothing for a list that never ends" {
+    const allocator = std.testing.allocator;
+    var db: Jatalog = .init(allocator);
+    defer db.deinit();
+    var setup = try db.execute("items(twice, [a, b, a]). items(open, a!b).", null);
+    setup.deinit();
+
+    const cases = [_]struct { element: input.Term, negated: bool, answers: usize }{
+        // `a` is held twice and answered once; the list that ends in `b`
+        // holds nothing at all, however many cells it has.
+        .{ .element = input.variable("X"), .negated = false, .answers = 2 },
+        // Negated, the question is only whether the element is there, and a
+        // list that never ends does not hold one.
+        .{ .element = input.atom("a"), .negated = true, .answers = 1 },
+        .{ .element = input.atom("c"), .negated = true, .answers = 2 },
+    };
+    for (cases) |case| {
+        var goals: [2]syntax.Clause = undefined;
+        goals[0] = .{ .relational = try compile.compileRelation(&db.state, "items", &.{
+            input.variable("N"),
+            input.variable("S"),
+        }, false) };
+        defer syntax.freeClauseTree(allocator, goals[0]);
+        var membership = try compile.compileBuiltin(&db.state, .member, &.{
+            case.element,
+            input.variable("S"),
+        });
+        membership.negated = case.negated;
+        goals[1] = if (case.negated) .{ .negated = membership } else .{ .builtin = membership };
+        defer syntax.freeClauseTree(allocator, goals[1]);
+        var result = try transaction.queryClauses(&db.state, &goals, &.{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.answers, result.answers.items.len);
+    }
+}
+
 test "views that reconstruct one relation equally well are chosen between by declaration order" {
     const allocator = std.testing.allocator;
     var db: Jatalog = .init(allocator);

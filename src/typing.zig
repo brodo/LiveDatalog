@@ -149,6 +149,14 @@ const Checker = struct {
                 if (try self.constrain(env, terms[0], if (integral) .int else .number)) changed = true;
                 return changed;
             },
+            .member => {
+                // Only a folded plan writes one, and plans are checked before
+                // they are lowered; this keeps the checker total anyway.
+                if (terms.len != 2) return false;
+                var changed = try self.constrain(env, terms[1], ColumnType.any.listOf().?);
+                if (try self.constrain(env, terms[0], self.typeOf(env, terms[1]).elements())) changed = true;
+                return changed;
+            },
             .type_test => {
                 if (terms.len != 1) return false;
                 return self.constrain(env, terms[0], expression.column_type);

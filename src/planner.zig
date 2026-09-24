@@ -50,6 +50,9 @@ pub const StepKind = enum {
     anti_join,
     /// A comparison, equality, or arithmetic goal: no lookup at all.
     filter,
+    /// A membership goal: one binding per element of a list already bound,
+    /// read off the list itself rather than looked up.
+    walk,
     /// A `setof` occurrence, whose inner body is planned in turn.
     aggregate,
 };
@@ -131,6 +134,7 @@ pub const Plan = struct {
             }
             switch (step.kind) {
                 .filter => try writer.writeAll(" filter"),
+                .walk => try writer.writeAll(" walk"),
                 .aggregate => try writer.writeAll(" aggregate"),
                 .join, .anti_join => {
                     try writer.writeAll(if (step.kind == .anti_join) " anti-join " else " join ");
@@ -289,7 +293,7 @@ fn describe(
     switch (clause) {
         .builtin => |expression| return .{
             .origin = origin,
-            .kind = .filter,
+            .kind = if (syntax.isMembership(expression)) .walk else .filter,
             .predicate = expression.predicate,
             .arity = expression.terms.len,
             .mask = 0,
@@ -349,6 +353,11 @@ fn describe(
 /// does; neither multiplies its input, so both belong before any join that
 /// would run them more times. Costing them by their own work rather than by
 /// their kind is what puts them there without a special case.
+///
+/// A membership goal does multiply its input, by the length of a list nobody
+/// knows until it is bound, and is costed as the built-in it is anyway. It is
+/// only ready once its list is bound, and walking that list then costs what
+/// reading the same elements through an index on it would.
 fn clauseCost(
     allocator: std.mem.Allocator,
     facts: *relation_store.RelationStore,
@@ -404,6 +413,9 @@ pub fn clauseReady(
             return true;
         },
         .builtin => |expression| {
+            if (syntax.isMembership(expression))
+                return expression.terms.len == 2 and
+                    syntax.termVariablesBound(expression.terms[1], bound);
             if (syntax.isArithmetic(expression)) {
                 return expression.terms.len == 3 and
                     syntax.termVariablesBound(expression.terms[1], bound) and
@@ -483,6 +495,8 @@ pub fn bindClause(
                     try syntax.bindTermVariables(allocator, expression.terms[0], bound);
                 return;
             }
+            if (expression.terms.len == 2 and syntax.isMembership(expression))
+                try syntax.bindTermVariables(allocator, expression.terms[0], bound);
             if (expression.terms.len == 2 and expression.kind == .equality and !expression.negated) {
                 try syntax.bindTermVariables(allocator, expression.terms[0], bound);
                 try syntax.bindTermVariables(allocator, expression.terms[1], bound);

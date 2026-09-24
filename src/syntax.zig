@@ -50,6 +50,11 @@ pub const GoalKind = enum {
     subtract,
     /// `X : T`: one term, and the type it is tested against in `column_type`.
     type_test,
+    /// `member(X, L)`: `X` is one of the values in the list `L`, which must
+    /// already be bound. Nothing a program writes compiles to this: it is how
+    /// a folded plan's `$member` reaches the evaluator (`folding.lowerPlan`),
+    /// answered by walking the list rather than by looking anything up.
+    member,
 };
 
 pub const Expr = struct {
@@ -409,6 +414,7 @@ pub fn goalOperator(kind: GoalKind) []const u8 {
         .add => "+",
         .subtract => "-",
         .type_test => ":",
+        .member => "$member",
     };
 }
 
@@ -448,6 +454,12 @@ pub fn isTypeTest(value: Expr) bool {
 
 pub fn isArithmetic(value: Expr) bool {
     return value.kind == .add or value.kind == .subtract;
+}
+
+/// A positive membership goal: the one built-in that binds more than one
+/// value for a variable, one answer per element of its list.
+pub fn isMembership(value: Expr) bool {
+    return value.kind == .member and !value.negated;
 }
 
 pub fn termContainsCons(term: Term) bool {
