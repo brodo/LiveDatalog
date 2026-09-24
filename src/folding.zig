@@ -379,10 +379,53 @@ fn writeSubject(
     try writer.print("/{d}", .{subject.arity()});
 }
 
-/// A query to fold: the goals to answer, and the rules the query defines its
-/// own predicates by. The rules are part of the question — Chapter 6's plan is
-/// `Q ∪ V⁻¹`, and a recursive `Q` is the case the Inverse Method exists for.
+/// A query to fold, in the language the database compiled it into: the goals
+/// to answer, the rules the query defines its own predicates by, and the
+/// variables its answers list. The rules are part of the question — Chapter
+/// 6's plan is `Q ∪ V⁻¹`, and a recursive `Q` is the case the Inverse Method
+/// exists for.
+///
+/// It is `syntax` rather than the folding IR because lowering is this
+/// module's business. Which scope each variable belongs to, and what name it
+/// runs under once a plan is lowered back out, are decisions about the IR, and
+/// a caller that made them would be reaching into it to find its own answer
+/// variables again.
 pub const Query = struct {
+    goals: []const syntax.Clause,
+    rules: []const syntax.Rule = &.{},
+    /// The variables the goals' answers list, in the order the goals first
+    /// mention them. `Folded.answer_variables` says where each one went.
+    answers: []const syntax.Id = &.{},
+};
+
+/// A fold's outcome, and where the query's own answer variables went in it.
+///
+/// The second half exists because a plan's variables are not the query's. A
+/// lowered plan runs each variable under the name it renders under, identity
+/// and all, so a caller reading a plan's answers needs to know which of those
+/// names are the ones it asked about — and nothing else can tell it, since
+/// the scope the goals were lowered into is opened here and gone by the time
+/// the fold returns.
+pub const Folded = struct {
+    allocator: std.mem.Allocator,
+    outcome: Outcome,
+    /// The name each of `Query.answers` runs under once the plan is lowered,
+    /// in the same order. Interned into the strings the fold was given, and
+    /// meaningful only against a plan lowered into them.
+    answer_variables: []syntax.Id,
+
+    pub fn deinit(self: *Folded) void {
+        self.allocator.free(self.answer_variables);
+        self.outcome.deinit();
+        self.* = undefined;
+    }
+};
+
+/// A query already lowered into the folding IR, which is what the fold proper
+/// reasons about. Separate from `Query` so that the tests of this module can
+/// state a question the language has no spelling for — a goal naming a view
+/// rather than the relation stored under its name.
+const Lowered = struct {
     goals: []const fold_ir.Goal,
     rules: []const fold_ir.Rule = &.{},
 };
@@ -514,13 +557,67 @@ const Normalizer = struct {
 /// and only `contained` when eliminating Skolem terms had to drop instances.
 /// A relation nothing can reconstruct makes the whole fold `unsupported`.
 ///
-/// The query is borrowed; the outcome owns copies of everything it returns.
+/// The query is lowered here, and lowered fresh every time: its goals share
+/// one scope and each of its rules gets one of its own, because two rules
+/// spelling a variable alike mean two variables. That is also why a cache
+/// keys on `normalizeQuery` rather than on anything this returns.
+///
+/// The query is borrowed; the result owns copies of everything it returns.
 /// Its variables and functions are handed out by the catalog's symbol table,
-/// which is why the catalog is not const.
+/// which is why the catalog is not const, and the names its answer variables
+/// run under are interned into `strings`, which must be the database's the
+/// query was compiled against.
 pub fn foldQuery(
     allocator: std.mem.Allocator,
     catalog: *view_catalog.Catalog,
+    strings: *string_table.StringTable,
     query: Query,
+) !Folded {
+    const goal_scope = try catalog.symbols.openScope(.query);
+    const goals = try fold_ir.lowerClauses(allocator, &catalog.symbols, goal_scope, query.goals);
+    defer fold_ir.freeGoals(allocator, goals);
+    const rules = try allocator.alloc(fold_ir.Rule, query.rules.len);
+    var built: usize = 0;
+    defer {
+        for (rules[0..built]) |rule| fold_ir.freeRule(allocator, rule);
+        allocator.free(rules);
+    }
+    for (query.rules, rules) |rule, *slot| {
+        slot.* = try fold_ir.lowerRule(
+            allocator,
+            &catalog.symbols,
+            try catalog.symbols.openScope(.query),
+            rule,
+        );
+        built += 1;
+    }
+
+    var outcome = try foldLowered(allocator, catalog, .{ .goals = goals, .rules = rules });
+    errdefer outcome.deinit();
+
+    // Where the query's own answer variables went: each is the variable its
+    // name denotes in the goals' scope, running under the name it renders
+    // under. A later caller asking the same question with other names
+    // mentions its variables in this same order, because a question's key is
+    // the question with its variables numbered by first mention.
+    const answer_variables = try allocator.alloc(syntax.Id, query.answers.len);
+    errdefer allocator.free(answer_variables);
+    var lowering: Lowering = .{
+        .allocator = allocator,
+        .strings = strings,
+        .symbols = &catalog.symbols,
+    };
+    for (query.answers, answer_variables) |name, *slot| slot.* = try lowering.variableName(
+        try catalog.symbols.userVariable(goal_scope, name),
+    );
+    return .{ .allocator = allocator, .outcome = outcome, .answer_variables = answer_variables };
+}
+
+/// Folds a query already in the IR. See `foldQuery`.
+fn foldLowered(
+    allocator: std.mem.Allocator,
+    catalog: *view_catalog.Catalog,
+    query: Lowered,
 ) !Outcome {
     // The query first says what it wants in the vocabulary the views kept. A
     // list function it defines for itself as a conjunction of ones they expose
@@ -533,7 +630,7 @@ pub fn foldQuery(
         query.rules,
     );
     defer expansion.deinit();
-    const expanded: Query = .{ .goals = expansion.goals, .rules = expansion.rules };
+    const expanded: Lowered = .{ .goals = expansion.goals, .rules = expansion.rules };
 
     var reads: Reads = .{ .allocator = allocator };
     defer reads.deinit();
@@ -890,7 +987,7 @@ const Splitting = struct {
         self: *Splitting,
         examination: *Examination,
         catalog: *const view_catalog.Catalog,
-        query: Query,
+        query: Lowered,
         reads: *const Reads,
     ) !void {
         try self.requireIdentifiedIn(examination, catalog, query.goals, reads);
@@ -1292,7 +1389,7 @@ const Examination = struct {
 fn examine(
     examination: *Examination,
     catalog: *const view_catalog.Catalog,
-    query: Query,
+    query: Lowered,
     reads: *const Reads,
 ) !void {
     const allocator = examination.allocator;
@@ -1676,18 +1773,6 @@ pub fn lowerPlan(
     };
 }
 
-/// The name `variable` runs under once a plan holding it is lowered, which
-/// is how a caller finds a query variable of its own among a plan's answers.
-pub fn executableVariableName(
-    allocator: std.mem.Allocator,
-    strings: *string_table.StringTable,
-    symbols: *const fold_ir.Symbols,
-    variable: fold_ir.Variable,
-) !syntax.Id {
-    var lowering: Lowering = .{ .allocator = allocator, .strings = strings, .symbols = symbols };
-    return lowering.variableName(variable);
-}
-
 fn definesMembership(rule: fold_ir.Rule) bool {
     return switch (rule.head.predicate) {
         .auxiliary => |relation| relation == .member,
@@ -1965,7 +2050,7 @@ test "a query inside the availability boundary is its own equivalent plan" {
     const goals = try fixture.queryGoals(allocator);
     defer fold_ir.freeGoals(allocator, goals);
 
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer outcome.deinit();
 
     try testing.expectEqual(Guarantee.equivalent, outcome.guarantee());
@@ -2000,7 +2085,7 @@ test "an unsupported fold carries no plan to mistake for an empty one" {
 
     // Neither relation is available: the view's extension is withheld, and
     // `edge` is only reachable by inverting that view.
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer outcome.deinit();
 
     try testing.expectEqual(Guarantee.unsupported, outcome.guarantee());
@@ -2070,7 +2155,7 @@ test "a relation nothing defines is reported apart from one a view mentions" {
         } },
     };
 
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = &goals });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = &goals });
     defer outcome.deinit();
     try testing.expectEqual(@as(usize, 1), outcome.unsupported.unmet.len);
     try testing.expectEqual(
@@ -2204,7 +2289,7 @@ test "a fold that reconstructs a relation reports the plan it built to do it" {
     } }});
     defer fold_ir.freeGoals(allocator, goals);
 
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
 
     // A view remembering every variable of its body loses nothing, so its
@@ -2262,7 +2347,7 @@ test "a reconstruction cannot stand in for a relation read under negation" {
     });
     defer fold_ir.freeGoals(allocator, goals);
 
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer outcome.deinit();
     try testing.expectEqual(Guarantee.unsupported, outcome.guarantee());
     try testing.expectEqual(@as(usize, 1), outcome.unsupported.unmet.len);
@@ -2274,7 +2359,7 @@ test "a reconstruction cannot stand in for a relation read under negation" {
     // Declaring the relation available answers the objection: what is there is
     // then known exactly, and nothing is reconstructed.
     try fixture.catalog.declareBaseAvailable(.{ .name = fixture.edge, .arity = 2 });
-    var allowed = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var allowed = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer allowed.deinit();
     try testing.expectEqual(Guarantee.equivalent, allowed.guarantee());
 }
@@ -2310,14 +2395,14 @@ test "a canonical view of the relation answers the objection to negating it" {
     });
     defer fold_ir.freeGoals(allocator, goals);
 
-    var outcome = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var outcome = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer outcome.deinit();
     try testing.expectEqual(Guarantee.maximally_contained, outcome.guarantee());
 
     // Withholding that view is what takes the discharge away, and the fold
     // then has nothing at all rather than a weaker plan.
     fixture.catalog.views.items[@intFromEnum(fixture.view)].availability = .withheld;
-    var withheld = try foldQuery(allocator, &fixture.catalog, .{ .goals = goals });
+    var withheld = try foldLowered(allocator, &fixture.catalog, .{ .goals = goals });
     defer withheld.deinit();
     try testing.expectEqual(Guarantee.unsupported, withheld.guarantee());
 }

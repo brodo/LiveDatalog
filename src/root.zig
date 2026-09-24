@@ -443,35 +443,24 @@ pub const Jatalog = struct {
         }
         self.plans.misses += 1;
 
-        const goal_scope = try self.views.symbols.openScope(.query);
-        const lowered_goals = try fold_ir.lowerClauses(
-            allocator,
-            &self.views.symbols,
-            goal_scope,
-            compiled_goals,
-        );
-        defer fold_ir.freeGoals(allocator, lowered_goals);
-        const lowered_rules = try lowerProgramRules(allocator, &self.views.symbols, compiled_rules);
-        defer {
-            for (lowered_rules) |rule| fold_ir.freeRule(allocator, rule);
-            allocator.free(lowered_rules);
-        }
-
+        const surface = try transaction.answerVariables(&staging, compiled_goals);
+        defer allocator.free(surface);
         // Sizes, for the one decision cost is allowed to make: which of
         // several views that reconstruct one relation exactly to read. Pointed
         // at the staged copy for the length of the fold and taken away after,
         // so the catalog never holds a store that has gone.
         self.views.extensions = staging.closureStore();
         defer self.views.extensions = null;
-        var outcome = try folding.foldQuery(allocator, &self.views, .{
-            .goals = lowered_goals,
-            .rules = lowered_rules,
+        var folded = try folding.foldQuery(allocator, &self.views, &staging.strings, .{
+            .goals = compiled_goals,
+            .rules = compiled_rules,
+            .answers = surface,
         });
-        var outcome_owned = true;
-        defer if (outcome_owned) outcome.deinit();
+        var folded_owned = true;
+        defer if (folded_owned) folded.deinit();
 
         var executable: ?folding.Executable = null;
-        if (outcome.plan()) |plan| {
+        if (folded.outcome.plan()) |plan| {
             executable = folding.lowerPlan(
                 allocator,
                 &staging.strings,
@@ -487,30 +476,12 @@ pub const Jatalog = struct {
         }
         errdefer if (executable) |*value| value.deinit();
 
-        // Where the query's own answer variables went in the plan, in the
-        // order the query mentions them. A later caller asking the same
-        // question with other names mentions its variables in this same
-        // order, because the key it matched is the question with variables
-        // numbered by first mention.
-        const surface = try transaction.answerVariables(&staging, compiled_goals);
-        defer allocator.free(surface);
-        const answer_variables = try allocator.alloc(syntax.Id, surface.len);
-        var answer_variables_owned = true;
-        defer if (answer_variables_owned) allocator.free(answer_variables);
-        for (surface, answer_variables) |name, *slot| slot.* = try folding.executableVariableName(
-            allocator,
-            &staging.strings,
-            &self.views.symbols,
-            try self.views.symbols.userVariable(goal_scope, name),
-        );
-
         const names = try answerNames(&staging, compiled_goals);
         errdefer freeNames(allocator, names);
 
-        const index = try self.plans.insert(key, outcome, executable, answer_variables);
+        const index = try self.plans.insert(key, folded.outcome, executable, folded.answer_variables);
         key_owned = false;
-        outcome_owned = false;
-        answer_variables_owned = false;
+        folded_owned = false;
         self.state.commit(&staging);
         return self.handle(index, false, names);
     }
@@ -1207,26 +1178,6 @@ fn compileProgramRules(db: *database.Database, rules: []const input.Rule) ![]syn
 fn freeProgramRules(allocator: std.mem.Allocator, rules: []syntax.Rule) void {
     for (rules) |rule| syntax.freeRule(allocator, rule);
     allocator.free(rules);
-}
-
-/// Lowers the query's own rules into the folding IR, each in a scope of its
-/// own: two rules spelling a variable alike mean two variables.
-fn lowerProgramRules(
-    allocator: std.mem.Allocator,
-    symbols: *fold_ir.Symbols,
-    rules: []const syntax.Rule,
-) ![]fold_ir.Rule {
-    const lowered = try allocator.alloc(fold_ir.Rule, rules.len);
-    var built: usize = 0;
-    errdefer {
-        for (lowered[0..built]) |rule| fold_ir.freeRule(allocator, rule);
-        allocator.free(lowered);
-    }
-    for (rules, lowered) |rule, *slot| {
-        slot.* = try fold_ir.lowerRule(allocator, symbols, try symbols.openScope(.query), rule);
-        built += 1;
-    }
-    return lowered;
 }
 
 /// Compiles a batch's relation descriptors into expressions the update path
@@ -5465,29 +5416,36 @@ fn compiledRule(
     return .{ .head = compiled, .body = try compile.compileGoals(db, body) };
 }
 
-/// One rule of the query program, in the folding IR and in a scope of its own.
+/// One rule of the query program, compiled. The fold lowers it, in a scope of
+/// its own.
 fn foldingRule(
     db: *database.Database,
-    symbols: *fold_ir.Symbols,
     head: input.Relation,
     body: []const input.Goal,
-) !fold_ir.Rule {
-    const compiled = try compiledRule(db, head, body);
-    defer syntax.freeRule(db.allocator, compiled);
-    return fold_ir.lowerRule(db.allocator, symbols, try symbols.openScope(.query), compiled);
+) !syntax.Rule {
+    return compiledRule(db, head, body);
 }
 
-fn foldingGoals(
+fn foldingGoals(db: *database.Database, goals: []const input.Goal) ![]syntax.Clause {
+    return compile.compileGoals(db, goals);
+}
+
+fn freeClauses(allocator: std.mem.Allocator, clauses: []syntax.Clause) void {
+    for (clauses) |clause| syntax.freeClauseTree(allocator, clause);
+    allocator.free(clauses);
+}
+
+/// Folds a compiled query against a catalog paired with `db`, keeping only
+/// the outcome: these tests run the plan's goals themselves, so they never
+/// ask where its answer variables went.
+fn foldCompiled(
     db: *database.Database,
-    symbols: *fold_ir.Symbols,
-    goals: []const input.Goal,
-) ![]fold_ir.Goal {
-    const compiled = try compile.compileGoals(db, goals);
-    defer {
-        for (compiled) |clause| syntax.freeClauseTree(db.allocator, clause);
-        db.allocator.free(compiled);
-    }
-    return fold_ir.lowerClauses(db.allocator, symbols, try symbols.openScope(.query), compiled);
+    catalog: *view_catalog.Catalog,
+    query: folding.Query,
+) !folding.Outcome {
+    const folded = try folding.foldQuery(db.allocator, catalog, &db.strings, query);
+    db.allocator.free(folded.answer_variables);
+    return folded.outcome;
 }
 
 fn defineView(
@@ -5587,8 +5545,8 @@ fn answerTuples(result: *const results.QueryResult) ![][]u8 {
 fn evenPathProblem(
     db: *database.Database,
     catalog: *view_catalog.Catalog,
-    rules: *[2]fold_ir.Rule,
-) ![]fold_ir.Goal {
+    rules: *[2]syntax.Rule,
+) ![]syntax.Clause {
     const x = input.variable("X");
     const y = input.variable("Y");
     const z = input.variable("Z");
@@ -5596,16 +5554,16 @@ fn evenPathProblem(
         input.relation("edge", &.{ x, y }),
         input.relation("edge", &.{ y, z }),
     }, .materialized);
-    rules[0] = try foldingRule(db, &catalog.symbols, input.fact("q", &.{ x, y }), &.{
+    rules[0] = try foldingRule(db, input.fact("q", &.{ x, y }), &.{
         input.relation("edge", &.{ x, y }),
     });
-    errdefer fold_ir.freeRule(db.allocator, rules[0]);
-    rules[1] = try foldingRule(db, &catalog.symbols, input.fact("q", &.{ x, z }), &.{
+    errdefer syntax.freeRule(db.allocator, rules[0]);
+    rules[1] = try foldingRule(db, input.fact("q", &.{ x, z }), &.{
         input.relation("edge", &.{ x, y }),
         input.relation("q", &.{ y, z }),
     });
-    errdefer fold_ir.freeRule(db.allocator, rules[1]);
-    return foldingGoals(db, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
+    errdefer syntax.freeRule(db.allocator, rules[1]);
+    return foldingGoals(db, &.{input.relation("q", &.{ x, y })});
 }
 
 test "an inverted view answers Chapter 6's even-length paths from its extension alone" {
@@ -5621,12 +5579,12 @@ test "an inverted view answers Chapter 6's even-length paths from its extension 
 
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
-    var rules: [2]fold_ir.Rule = undefined;
+    var rules: [2]syntax.Rule = undefined;
     const goals = try evenPathProblem(&db.state, &catalog, &rules);
-    defer fold_ir.freeGoals(allocator, goals);
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    defer freeClauses(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     // A view remembers pairs two edges apart and nothing else, so no plan over
     // it can answer every path. Maximal containment is the whole claim.
@@ -5672,9 +5630,8 @@ test "a comparison a reconstructed value cannot answer costs answers, not soundn
     // q(X, Z) :- edge(X, Y), edge(Y, Z), X != Z. The middle node is
     // reconstructed and has no name, so the instances that would compare it
     // cannot be run; the one that compares the two ends can.
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ x, z }),
         &.{
             input.relation("edge", &.{ x, y }),
@@ -5682,11 +5639,11 @@ test "a comparison a reconstructed value cannot answer costs answers, not soundn
             input.notEqual(x, z),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, z })});
-    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{input.relation("q", &.{ x, z })});
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     // Dropping an instance answers less, which is sound and is not maximal.
     try std.testing.expectEqual(folding.Guarantee.contained, outcome.guarantee());
@@ -5772,11 +5729,11 @@ test "every answer a folded plan returns is one the query would have returned" {
     defer planned.deinit();
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
-    var rules: [2]fold_ir.Rule = undefined;
+    var rules: [2]syntax.Rule = undefined;
     const goals = try evenPathProblem(&planned.state, &catalog, &rules);
-    defer fold_ir.freeGoals(allocator, goals);
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    defer freeClauses(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    var outcome = try foldCompiled(&planned.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     var executable = try folding.lowerPlan(
         allocator,
@@ -5836,17 +5793,17 @@ fn foldingAllocationScenario(allocator: std.mem.Allocator) !void {
 
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
-    var rules: [2]fold_ir.Rule = undefined;
+    var rules: [2]syntax.Rule = undefined;
     const goals = try evenPathProblem(&db.state, &catalog, &rules);
-    defer fold_ir.freeGoals(allocator, goals);
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    defer freeClauses(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
 
     const names: fold_ir.Names = .{
         .symbols = &catalog.symbols,
         .strings = &db.state.strings,
         .scalars = &db.state.eval.scalars,
     };
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     allocator.free(try outcome.explainAlloc(allocator, names));
     if (outcome.guarantee() != .maximally_contained) return error.UnexpectedGuarantee;
@@ -5870,9 +5827,15 @@ test "a predicate the query derives from a reconstruction is no more exact than 
     // The hole a relation-by-relation check leaves. `reach` is the query's own
     // predicate, so nothing about it is reconstructed — but it is derived from
     // `edge`, which is, so the plan knows less of `reach` than the query does
-    // and `not reach(...)` is therefore true of more. With edges a->x, x->b and
-    // a->b the view stores only (a, b), the query answers nothing, and a plan
-    // that let this through would answer (a, b).
+    // and `not reach(...)` is therefore true of more. Every edge is a pair
+    // `reach` holds, so the query answers nothing; a plan that let this
+    // through would answer whichever reconstructed edges its own `reach`
+    // failed to derive.
+    //
+    // The positive goal reads `edge` rather than the view, because a goal
+    // names a relation and which relations are views is the catalog's
+    // business. Reading `edge` positively is no objection — a reconstruction
+    // can stand in for it there — so the refusal is `reach`'s alone.
     const allocator = std.testing.allocator;
     var db: Jatalog = .init(allocator);
     defer db.deinit();
@@ -5883,29 +5846,24 @@ test "a predicate the query derives from a reconstruction is no more exact than 
     const x = input.variable("X");
     const y = input.variable("Y");
     const z = input.variable("Z");
-    const view = try defineView(&db.state, &catalog, input.fact("v", &.{ x, z }), &.{
+    _ = try defineView(&db.state, &catalog, input.fact("v", &.{ x, z }), &.{
         input.relation("edge", &.{ x, y }),
         input.relation("edge", &.{ y, z }),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("reach", &.{ x, y }),
         &.{input.relation("edge", &.{ x, y })},
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
-        input.relation("v", &.{ x, y }),
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
+        input.relation("edge", &.{ x, y }),
         input.not("reach", &.{ x, y }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
-    // Lowering points every goal at a base relation, because which of them is
-    // a view is the catalog's business rather than the language's. A query
-    // that means the view says so here.
-    goals[0].relation.predicate = catalog.view(view).predicate();
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
     try std.testing.expectEqual(
@@ -5960,17 +5918,16 @@ test "inverting a view that collected a list reads the values back out of it" {
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ x, y }),
         &.{ input.relation("r", &.{ x, y }), input.relation("p", &.{ y, z }) },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
-    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{input.relation("q", &.{ x, y })});
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
 
@@ -6035,9 +5992,8 @@ test "a value projected out of an aggregate is a witness per element, not per tu
         input.setof(y, &.{input.relation("r", &.{ x, y, w })}, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ first, second }),
         &.{
             input.relation("r", &.{ x, first, w }),
@@ -6045,15 +6001,14 @@ test "a value projected out of an aggregate is a witness per element, not per tu
             input.notEqual(first, second),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
     const goals = try foldingGoals(
         &db.state,
-        &catalog.symbols,
         &.{input.relation("q", &.{ first, second })},
     );
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     var executable = try folding.lowerPlan(
         allocator,
@@ -6114,17 +6069,16 @@ test "an aggregate nested in another is read by chaining into the list it collec
         }, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ y, z }),
         &.{ input.relation("s", &.{ y, z }), input.relation("r", &.{ x, y }) },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ y, z })});
-    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{input.relation("q", &.{ y, z })});
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
 
@@ -6184,22 +6138,21 @@ test "two aggregates side by side collect for themselves, not for each other" {
         input.setof(y, &.{input.relation("t", &.{ x, y, w })}, second),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ input.variable("Y1"), input.variable("Y2") }),
         &.{
             input.relation("r", &.{ x, input.variable("Y1"), w }),
             input.relation("t", &.{ x, input.variable("Y2"), w }),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ input.variable("Y1"), input.variable("Y2") }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     var executable = try folding.lowerPlan(
         allocator,
@@ -6233,17 +6186,16 @@ fn collectingAllocationScenario(allocator: std.mem.Allocator) !void {
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ x, y }),
         &.{ input.relation("r", &.{ x, y }), input.relation("p", &.{ y, z }) },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{input.relation("q", &.{ x, y })});
-    defer fold_ir.freeGoals(allocator, goals);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{input.relation("q", &.{ x, y })});
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     allocator.free(try outcome.explainAlloc(allocator, .{
         .symbols = &catalog.symbols,
@@ -6312,12 +6264,11 @@ fn defineCanonicalView(
 /// output they ask for, and whose containment differs entirely because of it.
 fn collectingQueryRule(
     db: *database.Database,
-    symbols: *fold_ir.Symbols,
     key: input.Term,
     output: input.Term,
-) !fold_ir.Rule {
+) !syntax.Rule {
     const y = input.variable("Y");
-    return foldingRule(db, symbols, input.fact("q", &.{key}), &.{
+    return foldingRule(db, input.fact("q", &.{key}), &.{
         input.setof(y, &.{input.relation("r", &.{ key, y })}, output),
     });
 }
@@ -6364,22 +6315,21 @@ test "Chapter 6's empty-set counterexample is refused and the query beside it is
     defer catalog.deinit();
     _ = try defineCollectingView(&db.state, &catalog, .materialized);
 
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{input.variable("X")}),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
     // q(a) :- setof(Y, r(a, Y), []). Nothing discharges the refusal: the view
     // is not a canonical aggregate view of `r`, and a query asking for an
     // empty set is not monotonic.
-    var refused_rules = [_]fold_ir.Rule{try collectingQueryRule(
+    var refused_rules = [_]syntax.Rule{try collectingQueryRule(
         &db.state,
-        &catalog.symbols,
         input.atom("a"),
         input.list(&.{}),
     )};
-    defer for (refused_rules) |rule| fold_ir.freeRule(allocator, rule);
-    var refused = try folding.foldQuery(allocator, &catalog, .{
+    defer for (refused_rules) |rule| syntax.freeRule(allocator, rule);
+    var refused = try foldCompiled(&db.state, &catalog, .{
         .goals = goals,
         .rules = &refused_rules,
     });
@@ -6396,14 +6346,13 @@ test "Chapter 6's empty-set counterexample is refused and the query beside it is
     const head = input.variable("H");
     const tail = input.variable("T");
     const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
-    var admitted_rules = [_]fold_ir.Rule{try collectingQueryRule(
+    var admitted_rules = [_]syntax.Rule{try collectingQueryRule(
         &db.state,
-        &catalog.symbols,
         input.atom("c"),
         input.cons(&pair),
     )};
-    defer for (admitted_rules) |rule| fold_ir.freeRule(allocator, rule);
-    var admitted = try folding.foldQuery(allocator, &catalog, .{
+    defer for (admitted_rules) |rule| syntax.freeRule(allocator, rule);
+    var admitted = try foldCompiled(&db.state, &catalog, .{
         .goals = goals,
         .rules = &admitted_rules,
     });
@@ -6500,18 +6449,17 @@ test "a canonical aggregate view folds a query no monotonicity argument covers" 
     // Without the canonical view the fold has nothing to offer, and says so as
     // the read it could not allow rather than as a missing relation.
     {
-        const goals = try foldingGoals(&db.state, &without.symbols, &.{
+        const goals = try foldingGoals(&db.state, &.{
             input.relation("q", &.{x}),
         });
-        defer fold_ir.freeGoals(allocator, goals);
-        var rules = [_]fold_ir.Rule{try collectingQueryRule(
+        defer freeClauses(allocator, goals);
+        var rules = [_]syntax.Rule{try collectingQueryRule(
             &db.state,
-            &without.symbols,
             input.atom("a"),
             input.list(&.{}),
         )};
-        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-        var outcome = try folding.foldQuery(allocator, &without, .{
+        defer for (rules) |rule| syntax.freeRule(allocator, rule);
+        var outcome = try foldCompiled(&db.state, &without, .{
             .goals = goals,
             .rules = &rules,
         });
@@ -6523,18 +6471,17 @@ test "a canonical aggregate view folds a query no monotonicity argument covers" 
         );
     }
 
-    const goals = try foldingGoals(&db.state, &with.symbols, &.{
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{x}),
     });
-    defer fold_ir.freeGoals(allocator, goals);
-    var rules = [_]fold_ir.Rule{try collectingQueryRule(
+    defer freeClauses(allocator, goals);
+    var rules = [_]syntax.Rule{try collectingQueryRule(
         &db.state,
-        &with.symbols,
         input.atom("a"),
         input.list(&.{}),
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    var outcome = try folding.foldQuery(allocator, &with, .{ .goals = goals, .rules = &rules });
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    var outcome = try foldCompiled(&db.state, &with, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
     const explained = try outcome.explainAlloc(allocator, .{
@@ -6621,19 +6568,18 @@ test "a view that projected its collected list away still remembers its outer go
             input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
         }, .materialized);
 
-        var rules = [_]fold_ir.Rule{try foldingRule(
+        var rules = [_]syntax.Rule{try foldingRule(
             &db.state,
-            &catalog.symbols,
             input.fact("q", &.{x}),
             &.{input.relation("p", &.{ x, s })},
         )};
-        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        defer for (rules) |rule| syntax.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &.{
             input.relation("q", &.{x}),
         });
-        defer fold_ir.freeGoals(allocator, goals);
+        defer freeClauses(allocator, goals);
 
-        var outcome = try folding.foldQuery(allocator, &catalog, .{
+        var outcome = try foldCompiled(&db.state, &catalog, .{
             .goals = goals,
             .rules = &rules,
         });
@@ -6670,19 +6616,18 @@ test "a view that projected its collected list away still remembers its outer go
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &second.state,
-        &catalog.symbols,
         input.fact("t", &.{ x, y }),
         &.{input.relation("r", &.{ x, y })},
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&second.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&second.state, &.{
         input.relation("t", &.{ x, y }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{
+    var outcome = try foldCompiled(&second.state, &catalog, .{
         .goals = goals,
         .rules = &rules,
     });
@@ -6790,22 +6735,21 @@ test "bounded exhaustive models find no counterexample to either discharge" {
     const head = input.variable("H");
     const tail = input.variable("T");
     const pair: input.Term.Cons = .{ .head = &head, .tail = &tail };
-    var rules = [_]fold_ir.Rule{try foldingRule(
+    var rules = [_]syntax.Rule{try foldingRule(
         &planned.state,
-        &catalog.symbols,
         input.fact("q", &.{x}),
         &.{
             input.relation("p", &.{x}),
             input.setof(y, &.{input.relation("r", &.{ y, x })}, input.cons(&pair)),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&planned.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&planned.state, &.{
         input.relation("q", &.{x}),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{
+    var outcome = try foldCompiled(&planned.state, &catalog, .{
         .goals = goals,
         .rules = &rules,
     });
@@ -6863,19 +6807,18 @@ test "bounded exhaustive models find no counterexample to either discharge" {
     defer exact.deinit();
     _ = try defineCanonicalView(&canonical.state, &exact, .materialized);
 
-    var counting = [_]fold_ir.Rule{try collectingQueryRule(
+    var counting = [_]syntax.Rule{try collectingQueryRule(
         &canonical.state,
-        &exact.symbols,
         input.atom("a"),
         input.list(&.{}),
     )};
-    defer for (counting) |rule| fold_ir.freeRule(allocator, rule);
-    const asked = try foldingGoals(&canonical.state, &exact.symbols, &.{
+    defer for (counting) |rule| syntax.freeRule(allocator, rule);
+    const asked = try foldingGoals(&canonical.state, &.{
         input.relation("q", &.{x}),
     });
-    defer fold_ir.freeGoals(allocator, asked);
+    defer freeClauses(allocator, asked);
 
-    var folding_outcome = try folding.foldQuery(allocator, &exact, .{
+    var folding_outcome = try foldCompiled(&canonical.state, &exact, .{
         .goals = asked,
         .rules = &counting,
     });
@@ -6944,19 +6887,18 @@ fn restrictedFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    var rules = [_]fold_ir.Rule{try collectingQueryRule(
+    var rules = [_]syntax.Rule{try collectingQueryRule(
         &db.state,
-        &catalog.symbols,
         input.atom("a"),
         input.list(&.{}),
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{x}),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     allocator.free(try outcome.explainAlloc(allocator, .{
         .symbols = &catalog.symbols,
@@ -7048,7 +6990,7 @@ const Excess = struct {
 
     /// `excess(L, E) :- sum(L, T), length(L, C), E = T - C.` and
     /// `q(X, E) :- p(X), setof(Y, r(X, Y), S), excess(S, E).`
-    fn query(db: *database.Database, symbols: *fold_ir.Symbols, into: *[2]fold_ir.Rule) !void {
+    fn query(db: *database.Database, into: *[2]syntax.Rule) !void {
         const x = input.variable("X");
         const y = input.variable("Y");
         const s = input.variable("S");
@@ -7056,13 +6998,13 @@ const Excess = struct {
         const c = input.variable("C");
         const l = input.variable("L");
         const e = input.variable("E");
-        into[0] = try foldingRule(db, symbols, input.fact("excess", &.{ l, e }), &.{
+        into[0] = try foldingRule(db, input.fact("excess", &.{ l, e }), &.{
             input.relation("sum", &.{ l, t }),
             input.relation("length", &.{ l, c }),
             input.subtract(e, t, c),
         });
-        errdefer fold_ir.freeRule(db.allocator, into[0]);
-        into[1] = try foldingRule(db, symbols, input.fact("q", &.{ x, e }), &.{
+        errdefer syntax.freeRule(db.allocator, into[0]);
+        into[1] = try foldingRule(db, input.fact("q", &.{ x, e }), &.{
             input.relation("p", &.{x}),
             input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
             input.relation("excess", &.{ s, e }),
@@ -7109,15 +7051,15 @@ test "a list function no view exposes is folded through the two that do" {
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
     try Excess.catalog(&db.state, &catalog);
-    var rules: [2]fold_ir.Rule = undefined;
-    try Excess.query(&db.state, &catalog.symbols, &rules);
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    var rules: [2]syntax.Rule = undefined;
+    try Excess.query(&db.state, &rules);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ input.variable("X"), input.variable("E") }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
 
@@ -7191,24 +7133,23 @@ test "Example 6.5.1's recursive list function is refused rather than merely surv
 
     // sum(H!T2, S) :- sum(T2, A), S = A + H. Appendix B's definition, handed
     // to the fold as one of the query's own rules.
-    var rules: [3]fold_ir.Rule = undefined;
-    try Excess.query(&db.state, &catalog.symbols, rules[0..2]);
+    var rules: [3]syntax.Rule = undefined;
+    try Excess.query(&db.state, rules[0..2]);
     rules[2] = try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("sum", &.{ input.cons(&pair), s }),
         &.{
             input.relation("sum", &.{ tail, t }),
             input.add(s, t, head),
         },
     );
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ x, e }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.unsupported, outcome.guarantee());
     var refused = false;
@@ -7231,7 +7172,7 @@ test "Example 6.5.1's recursive list function is refused rather than merely surv
 
     // The same query without that rule is the one the phase folds, so the
     // refusal is the rule and not the setting.
-    var without = try folding.foldQuery(allocator, &catalog, .{
+    var without = try foldCompiled(&db.state, &catalog, .{
         .goals = goals,
         .rules = rules[0..2],
     });
@@ -7247,18 +7188,17 @@ test "Example 6.5.1's recursive list function is refused rather than merely surv
     _ = try defineView(&db.state, &recursive, input.fact("sum", &.{ input.cons(&pair), s }), &.{
         input.relation("sum", &.{ tail, t }),
     }, .materialized);
-    const rules_only = [_]fold_ir.Rule{try foldingRule(
+    const rules_only = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &recursive.symbols,
         input.fact("total", &.{ y, s }),
         &.{input.relation("sum", &.{ y, s })},
     )};
-    defer for (rules_only) |rule| fold_ir.freeRule(allocator, rule);
-    const asking = try foldingGoals(&db.state, &recursive.symbols, &.{
+    defer for (rules_only) |rule| syntax.freeRule(allocator, rule);
+    const asking = try foldingGoals(&db.state, &.{
         input.relation("total", &.{ y, s }),
     });
-    defer fold_ir.freeGoals(allocator, asking);
-    var view_side = try folding.foldQuery(allocator, &recursive, .{
+    defer freeClauses(allocator, asking);
+    var view_side = try foldCompiled(&db.state, &recursive, .{
         .goals = asking,
         .rules = &rules_only,
     });
@@ -7331,9 +7271,8 @@ test "a plan whose views leave the collected set undetermined is unsupported" {
         defer catalog.deinit();
         try defineLinkedView(&db.state, &catalog, keeps);
 
-        const rules = [_]fold_ir.Rule{try foldingRule(
+        const rules = [_]syntax.Rule{try foldingRule(
             &db.state,
-            &catalog.symbols,
             input.fact("q", &.{ z, t }),
             &.{
                 input.relation("link", &.{ x, z }),
@@ -7341,13 +7280,13 @@ test "a plan whose views leave the collected set undetermined is unsupported" {
                 input.relation("sum", &.{ s, t }),
             },
         )};
-        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        defer for (rules) |rule| syntax.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &.{
             input.relation("q", &.{ z, t }),
         });
-        defer fold_ir.freeGoals(allocator, goals);
+        defer freeClauses(allocator, goals);
 
-        var outcome = try folding.foldQuery(allocator, &catalog, .{
+        var outcome = try foldCompiled(&db.state, &catalog, .{
             .goals = goals,
             .rules = &rules,
         });
@@ -7441,22 +7380,21 @@ test "a set collected from a relation the plan half knows is refused, monotonic 
             input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
         }, .materialized);
 
-        const rules = [_]fold_ir.Rule{try foldingRule(
+        const rules = [_]syntax.Rule{try foldingRule(
             &db.state,
-            &catalog.symbols,
             input.fact("q", &.{ x, t }),
             &.{
                 input.relation("asked", &.{ x, s }),
                 input.relation("sum", &.{ s, t }),
             },
         )};
-        defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-        const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+        defer for (rules) |rule| syntax.freeRule(allocator, rule);
+        const goals = try foldingGoals(&db.state, &.{
             input.relation("q", &.{ x, t }),
         });
-        defer fold_ir.freeGoals(allocator, goals);
+        defer freeClauses(allocator, goals);
 
-        var outcome = try folding.foldQuery(allocator, &catalog, .{
+        var outcome = try foldCompiled(&db.state, &catalog, .{
             .goals = goals,
             .rules = &rules,
         });
@@ -7587,15 +7525,15 @@ test "bounded exhaustive models find no counterexample to the folded list functi
     var catalog: view_catalog.Catalog = .init(allocator);
     defer catalog.deinit();
     try Excess.catalog(&planned.state, &catalog);
-    var rules: [2]fold_ir.Rule = undefined;
-    try Excess.query(&planned.state, &catalog.symbols, &rules);
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&planned.state, &catalog.symbols, &.{
+    var rules: [2]syntax.Rule = undefined;
+    try Excess.query(&planned.state, &rules);
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&planned.state, &.{
         input.relation("q", &.{ input.variable("X"), input.variable("E") }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&planned.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
     var executable = try folding.lowerPlan(
@@ -7693,25 +7631,25 @@ fn listFunctionFoldingAllocationScenario(allocator: std.mem.Allocator) !void {
     // Built one at a time, because an array initializer whose second element
     // fails never assigns the array and never reaches the `defer` that would
     // have released the first.
-    var rules: [2]fold_ir.Rule = undefined;
+    var rules: [2]syntax.Rule = undefined;
     var built: usize = 0;
-    defer for (rules[0..built]) |rule| fold_ir.freeRule(allocator, rule);
-    rules[0] = try foldingRule(&db.state, &catalog.symbols, input.fact("total", &.{ l, t }), &.{
+    defer for (rules[0..built]) |rule| syntax.freeRule(allocator, rule);
+    rules[0] = try foldingRule(&db.state, input.fact("total", &.{ l, t }), &.{
         input.relation("sum", &.{ l, t }),
     });
     built = 1;
-    rules[1] = try foldingRule(&db.state, &catalog.symbols, input.fact("q", &.{ x, t }), &.{
+    rules[1] = try foldingRule(&db.state, input.fact("q", &.{ x, t }), &.{
         input.relation("p", &.{x}),
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
         input.relation("total", &.{ s, t }),
     });
     built = 2;
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ x, t }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     allocator.free(try outcome.explainAlloc(allocator, .{
         .symbols = &catalog.symbols,
@@ -7806,9 +7744,8 @@ test "identifying two collected sets that were never one answers more than the q
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    const rules = [_]fold_ir.Rule{try foldingRule(
+    const rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ x, e }),
         &.{
             input.relation("p", &.{x}),
@@ -7818,13 +7755,13 @@ test "identifying two collected sets that were never one answers more than the q
             input.subtract(e, t, c),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ x, e }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     try std.testing.expectEqual(folding.Guarantee.maximally_contained, outcome.guarantee());
 
@@ -7918,9 +7855,8 @@ test "an auxiliary view whose group a plan cannot name derives nothing rather th
         input.setof(y, &.{input.relation("r", &.{ x, y })}, s),
     }, .materialized);
 
-    const rules = [_]fold_ir.Rule{try foldingRule(
+    const rules = [_]syntax.Rule{try foldingRule(
         &db.state,
-        &catalog.symbols,
         input.fact("q", &.{ x, w, t }),
         &.{
             input.relation("p", &.{x}),
@@ -7929,13 +7865,13 @@ test "an auxiliary view whose group a plan cannot name derives nothing rather th
             input.relation("sum", &.{ s, t }),
         },
     )};
-    defer for (rules) |rule| fold_ir.freeRule(allocator, rule);
-    const goals = try foldingGoals(&db.state, &catalog.symbols, &.{
+    defer for (rules) |rule| syntax.freeRule(allocator, rule);
+    const goals = try foldingGoals(&db.state, &.{
         input.relation("q", &.{ x, w, t }),
     });
-    defer fold_ir.freeGoals(allocator, goals);
+    defer freeClauses(allocator, goals);
 
-    var outcome = try folding.foldQuery(allocator, &catalog, .{ .goals = goals, .rules = &rules });
+    var outcome = try foldCompiled(&db.state, &catalog, .{ .goals = goals, .rules = &rules });
     defer outcome.deinit();
     // Dropping an instance answers less, which is sound and is not maximal.
     try std.testing.expectEqual(folding.Guarantee.contained, outcome.guarantee());
