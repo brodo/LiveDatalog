@@ -1,0 +1,54 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zig:
+    name: Zig tests, format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Formatting, ziglint, the library, CLI and server tests, and the
+      # CLI example check.
+      - run: zig build test --summary all
+
+  tree-sitter:
+    name: Tree-sitter grammar
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tree-sitter-livedatalog
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tree-sitter-livedatalog/package-lock.json
+
+      - run: npm ci
+
+      - name: Check the generated parser is up to date
+        run: |
+          npx tree-sitter generate
+          git diff --exit-code -- src
+
+      # Corpus and highlight tests, then parse every example program.
+      - run: npm test
