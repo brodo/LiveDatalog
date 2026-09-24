@@ -43,6 +43,11 @@ var watcher: ?Io.Future(Io.Cancelable!void) = null;
 var server_name_buffer: [64]u8 = undefined;
 var server_name: []const u8 = "";
 var show_errors = false;
+/// The `Model.table_revision` the grid's columns were last sized for.
+var sized_revision: ?u64 = null;
+/// The share of the window's width the predicate list takes. Dragging the
+/// sash between it and the table changes it.
+var sidebar_ratio: f32 = 0.22;
 
 fn parseAddress(args: []const [:0]const u8) !Io.net.IpAddress {
     var host: []const u8 = "127.0.0.1";
@@ -102,7 +107,11 @@ fn appFrame() !dvui.App.Result {
     statusBar();
     if (show_errors) loadErrors();
 
-    var paned = dvui.paned(@src(), .{ .direction = .horizontal, .collapsed_size = 0 }, .{ .expand = .both });
+    var paned = dvui.paned(@src(), .{
+        .direction = .horizontal,
+        .collapsed_size = 0,
+        .split_ratio = &sidebar_ratio,
+    }, .{ .expand = .both });
     defer paned.deinit();
     if (paned.showFirst()) try predicateList();
     if (paned.showSecond()) try table();
@@ -212,6 +221,12 @@ fn table() !void {
         .rows = total,
     }, .{ .expand = .both, .id_extra = @truncate(grid_id) });
     defer grid.deinit();
+    // Fit the columns and rows to what is on show whenever new rows arrive.
+    // Sizing takes a few frames to settle, which the grid schedules itself.
+    if (sized_revision != model.table_revision) {
+        grid.autoSize(.both);
+        sized_revision = model.table_revision;
+    }
 
     for (0..selection.arity) |column| {
         const header = grid.colHeader(.{ .col = column }, .{ .border = .all(1) });

@@ -42,6 +42,8 @@ selection: ?Selection = null,
 visible: [2]usize = .{ 0, 0 },
 /// What was fetched for `selection`, once its schema is in.
 table: ?Table = null,
+/// Counts the changes to `table`: a new schema or a new page.
+table_revision: u64 = 0,
 
 /// Wakes the fetcher. Holds at most one pending wake.
 fetch_signal: Io.Queue(u8),
@@ -403,6 +405,7 @@ fn fetchSchema(
     defer self.mutex.unlock(self.io);
     if (self.table) |*old| old.deinit(self.gpa);
     self.table = table;
+    self.table_revision += 1;
 }
 
 fn fetchPage(
@@ -450,6 +453,7 @@ fn fetchPage(
     if (!table.selection.eql(selection) or table.generation != generation) return fetched.arena.deinit();
     if (table.pages.count() >= max_pages) evictFarthest(table, page);
     try table.pages.put(self.gpa, page, fetched);
+    self.table_revision += 1;
 }
 
 /// Drops the cached page farthest from `page`.
