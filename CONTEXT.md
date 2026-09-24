@@ -622,7 +622,22 @@ off by whatever has been typed since.
 ### Definition
 
 Where a predicate is defined, for going to it from any place it is named. A
-predicate with a schema is defined by its schema, which says what it holds;
+predicate with a schema is defined by its schema, which says what it holds
+— including for the arities the schema rules out;
 otherwise by the rules whose head it is; otherwise by its facts. Each of
 these may be several statements in several files — including identical
 schemas, which the engine accepts — and every one of them is a definition.
+
+### Reference
+
+Any place a statement in a loaded file names a predicate: a head, a goal in a
+body, query or retraction — including goals under `not` and inside `setof` —
+or a schema. A predicate is its name *and* arity, so `edge(a)` and
+`edge(a, b)` never refer to each other — except through a schema, which
+declares the one arity its name may have: `schema edge(atom, atom).` is a
+reference to, and the definition of, `edge` at every arity, since it is what
+rejects `edge(a)`. Every definition is also a reference; the other
+references are those that use the predicate rather than say what it holds,
+which is why a fact of a predicate that has rules is a reference but not a
+definition. Like definitions, references are read from the files as loaded,
+never from a draft.

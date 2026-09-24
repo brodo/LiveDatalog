@@ -7,7 +7,8 @@ brings two parts of this repository into the editor:
   bracket matching, the outline, indentation, comment toggling and Vim text
   objects;
 - the development server's [language listener](../README.md#language-listener),
-  for diagnostics, hover and go to definition.
+  for diagnostics, hover, go to definition, find references, document
+  highlights, project symbols and completion.
 
 ## Install
 

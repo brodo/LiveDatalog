@@ -61,7 +61,7 @@ lists, and aggregation, read the [LiveDatalog language tutorial](docs/language-t
 
 [`tree-sitter-livedatalog`](tree-sitter-livedatalog) is a tree-sitter grammar
 for `.dl` files. It includes highlighting, scope and folding queries for
-editors that use tree-sitter. For diagnostics, hover and go to definition,
+editors that use tree-sitter. For diagnostics, navigation and completion,
 connect the editor to the development server's language listener.
 
 [`zed-livedatalog`](zed-livedatalog) is a [Zed](https://zed.dev) extension
@@ -108,11 +108,20 @@ It offers:
   how many of each the database holds, its schema, and the files defining it.
 - **Go to definition**: the predicate's schema, or else the rules whose head
   it is, or else its facts, in every loaded file.
+- **Find references**: every place a loaded file names the predicate, with or
+  without its definitions. `edge/2` and `edge/3` are different predicates.
+- **Document highlight**: the other places the open document names the
+  predicate, with its definitions marked as writes and its uses as reads.
+- **Workspace symbols**: every defined predicate, as `name/arity`, found by
+  typing part of its name.
+- **Completion** of predicate names wherever a goal can start — not inside a
+  relation's arguments — inserting a placeholder per column, named after the
+  schema's columns where they have names.
 
-What you type is never loaded: hover and definition describe the database the
-saved files built, and a draft that does not parse is read at the positions of
-its last version that did. Files outside the watched directory get hover and
-definition too. Positions are counted in UTF-8 when the editor offers it, and
+What you type is never loaded: everything the listener says about a predicate
+describes the database the saved files built, and a draft that does not parse
+is read at the positions of its last version that did. Files outside the
+watched directory get these features too. Positions are counted in UTF-8 when the editor offers it, and
 in UTF-16 otherwise.
 
 An editor that can only launch a language server over stdio can bridge to the

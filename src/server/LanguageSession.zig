@@ -1,6 +1,6 @@
 //! What the language listener says to one editor: the Language Server
-//! Protocol handler for a connection. See "Development server", "Draft" and
-//! "Definition" in CONTEXT.md.
+//! Protocol handler for a connection. See "Development server", "Draft",
+//! "Definition" and "Reference" in CONTEXT.md.
 //!
 //! A `LanguageSession` keeps the drafts the editor has open and parses them for
 //! their syntax errors and for which predicate a position names. Everything
@@ -374,6 +374,10 @@ pub fn initialize(
             } },
             .hoverProvider = .{ .bool = true },
             .definitionProvider = .{ .bool = true },
+            .referencesProvider = .{ .bool = true },
+            .documentHighlightProvider = .{ .bool = true },
+            .workspaceSymbolProvider = .{ .bool = true },
+            .completionProvider = .{},
         },
     };
 }
@@ -539,10 +543,10 @@ fn describe(
     for (try sortedPaths(arena, engine)) |path| {
         const source = engine.files.getPtr(path).?;
         var defines = false;
-        var heads = Heads.init(source.parsed.value, predicate, arity);
-        while (heads.next()) |head| {
+        var heads = Occurrences.init(source.parsed.value, predicate, arity);
+        while (heads.nextHead()) |head| {
             defines = true;
-            switch (head.kind) {
+            switch (head.defines.?) {
                 .fact => has_facts = true,
                 .rule => has_rules = true,
                 .schema => {
@@ -649,18 +653,12 @@ fn definitions(
     for (try sortedPaths(arena, engine)) |path| {
         const source = engine.files.getPtr(path).?;
         const uri = try pathToUri(arena, path);
-        // Names come in source order, so positions advance through the text.
-        var position: types.Position = .{ .line = 0, .character = 0 };
-        var index: usize = 0;
-        var heads = Heads.init(source.parsed.value, predicate, arity);
-        while (heads.next()) |head| {
-            const start = offsets.advancePosition(source.text, position, index, head.span.start, encoding);
-            const end = offsets.advancePosition(source.text, start, head.span.start, head.span.end, encoding);
-            position = end;
-            index = head.span.end;
-            try by_kind[@intFromEnum(head.kind)].append(arena, .{
+        var ranges: Ranges = .{ .text = source.text, .encoding = encoding };
+        var heads = Occurrences.init(source.parsed.value, predicate, arity);
+        while (heads.nextHead()) |head| {
+            try by_kind[@intFromEnum(head.defines.?)].append(arena, .{
                 .uri = uri,
-                .range = .{ .start = start, .end = end },
+                .range = ranges.of(head.span),
             });
         }
     }
@@ -668,45 +666,83 @@ fn definitions(
     return &.{};
 }
 
-/// The statements of a program that define one predicate: its schemas, and
-/// the facts and rules whose head it is.
-const Heads = struct {
+/// How a statement defines the predicate its first name names, in the order
+/// `definitions` prefers them.
+const Definer = enum { schema, rule, fact };
+
+/// What `program.names[index]` defines: the kind of its statement when it is
+/// that statement's head (or schema name), else null — a use, not a
+/// definition.
+fn definerAt(program: LiveDatalog.Program, index: usize) ?Definer {
+    const names = program.names;
+    // The first name of a statement is its head's, or its schema's.
+    if (index != 0 and names[index - 1].statement == names[index].statement) return null;
+    return switch (program.statements[names[index].statement]) {
+        .schema => .schema,
+        .rule => .rule,
+        .fact => .fact,
+        .query, .retraction => null,
+    };
+}
+
+/// The references to one predicate in a program, in source order: its name
+/// with its arity, and its name's schema whatever arity the schema has. See
+/// "Reference" in CONTEXT.md.
+const Occurrences = struct {
     program: LiveDatalog.Program,
     predicate: []const u8,
     arity: usize,
     index: usize = 0,
 
-    /// In the order `definitions` prefers them.
-    const Kind = enum { schema, rule, fact };
-
-    const Head = struct {
-        kind: Kind,
+    const Occurrence = struct {
+        /// Set when this reference is also a definition.
+        defines: ?Definer,
         statement: usize,
-        /// The head's predicate name, as written.
+        /// The predicate's name, as written.
         span: LiveDatalog.Span,
     };
 
-    fn init(program: LiveDatalog.Program, predicate: []const u8, arity: usize) Heads {
+    fn init(program: LiveDatalog.Program, predicate: []const u8, arity: usize) Occurrences {
         return .{ .program = program, .predicate = predicate, .arity = arity };
     }
 
-    fn next(self: *Heads) ?Head {
+    fn next(self: *Occurrences) ?Occurrence {
         const names = self.program.names;
         while (self.index < names.len) {
-            const name = names[self.index];
+            const index = self.index;
             self.index += 1;
-            // The first name of a statement is its head's, or its schema's.
-            if (self.index > 1 and names[self.index - 2].statement == name.statement) continue;
-            if (name.arity != self.arity or !std.mem.eql(u8, name.predicate, self.predicate)) continue;
-            const kind: Kind = switch (self.program.statements[name.statement]) {
-                .schema => .schema,
-                .rule => .rule,
-                .fact => .fact,
-                .query, .retraction => continue,
-            };
-            return .{ .kind = kind, .statement = name.statement, .span = name.span };
+            const name = names[index];
+            if (!std.mem.eql(u8, name.predicate, self.predicate)) continue;
+            const defines = definerAt(self.program, index);
+            // A schema declares its name's only arity, so it defines the
+            // name at every arity, including those it rules out.
+            if (name.arity != self.arity and defines != .schema) continue;
+            return .{ .defines = defines, .statement = name.statement, .span = name.span };
         }
         return null;
+    }
+
+    /// The next reference that is a schema, or the head of a fact or rule.
+    fn nextHead(self: *Occurrences) ?Occurrence {
+        while (self.next()) |occurrence| if (occurrence.defines != null) return occurrence;
+        return null;
+    }
+};
+
+/// The ranges of spans taken in source order, each counted on from the last
+/// so that a text is walked once however many spans it has.
+const Ranges = struct {
+    text: []const u8,
+    encoding: offsets.Encoding,
+    position: types.Position = .{ .line = 0, .character = 0 },
+    index: usize = 0,
+
+    fn of(self: *Ranges, span: LiveDatalog.Span) types.Range {
+        const start = offsets.advancePosition(self.text, self.position, self.index, span.start, self.encoding);
+        const end = offsets.advancePosition(self.text, start, span.start, span.end, self.encoding);
+        self.position = end;
+        self.index = span.end;
+        return .{ .start = start, .end = end };
     }
 };
 
@@ -718,6 +754,487 @@ fn sortedPaths(arena: std.mem.Allocator, engine: *Engine) ![]const []const u8 {
         }
     }.lessThan);
     return paths;
+}
+
+/// How reading the engine for a request can fail: only for want of memory,
+/// which an allocating writer reports as `WriteFailed`.
+const ReadError = error{ OutOfMemory, WriteFailed };
+
+/// Runs `function(engine, args...)` on the engine task and returns what it
+/// returned.
+fn onEngine(
+    self: *LanguageSession,
+    comptime T: type,
+    comptime function: anytype,
+    args: anytype,
+) (ReadError || error{ServerCancelled})!T {
+    const Run = struct {
+        const Self = @This();
+        call: Engine.Call = .{ .run = run },
+        args: @TypeOf(args),
+        result: ReadError!T = error.OutOfMemory,
+
+        fn run(call: *Engine.Call, engine: *Engine) void {
+            const s: *Self = @fieldParentPtr("call", call);
+            s.result = @call(.auto, function, .{engine} ++ s.args);
+        }
+    };
+    var run: Run = .{ .args = args };
+    if (!run.call.perform(self.engine)) return error.ServerCancelled;
+    return run.result;
+}
+
+// ---------------------------------------------------------------------------
+// Document highlight
+
+/// Every reference in the draft to the predicate at the position: its
+/// definitions written to, every other use read.
+pub fn @"textDocument/documentHighlight"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.DocumentHighlight.Params,
+) !?[]const types.DocumentHighlight {
+    const io = self.engine.io;
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    const document = self.documents.getPtr(params.textDocument.uri) orelse return null;
+    const name = document.nameAt(params.position, self.encoding) orelse return null;
+
+    var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+    var ranges: Ranges = .{ .text = document.parsed_text.?, .encoding = self.encoding };
+    var occurrences = Occurrences.init(document.parsed.?.value, name.predicate, name.arity);
+    while (occurrences.next()) |occurrence| try highlights.append(arena, .{
+        .range = ranges.of(occurrence.span),
+        .kind = if (occurrence.defines != null) .Write else .Read,
+    });
+    return highlights.items;
+}
+
+// ---------------------------------------------------------------------------
+// Find references
+
+pub fn @"textDocument/references"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.reference.Params,
+) !?[]const types.Location {
+    const name = try self.nameAt(arena, params.textDocument.uri, params.position) orelse return null;
+    const locations = try self.onEngine([]const types.Location, references, .{
+        arena,
+        name.predicate,
+        name.arity,
+        params.context.includeDeclaration,
+        self.encoding,
+    });
+    return locations;
+}
+
+/// Every reference to `predicate`/`arity` in the loaded files, leaving out
+/// the ones `definitions` returns unless `include_definitions`. Runs on the
+/// engine task.
+fn references(
+    engine: *Engine,
+    arena: std.mem.Allocator,
+    predicate: []const u8,
+    arity: usize,
+    include_definitions: bool,
+    encoding: offsets.Encoding,
+) ReadError![]const types.Location {
+    const Found = struct { location: types.Location, defines: ?Definer };
+    var found: std.ArrayList(Found) = .empty;
+    // The kind of statement that defines the predicate: the first present.
+    var definer: ?Definer = null;
+    for (try sortedPaths(arena, engine)) |path| {
+        const source = engine.files.getPtr(path).?;
+        const uri = try pathToUri(arena, path);
+        var ranges: Ranges = .{ .text = source.text, .encoding = encoding };
+        var occurrences = Occurrences.init(source.parsed.value, predicate, arity);
+        while (occurrences.next()) |occurrence| {
+            try found.append(arena, .{
+                .location = .{ .uri = uri, .range = ranges.of(occurrence.span) },
+                .defines = occurrence.defines,
+            });
+            if (occurrence.defines) |defines| {
+                if (definer == null or @intFromEnum(defines) < @intFromEnum(definer.?)) definer = defines;
+            }
+        }
+    }
+    var locations: std.ArrayList(types.Location) = try .initCapacity(arena, found.items.len);
+    for (found.items) |reference| {
+        const defines = reference.defines orelse {
+            locations.appendAssumeCapacity(reference.location);
+            continue;
+        };
+        if (include_definitions or defines != definer.?) locations.appendAssumeCapacity(reference.location);
+    }
+    return locations.items;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace symbols
+
+pub fn @"workspace/symbol"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.workspace.Symbol.Params,
+) !?types.workspace.Symbol.Result {
+    const defined = try self.onEngine([]const Defined, definedPredicates, .{ arena, self.encoding });
+    var symbols: std.ArrayList(types.SymbolInformation) = .empty;
+    for (defined) |predicate| {
+        if (!isSubsequence(params.query, predicate.label)) continue;
+        try symbols.append(arena, .{
+            .name = predicate.label,
+            .kind = switch (predicate.definer) {
+                .schema => .Interface,
+                .rule => .Function,
+                .fact => .Constant,
+            },
+            .location = predicate.location,
+        });
+    }
+    return .{ .symbol_informations = symbols.items };
+}
+
+/// Whether `query` is a subsequence of `text`, ignoring ASCII case.
+fn isSubsequence(query: []const u8, text: []const u8) bool {
+    var matched: usize = 0;
+    for (text) |c| {
+        if (matched == query.len) break;
+        if (std.ascii.toLower(c) == std.ascii.toLower(query[matched])) matched += 1;
+    }
+    return matched == query.len;
+}
+
+/// A predicate with a definition in the loaded files.
+const Defined = struct {
+    predicate: []const u8,
+    arity: usize,
+    /// `predicate/arity`, the predicate as the source writes it.
+    label: []const u8,
+    /// What defines it; see `definitions`.
+    definer: Definer,
+    /// Its first definition in sorted path order.
+    location: types.Location,
+    /// The column names of its schema, null where a column has none. Empty
+    /// unless a schema defines it.
+    columns: []const ?[]const u8,
+};
+
+/// Every predicate with a definition in the loaded files, sorted by label.
+/// Runs on the engine task.
+fn definedPredicates(
+    engine: *Engine,
+    arena: std.mem.Allocator,
+    encoding: offsets.Encoding,
+) ReadError![]const Defined {
+    const First = struct {
+        predicate: []const u8,
+        arity: usize,
+        definer: Definer,
+        path: []const u8,
+        statement: usize,
+        span: LiveDatalog.Span,
+    };
+    var firsts: std.array_hash_map.String(First) = .empty;
+    var label: std.ArrayList(u8) = .empty;
+    for (try sortedPaths(arena, engine)) |path| {
+        const program = engine.files.getPtr(path).?.parsed.value;
+        for (program.names, 0..) |name, index| {
+            const definer = definerAt(program, index) orelse continue;
+            label.clearRetainingCapacity();
+            try label.print(arena, "{s}/{d}", .{ name.predicate, name.arity });
+            const entry = try firsts.getOrPut(arena, label.items);
+            if (entry.found_existing) {
+                if (@intFromEnum(entry.value_ptr.definer) <= @intFromEnum(definer)) continue;
+            } else {
+                entry.key_ptr.* = try arena.dupe(u8, label.items);
+            }
+            entry.value_ptr.* = .{
+                .predicate = name.predicate,
+                .arity = name.arity,
+                .definer = definer,
+                .path = path,
+                .statement = name.statement,
+                .span = name.span,
+            };
+        }
+    }
+
+    const defined = try arena.alloc(Defined, firsts.count());
+    for (defined, firsts.values()) |*to, first| {
+        const source = engine.files.getPtr(first.path).?;
+        var columns: []const ?[]const u8 = &.{};
+        if (first.definer == .schema) {
+            const schema = source.parsed.value.statements[first.statement].schema;
+            const names = try arena.alloc(?[]const u8, schema.columns.len);
+            for (names, schema.columns) |*column_name, column| {
+                column_name.* = if (column.name) |n| try arena.dupe(u8, n) else null;
+            }
+            columns = names;
+        }
+        var ranges: Ranges = .{ .text = source.text, .encoding = encoding };
+        to.* = .{
+            .predicate = try arena.dupe(u8, first.predicate),
+            .arity = first.arity,
+            .label = try std.fmt.allocPrint(arena, "{s}/{d}", .{
+                try predicateSource(arena, first.predicate),
+                first.arity,
+            }),
+            .definer = first.definer,
+            .location = .{
+                .uri = try pathToUri(arena, first.path),
+                .range = ranges.of(first.span),
+            },
+            .columns = columns,
+        };
+    }
+    std.mem.sort(Defined, defined, {}, struct {
+        fn lessThan(_: void, a: Defined, b: Defined) bool {
+            return std.mem.order(u8, a.label, b.label) == .lt;
+        }
+    }.lessThan);
+    return defined;
+}
+
+// ---------------------------------------------------------------------------
+// Completion
+
+pub fn @"textDocument/completion"(
+    self: *LanguageSession,
+    arena: std.mem.Allocator,
+    params: types.completion.Params,
+) !?types.completion.Result {
+    const place = place: {
+        const io = self.engine.io;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const document = self.documents.getPtr(params.textDocument.uri) orelse break :place .none;
+        const offset = offsets.positionToIndex(document.text, params.position, self.encoding);
+        break :place completionPlace(document.text, offset);
+    };
+    if (place == .none) return .{ .completion_items = &.{} };
+
+    const defined = try self.onEngine([]const Defined, definedPredicates, .{ arena, self.encoding });
+    var items: std.ArrayList(types.completion.Item) = .empty;
+    if (place == .goal) try items.appendSlice(arena, &.{
+        .{ .label = "not", .kind = .Keyword },
+        .{
+            .label = "setof",
+            .kind = .Keyword,
+            .insertText = "setof(${1:Template}, ${2:Goal}, ${3:Result})",
+            .insertTextFormat = .Snippet,
+        },
+    });
+    for (defined) |predicate| try items.append(arena, .{
+        .label = predicate.label,
+        .filterText = predicate.predicate,
+        .kind = switch (predicate.definer) {
+            .schema => .Interface,
+            .rule => .Function,
+            .fact => .Constant,
+        },
+        .insertText = switch (place) {
+            .goal => try goalSnippet(arena, predicate),
+            .schema_name => try predicateSource(arena, predicate.predicate),
+            .none => unreachable,
+        },
+        .insertTextFormat = if (place == .goal) .Snippet else .PlainText,
+    });
+    return .{ .completion_items = items.items };
+}
+
+/// What completion may insert at a place in a draft.
+const Place = enum {
+    /// Nothing: an argument, a comment, a quoted atom, a variable.
+    none,
+    /// A goal: a predicate, `not` or `setof`.
+    goal,
+    /// The name a schema declares.
+    schema_name,
+};
+
+/// What completion may insert where the word ending at byte `offset` of
+/// `text` starts. Decided by the text alone, since a draft being typed rarely
+/// parses: it is read from the start, skipping comments and quoted atoms and
+/// keeping a stack of open parentheses, each either a relation's arguments,
+/// `setof`'s arguments, or a group of goals.
+fn completionPlace(text: []const u8, offset: usize) Place {
+    const end = @min(offset, text.len);
+    var cursor = end;
+    while (cursor > 0 and isWordByte(text[cursor - 1])) cursor -= 1;
+    if (cursor < end and !(std.ascii.isLower(text[cursor]) or text[cursor] == '_')) return .none;
+
+    const Frame = union(enum) { arguments, group, list, setof: usize };
+    var stack: [64]Frame = undefined;
+    var depth: usize = 0;
+    var goal = true;
+    var statement_start = true;
+    var schema_name = false;
+    // The word just before, if the last token was one.
+    var word: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < cursor) {
+        const c = text[i];
+        if (std.ascii.isWhitespace(c)) {
+            i += 1;
+            continue;
+        }
+        if (c == '%' or std.mem.startsWith(u8, text[i..], "//")) {
+            i = std.mem.findScalarPos(u8, text, i, '\n') orelse return .none;
+            if (i >= cursor) return .none;
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], "/*")) {
+            const close = std.mem.findPos(u8, text, i + 2, "*/") orelse return .none;
+            if (close + 2 > cursor) return .none;
+            i = close + 2;
+            continue;
+        }
+
+        const previous = word;
+        word = null;
+        const was_statement_start = statement_start;
+        statement_start = false;
+
+        if (c == '"' or c == '\'' or isWordByte(c)) {
+            const start = i;
+            if (c == '"' or c == '\'') {
+                i += 1;
+                while (i < text.len and text[i] != c) i += if (text[i] == '\\') 2 else 1;
+                if (i >= cursor) return .none;
+                i += 1;
+            } else {
+                i = wordEnd(text, i);
+            }
+            const token = text[start..i];
+            word = token;
+            if (was_statement_start and std.mem.eql(u8, token, "schema")) {
+                schema_name = true;
+                goal = false;
+            } else if (schema_name) {
+                schema_name = false;
+            } else if (!(goal and std.mem.eql(u8, token, "not"))) {
+                goal = false;
+            }
+            continue;
+        }
+
+        i += 1;
+        switch (c) {
+            '(' => {
+                if (depth == stack.len) return .none;
+                const frame: Frame = if (previous) |name|
+                    if (std.mem.eql(u8, name, "setof")) .{ .setof = 0 } else .arguments
+                else
+                    .group;
+                stack[depth] = frame;
+                depth += 1;
+                goal = frame == .group;
+            },
+            '[' => {
+                if (depth == stack.len) return .none;
+                stack[depth] = .list;
+                depth += 1;
+                goal = false;
+            },
+            ')', ']' => {
+                depth -|= 1;
+                goal = false;
+            },
+            ',' => if (depth == 0) {
+                goal = true;
+            } else switch (stack[depth - 1]) {
+                .group => goal = true,
+                .setof => |*argument| {
+                    argument.* += 1;
+                    goal = argument.* == 1;
+                },
+                .arguments, .list => {},
+            },
+            ':' => if (i < text.len and text[i] == '-') {
+                i += 1;
+                goal = true;
+            } else {
+                goal = false;
+            },
+            '.', '?', '~' => {
+                depth = 0;
+                goal = true;
+                statement_start = true;
+                schema_name = false;
+            },
+            else => goal = false,
+        }
+    }
+    if (schema_name) return .schema_name;
+    return if (goal) .goal else .none;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The end of the word or number starting at `start`. A number takes its
+/// decimal point and signed exponent, so `1.5` is not a statement's end.
+fn wordEnd(text: []const u8, start: usize) usize {
+    var i = start;
+    const number = std.ascii.isDigit(text[start]);
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (isWordByte(c)) continue;
+        if (!number) break;
+        const next_is_digit = i + 1 < text.len and std.ascii.isDigit(text[i + 1]);
+        if (c == '.' and next_is_digit) continue;
+        if ((c == '+' or c == '-') and (text[i - 1] == 'e' or text[i - 1] == 'E') and next_is_digit) continue;
+        break;
+    }
+    return i;
+}
+
+/// `predicate` as the source writes it: bare when it can be, else quoted.
+fn predicateSource(arena: std.mem.Allocator, predicate: []const u8) ![]const u8 {
+    const bare = predicate.len != 0 and (std.ascii.isLower(predicate[0]) or predicate[0] == '_') and
+        for (predicate) |c| {
+            if (!isWordByte(c)) break false;
+        } else true;
+    if (bare) return predicate;
+    var out: Io.Writer.Allocating = .init(arena);
+    try out.writer.writeByte('\'');
+    for (predicate) |c| {
+        if (c == '\'' or c == '\\') try out.writer.writeByte('\\');
+        try out.writer.writeByte(c);
+    }
+    try out.writer.writeByte('\'');
+    return out.written();
+}
+
+/// A snippet calling `predicate` with a placeholder per column, named after
+/// its schema's column where it has one.
+fn goalSnippet(arena: std.mem.Allocator, predicate: Defined) ![]const u8 {
+    var out: Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    try writeSnippetEscaped(writer, try predicateSource(arena, predicate.predicate));
+    if (predicate.arity == 0) return out.written();
+    try writer.writeByte('(');
+    for (0..predicate.arity) |index| {
+        if (index != 0) try writer.writeAll(", ");
+        const column = if (index < predicate.columns.len) predicate.columns[index] else null;
+        if (column) |name| {
+            try writer.print("${{{d}:", .{index + 1});
+            try writeSnippetEscaped(writer, name);
+            try writer.writeByte('}');
+        } else try writer.print("${d}", .{index + 1});
+    }
+    try writer.writeByte(')');
+    return out.written();
+}
+
+fn writeSnippetEscaped(writer: *Io.Writer, text: []const u8) !void {
+    for (text) |c| {
+        if (c == '$' or c == '}' or c == '\\') try writer.writeByte('\\');
+        try writer.writeByte(c);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -778,15 +1295,15 @@ test "heads are the first name of each defining statement" {
     ;
     const parsed = try LiveDatalog.parseProgram(testing.allocator, source, null);
     defer parsed.deinit();
-    var heads = Heads.init(parsed.value, "path", 2);
-    const expected = [_]Heads.Kind{ .schema, .rule, .fact };
+    var heads = Occurrences.init(parsed.value, "path", 2);
+    const expected = [_]Definer{ .schema, .rule, .fact };
     for (expected, 0..) |kind, statement| {
-        const head = heads.next().?;
-        try testing.expectEqual(kind, head.kind);
+        const head = heads.nextHead().?;
+        try testing.expectEqual(kind, head.defines.?);
         try testing.expectEqual(statement, head.statement);
         try testing.expectEqualStrings("path", source[head.span.start..head.span.end]);
     }
-    try testing.expectEqual(@as(?Heads.Head, null), heads.next());
+    try testing.expectEqual(@as(?Occurrences.Occurrence, null), heads.nextHead());
 }
 
 /// A watched directory with a running engine, and a session whose output
@@ -869,6 +1386,40 @@ const TestSession = struct {
             .position = .{ .line = line, .character = character },
         }) orelse return &.{};
         return result.definition.locations;
+    }
+
+    fn highlights(self: *TestSession, name: []const u8, line: u32, character: u32) ![]const types.DocumentHighlight {
+        return try self.session.@"textDocument/documentHighlight"(self.arena.allocator(), .{
+            .textDocument = .{ .uri = try self.uri(name) },
+            .position = .{ .line = line, .character = character },
+        }) orelse &.{};
+    }
+
+    fn references(
+        self: *TestSession,
+        name: []const u8,
+        line: u32,
+        character: u32,
+        include_declaration: bool,
+    ) ![]const types.Location {
+        return try self.session.@"textDocument/references"(self.arena.allocator(), .{
+            .context = .{ .includeDeclaration = include_declaration },
+            .textDocument = .{ .uri = try self.uri(name) },
+            .position = .{ .line = line, .character = character },
+        }) orelse &.{};
+    }
+
+    fn symbols(self: *TestSession, query: []const u8) ![]const types.SymbolInformation {
+        const result = try self.session.@"workspace/symbol"(self.arena.allocator(), .{ .query = query });
+        return result.?.symbol_informations;
+    }
+
+    fn completions(self: *TestSession, name: []const u8, line: u32, character: u32) ![]const types.completion.Item {
+        const result = try self.session.@"textDocument/completion"(self.arena.allocator(), .{
+            .textDocument = .{ .uri = try self.uri(name) },
+            .position = .{ .line = line, .character = character },
+        });
+        return result.?.completion_items;
     }
 
     /// Takes what the session has written so far.
@@ -1017,4 +1568,176 @@ test "drafts report syntax errors and keep their last good parse" {
     try t.session.publishAll();
     // Only b.dl is still published.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, try t.written(), "publishDiagnostics"));
+}
+
+test "document highlight writes definitions and reads uses, in the draft" {
+    var t: TestSession = undefined;
+    try t.init(&.{});
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+    try t.open("a.dl", "p(a).\nq(X) :- p(X), not p(X, X).\np(X)?\n");
+
+    const found = try t.highlights("a.dl", 1, 9);
+    try testing.expectEqual(@as(usize, 3), found.len);
+    try testing.expectEqual(types.DocumentHighlight.Kind.Write, found[0].kind.?);
+    try testing.expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 1 },
+    }, found[0].range);
+    try testing.expectEqual(types.DocumentHighlight.Kind.Read, found[1].kind.?);
+    try testing.expectEqual(@as(u32, 8), found[1].range.start.character);
+    try testing.expectEqual(types.DocumentHighlight.Kind.Read, found[2].kind.?);
+    try testing.expectEqual(@as(u32, 2), found[2].range.start.line);
+
+    // `p/2` is another predicate.
+    try testing.expectEqual(@as(usize, 1), (try t.highlights("a.dl", 1, 19)).len);
+    try testing.expectEqual(@as(usize, 0), (try t.highlights("a.dl", 1, 3)).len);
+}
+
+test "references span the loaded files and can leave out definitions" {
+    var t: TestSession = undefined;
+    try t.init(&.{
+        .{ "schema.dl", "schema edge(From: atom, To: atom).\n" },
+        .{ "edges.dl", "edge(a, b). edge(b, c).\n" },
+        .{
+            "rules.dl",
+            \\path(X, Y) :- edge(X, Y).
+            \\path(X, Z) :- edge(X, Y), path(Y, Z).
+            \\path(z, z).
+            \\far(X, S) :- node(X), setof(Y, path(X, Y), S).
+            \\alone(X) :- node(X), not path(X, _).
+            \\node(a).
+            \\
+        },
+    });
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+    try t.open("q.dl", "path(a, X)?\nedge(a, b)~\nedge(1, 2, 3)?\nnode(1, 2)?\n");
+
+    // Rule heads, a fact, and uses in bodies, under `setof` and under `not`.
+    const path = try t.references("q.dl", 0, 0, true);
+    try testing.expectEqual(@as(usize, 6), path.len);
+    for (path) |location| try testing.expectEqualStrings(try t.uri("rules.dl"), location.uri);
+    // Without its definitions, the rule heads go and the fact stays.
+    const path_uses = try t.references("q.dl", 0, 0, false);
+    try testing.expectEqual(@as(usize, 4), path_uses.len);
+    try testing.expectEqual(@as(u32, 1), path_uses[0].range.start.line);
+    try testing.expectEqual(@as(u32, 26), path_uses[0].range.start.character);
+    try testing.expectEqual(@as(u32, 2), path_uses[1].range.start.line);
+
+    // The schema defines edge, so its facts are uses. The draft is not read.
+    const edge = try t.references("q.dl", 1, 0, true);
+    try testing.expectEqual(@as(usize, 5), edge.len);
+    try testing.expectEqualStrings(try t.uri("edges.dl"), edge[0].uri);
+    try testing.expectEqualStrings(try t.uri("rules.dl"), edge[2].uri);
+    try testing.expectEqualStrings(try t.uri("schema.dl"), edge[4].uri);
+    const edge_uses = try t.references("q.dl", 1, 0, false);
+    try testing.expectEqual(@as(usize, 4), edge_uses.len);
+    try testing.expectEqualStrings(try t.uri("rules.dl"), edge_uses[3].uri);
+
+    // The schema rules out edge/3, so it is edge/3's definition too.
+    const edge3 = try t.references("q.dl", 2, 0, true);
+    try testing.expectEqual(@as(usize, 1), edge3.len);
+    try testing.expectEqualStrings(try t.uri("schema.dl"), edge3[0].uri);
+    try testing.expectEqual(@as(usize, 0), (try t.references("q.dl", 2, 0, false)).len);
+    const edge3_definitions = try t.definition("q.dl", 2, 0);
+    try testing.expectEqual(@as(usize, 1), edge3_definitions.len);
+    try testing.expectEqualStrings(try t.uri("schema.dl"), edge3_definitions[0].uri);
+    try expectContains((try t.hover("q.dl", 2, 0)).?, "schema edge(From: atom, To: atom).");
+
+    try testing.expectEqual(@as(usize, 0), (try t.references("q.dl", 3, 0, true)).len);
+}
+
+test "workspace symbols list each defined predicate once" {
+    var t: TestSession = undefined;
+    try t.init(&.{
+        .{ "a.dl", "edge(a, b). edge(b, c). link(a). link(a, b).\npath(X, Y) :- edge(X, Y).\n" },
+        .{ "b.dl", "schema edge(atom, atom).\npath(X, Y)?\n" },
+    });
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+
+    const all = try t.symbols("");
+    try testing.expectEqual(@as(usize, 4), all.len);
+    try testing.expectEqualStrings("edge/2", all[0].name);
+    try testing.expectEqual(types.SymbolKind.Interface, all[0].kind);
+    try testing.expectEqualStrings(try t.uri("b.dl"), all[0].location.uri);
+    try testing.expectEqualStrings("link/1", all[1].name);
+    try testing.expectEqual(types.SymbolKind.Constant, all[1].kind);
+    try testing.expectEqual(@as(u32, 24), all[1].location.range.start.character);
+    try testing.expectEqualStrings("link/2", all[2].name);
+    try testing.expectEqual(@as(u32, 33), all[2].location.range.start.character);
+    try testing.expectEqualStrings("path/2", all[3].name);
+    try testing.expectEqual(types.SymbolKind.Function, all[3].kind);
+
+    try testing.expectEqual(@as(usize, 1), (try t.symbols("ED")).len);
+    try testing.expectEqual(@as(usize, 1), (try t.symbols("lk2")).len);
+    try testing.expectEqual(@as(usize, 0), (try t.symbols("xz")).len);
+}
+
+test "completion offers predicates where a goal can start" {
+    const cases = [_]struct { []const u8, Place }{
+        .{ "", .goal },
+        .{ "p(a). q", .goal },
+        .{ "q(X) :- ", .goal },
+        .{ "q(X) :- p(X), r", .goal },
+        .{ "q(X) :- not ", .goal },
+        .{ "q(X) :- (p(X), ", .goal },
+        .{ "q(X, S) :- setof(Y, ", .goal },
+        .{ "q(X, S) :- setof(Y, (p(X, Y), r", .goal },
+        .{ "p(1.5). q", .goal },
+        .{ "schema ", .schema_name },
+        .{ "schema ag", .schema_name },
+        .{ "q(X) :- p(", .none },
+        .{ "q(X) :- p(a, b", .none },
+        .{ "q(X) :- p(X, [a, ", .none },
+        .{ "q(X, S) :- setof(", .none },
+        .{ "q(X, S) :- setof(Y, p(X, Y), ", .none },
+        .{ "q(X) :- p(X), X", .none },
+        .{ "q(X) :- p(X), X : ", .none },
+        .{ "% p", .none },
+        .{ "/* p", .none },
+        .{ "q('a, ", .none },
+        .{ "q(X) :- p(X)", .none },
+        .{ "schema p(atom). % x\nq(X) :- ", .goal },
+        .{ "q(a). /* x */ ", .goal },
+        .{ "q(\"(\"). ", .goal },
+    };
+    for (cases) |case| {
+        const text, const expected = case;
+        testing.expectEqual(expected, completionPlace(text, text.len)) catch |err| {
+            std.debug.print("at the end of \"{s}\"\n", .{text});
+            return err;
+        };
+    }
+
+    var t: TestSession = undefined;
+    try t.init(&.{
+        .{ "schema.dl", "schema age(Person: atom, int).\n" },
+        .{ "facts.dl", "'my pred'(1).\n" },
+    });
+    defer t.deinit();
+    _ = t.session.initialize(t.arena.allocator(), .{ .capabilities = .{} });
+    try t.open("q.dl", "q(X) :- a");
+    try t.open("s.dl", "schema ");
+    try t.open("r.dl", "q(X) :- age(");
+
+    const goal = try t.completions("q.dl", 0, 9);
+    try testing.expectEqual(@as(usize, 4), goal.len);
+    try testing.expectEqualStrings("not", goal[0].label);
+    try testing.expectEqualStrings("setof", goal[1].label);
+    try testing.expectEqualStrings("'my pred'/1", goal[2].label);
+    try testing.expectEqualStrings("'my pred'($1)", goal[2].insertText.?);
+    try testing.expectEqualStrings("age/2", goal[3].label);
+    try testing.expectEqualStrings("age", goal[3].filterText.?);
+    try testing.expectEqualStrings("age(${1:Person}, $2)", goal[3].insertText.?);
+    try testing.expectEqual(types.InsertTextFormat.Snippet, goal[3].insertTextFormat.?);
+
+    const schema = try t.completions("s.dl", 0, 7);
+    try testing.expectEqual(@as(usize, 2), schema.len);
+    try testing.expectEqualStrings("age", schema[1].insertText.?);
+    try testing.expectEqual(types.InsertTextFormat.PlainText, schema[1].insertTextFormat.?);
+
+    try testing.expectEqual(@as(usize, 0), (try t.completions("r.dl", 0, 12)).len);
+    try testing.expectEqual(@as(usize, 0), (try t.completions("unopened.dl", 0, 0)).len);
 }
