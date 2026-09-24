@@ -17,6 +17,7 @@ const syntax = @import("syntax.zig");
 const transaction = @import("transaction.zig");
 const errors = @import("errors.zig");
 const test_support = @import("test_support.zig");
+const update = @import("update.zig");
 
 /// The source a program was parsed from, so a statement that fails when it
 /// runs can be pointed at.
@@ -61,11 +62,18 @@ const Run = struct {
 ///
 /// On failure `diagnostic`, if given, names the failing statement, and points
 /// at it when `source` says where it was written.
+///
+/// The facts the statements assert are `contributor`'s, or the direct
+/// contributor's when that is null (see "Contributor" in CONTEXT.md). Only
+/// assertions are attributed: a retraction among the statements still takes
+/// its facts from every contributor, in its place in the order, so
+/// `p(a)~. p(a).` leaves `p(a)` asserted by `contributor` alone.
 pub fn execute(
     db: *database.Database,
     statements: []const input.Statement,
     source: ?Source,
     diagnostic: ?*parser.Diagnostic,
+    contributor: ?[]const u8,
 ) !results.ExecutionResult {
     var last: ?results.ExecutionResult = null;
     errdefer if (last) |*result| result.deinit();
@@ -82,7 +90,7 @@ pub fn execute(
                 };
                 const open = &run.?.transaction;
                 const mark = open.savepoint();
-                assert(open.target(), statement) catch |err| {
+                assert(open.target(), statement, contributor) catch |err| {
                     // The statements before this one are staged on the copy
                     // it has just been rolled back out of, so committing is
                     // what keeps them and drops it.
@@ -115,19 +123,21 @@ fn describe(diagnostic: ?*parser.Diagnostic, source: ?Source, index: usize) void
 /// Adds a fact or a rule to `db`, which is a transaction's staging copy.
 /// Either it lands or `db` is left as it was, save for what compiling it
 /// interned — which the caller's savepoint takes back out.
-fn assert(db: *database.Database, statement: input.Statement) !void {
+fn assert(db: *database.Database, statement: input.Statement, contributor: ?[]const u8) !void {
     switch (statement) {
-        .fact => |fact| try addFact(db, fact),
+        .fact => |fact| try addFact(db, fact, contributor),
         .rule => |rule| try addRule(db, rule),
         .schema => |declared| try declareSchema(db, declared),
         .query, .retraction => unreachable,
     }
 }
 
-pub fn addFact(db: *database.Database, fact: input.Relation) !void {
+/// Asserts `fact` on behalf of `contributor`, or of the direct contributor
+/// when that is null.
+pub fn addFact(db: *database.Database, fact: input.Relation, contributor: ?[]const u8) !void {
     const expression = try compile.compileRelation(db, fact.predicate, fact.terms, false);
     defer syntax.freeExpr(db.allocator, expression);
-    try transaction.addFactExpr(db, expression);
+    try transaction.addFactExpr(db, expression, contributor);
 }
 
 pub fn declareSchema(db: *database.Database, declared: input.Schema) !void {
@@ -172,7 +182,7 @@ fn evaluate(db: *database.Database, statement: input.Statement) !results.Executi
 fn runSource(db: *database.Database, text: []const u8) !results.ExecutionResult {
     const parsed = try parser.parseProgram(db.allocator, text, null);
     defer parsed.deinit();
-    return execute(db, parsed.value.statements, null, null);
+    return execute(db, parsed.value.statements, null, null, null);
 }
 
 test "a parse error after a query releases nothing because nothing ran" {
@@ -201,6 +211,7 @@ test "a semantic failure keeps earlier statements and names the failing one" {
         parsed.value.statements,
         .{ .text = text, .spans = parsed.value.spans },
         &diagnostic,
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 2), db.facts.len());
     try std.testing.expectEqual(@as(?usize, 2), diagnostic.statement);
@@ -218,7 +229,7 @@ test "a semantic failure keeps earlier statements and names the failing one" {
     };
     try std.testing.expectError(
         errors.Error.InvalidRule,
-        execute(&db, &statements, null, &unlocated),
+        execute(&db, &statements, null, &unlocated, null),
     );
     try std.testing.expectEqual(@as(?usize, 2), unlocated.statement);
     try std.testing.expectEqual(@as(?parser.Span, null), unlocated.span);
@@ -270,7 +281,7 @@ test "sort keys order answers, and ties fall back to the default order" {
     var built = try execute(&db, &.{.{ .query = input.query(
         &.{input.relation("score", &.{ p, s })},
         &.{ input.ascending("S"), input.descending("P") },
-    ) }}, null, null);
+    ) }}, null, null, null);
     defer built.deinit();
     try expectColumn(&built, "P", &.{ "eve", "cat", "ann", "dan", "bob" });
 }
@@ -870,4 +881,260 @@ test "a retraction's rebuild starts low enough to recompute an aggregate over it
     try runQuietly(&db, "item(b)~");
     try std.testing.expectEqual(@as(usize, 1), db.maintenanceStats().rebuild_fallbacks);
     try test_support.expectClosureMatchesRebuild(&db);
+}
+
+/// Replaces what `contributor` asserts with the facts `text` states, as
+/// `Jatalog.setContribution` does. Anything else `text` says is ignored.
+fn contribute(db: *database.Database, contributor: []const u8, text: []const u8) !bool {
+    const parsed = try parser.parseProgram(db.allocator, text, null);
+    defer parsed.deinit();
+    var facts: std.ArrayList(input.Relation) = .empty;
+    defer facts.deinit(db.allocator);
+    for (parsed.value.statements) |statement| switch (statement) {
+        .fact => |fact| try facts.append(db.allocator, fact),
+        else => {},
+    };
+    return transaction.contribute(db, contributor, facts.items);
+}
+
+/// Runs `text` with the facts it asserts attributed to `contributor`, as
+/// `Jatalog.executeStatements` does.
+fn runContributed(db: *database.Database, contributor: []const u8, text: []const u8) !void {
+    const parsed = try parser.parseProgram(db.allocator, text, null);
+    defer parsed.deinit();
+    var result = try execute(db, parsed.value.statements, null, null, contributor);
+    result.deinit();
+}
+
+/// Checks that `query`'s single variable `X` takes exactly `expected`.
+fn expectAnswers(db: *database.Database, query: []const u8, expected: []const []const u8) !void {
+    var result = try runSource(db, query);
+    defer result.deinit();
+    try expectColumn(&result, "X", expected);
+}
+
+test "a fact two contributors assert outlives either one withdrawing" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expect(try contribute(&db, "a.dl", "p(shared). p(mine)."));
+    // Nothing new is present, but `b.dl` now holds `shared` up too.
+    try std.testing.expect(!try contribute(&db, "b.dl", "p(shared)."));
+    try expectAnswers(&db, "p(X)?", &.{ "mine", "shared" });
+
+    try std.testing.expect(try contribute(&db, "a.dl", ""));
+    try expectAnswers(&db, "p(X)?", &.{"shared"});
+    try std.testing.expect(try contribute(&db, "b.dl", ""));
+    try expectAnswers(&db, "p(X)?", &.{});
+    // Withdrawn contributors leave nothing behind.
+    try std.testing.expectEqual(@as(usize, 0), db.contributions.named.count());
+    try std.testing.expectEqual(@as(usize, 0), db.contributions.supported());
+    // And withdrawing one that asserts nothing changes nothing.
+    try std.testing.expect(!try contribute(&db, "c.dl", ""));
+}
+
+test "contributors agree on sameness as scalar identity does" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expect(try contribute(&db, "ints.dl", "n(1). n([2])."));
+    try std.testing.expect(!try contribute(&db, "floats.dl", "n(1.0). n([2.0]). n(1e0)."));
+    try std.testing.expectEqual(@as(usize, 2), db.facts.len());
+    try std.testing.expect(!try contribute(&db, "ints.dl", ""));
+    try expectAnswers(&db, "n(X)?", &.{ "1", "[2]" });
+    try std.testing.expect(try contribute(&db, "floats.dl", ""));
+    try std.testing.expectEqual(@as(usize, 0), db.facts.len());
+}
+
+test "a long cons chain is the fact the list it spells is" {
+    // 65 heads: one more than a chain a fixed-size walk of 64 would see whole.
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(std.testing.allocator);
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try chain.appendSlice(std.testing.allocator, "p(");
+    try list.appendSlice(std.testing.allocator, "p([");
+    for (0..65) |index| {
+        try chain.print(std.testing.allocator, "e{d}!", .{index});
+        try list.print(std.testing.allocator, "{s}e{d}", .{ if (index == 0) "" else ", ", index });
+    }
+    try chain.appendSlice(std.testing.allocator, "[]).");
+    try list.appendSlice(std.testing.allocator, "]).");
+
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expect(try contribute(&db, "list.dl", list.items));
+    try std.testing.expect(!try contribute(&db, "chain.dl", chain.items));
+    try std.testing.expect(!try contribute(&db, "list.dl", ""));
+    try std.testing.expectEqual(@as(usize, 1), db.facts.len());
+    try std.testing.expect(try contribute(&db, "chain.dl", ""));
+    try std.testing.expectEqual(@as(usize, 0), db.facts.len());
+}
+
+test "a deletion takes a fact from every contributor until one asserts it again" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    _ = try contribute(&db, "a.dl", "p(a). p(b).");
+    _ = try contribute(&db, "b.dl", "p(a). p(c).");
+    try runQuietly(&db, "p(c).");
+
+    try runQuietly(&db, "p(a)~");
+    try expectAnswers(&db, "p(X)?", &.{ "b", "c" });
+    // Neither contributor holds `a` up any more, so it stays gone however
+    // they change around it.
+    _ = try contribute(&db, "a.dl", "p(b).");
+    try expectAnswers(&db, "p(X)?", &.{ "b", "c" });
+
+    // A batch deletion is a deletion too, of the direct contributor's `c`
+    // and `b.dl`'s alike.
+    const expression = try compile.compileRelation(&db, "p", &.{input.atom("c")}, false);
+    defer syntax.freeExpr(db.allocator, expression);
+    try std.testing.expectEqual(@as(usize, 1), try update.apply(&db, .{ .named = &.{expression} }, &.{}));
+    _ = try contribute(&db, "a.dl", "");
+    try expectAnswers(&db, "p(X)?", &.{});
+
+    // Asserting it again brings it back.
+    try std.testing.expect(try contribute(&db, "b.dl", "p(a). p(c)."));
+    try expectAnswers(&db, "p(X)?", &.{ "a", "c" });
+}
+
+test "a contribution that fails changes neither the facts nor any contribution" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db, "schema age(atom, int).");
+    _ = try contribute(&db, "a.dl", "p(a). age(ann, 3).");
+    _ = try contribute(&db, "b.dl", "p(a).");
+
+    const facts = [_]input.Relation{
+        input.fact("p", &.{input.atom("b")}),
+        input.fact("p", &.{input.variable("X")}),
+    };
+    try std.testing.expectError(errors.Error.InvalidFact, transaction.contribute(&db, "a.dl", &facts));
+    try std.testing.expectError(errors.Error.SchemaViolation, contribute(&db, "a.dl", "p(b). age(bob, old)."));
+    try std.testing.expectError(errors.Error.SchemaViolation, contribute(&db, "c.dl", "age(bob, old)."));
+    try expectAnswers(&db, "p(X)?", &.{"a"});
+    try std.testing.expectEqual(@as(usize, 2), db.contributions.named.count());
+    try std.testing.expectEqual(@as(usize, 2), db.contributions.supported());
+
+    // `a.dl` still asserts what it did, and only that: withdrawing it keeps
+    // the fact `b.dl` shares and takes the one it alone asserted.
+    _ = try contribute(&db, "a.dl", "");
+    try expectAnswers(&db, "p(X)?", &.{"a"});
+    try expectAnswers(&db, "age(X, Y)?", &.{});
+}
+
+test "statements run for a contributor keep their order" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    _ = try contribute(&db, "other.dl", "p(a). p(b).");
+    // The retraction takes `a` from `other.dl`, and the fact after it is the
+    // file's own.
+    try runContributed(&db, "file.dl", "p(a)~ p(a). p(b). p(b)~ p(c).");
+    try expectAnswers(&db, "p(X)?", &.{ "a", "c" });
+    // `b` was retracted after the file asserted it, so it is nobody's.
+    _ = try contribute(&db, "other.dl", "");
+    try expectAnswers(&db, "p(X)?", &.{ "a", "c" });
+    _ = try contribute(&db, "file.dl", "");
+    try expectAnswers(&db, "p(X)?", &.{});
+}
+
+test "a direct fact outlives a named contributor asserting it too" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    // Direct first, then named.
+    try runQuietly(&db, "p(first).");
+    _ = try contribute(&db, "a.dl", "p(first). p(second). p(third).");
+    // Named first, then direct: the direct assertion is recorded although
+    // the fact was already there.
+    try runQuietly(&db, "p(second).");
+    try std.testing.expect(try contribute(&db, "a.dl", ""));
+    try expectAnswers(&db, "p(X)?", &.{ "first", "second" });
+    // With no named contributor left, nothing is recorded at all.
+    try std.testing.expectEqual(@as(usize, 0), db.contributions.supported());
+}
+
+test "a statement that fails under a contributor takes its record with it" {
+    // A run of assertions shares one staging copy, and the failing statement
+    // is rolled back out of it by savepoint: see `Database.rollback`, which
+    // checks the records are where the savepoint left them.
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db, "schema age(atom, int).");
+    try std.testing.expectError(
+        errors.Error.SchemaViolation,
+        runContributed(&db, "file.dl", "p(a). age(ann, 3). age(bob, old). p(b)."),
+    );
+    try expectAnswers(&db, "p(X)?", &.{"a"});
+    try std.testing.expectEqual(@as(usize, 2), db.contributions.supported());
+    _ = try contribute(&db, "file.dl", "");
+    try std.testing.expectEqual(@as(usize, 0), db.facts.len());
+}
+
+fn contributionAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: database.Database = .init(allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\q(a).
+        \\r(X) :- p(X), q(X).
+        \\r(X)?
+    );
+    // Ends in a failing statement, so that the rollback runs too.
+    runContributed(&db, "a.dl", "p(a). p(b). p(b)~ p(c). q(X).") catch |err| switch (err) {
+        errors.Error.InvalidFact => {},
+        else => return err,
+    };
+}
+
+test "asserting for a contributor releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(contributionAllocationScenario);
+}
+
+fn replacementAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: database.Database = .init(allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\p(a).
+        \\r(X) :- p(X).
+        \\r(X)?
+    );
+    _ = try contribute(&db, "a.dl", "p(a). p(b).");
+    _ = try contribute(&db, "b.dl", "p(b). p(c).");
+    _ = try contribute(&db, "a.dl", "p(c).");
+    _ = try contribute(&db, "b.dl", "");
+}
+
+test "replacing a contribution releases every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(replacementAllocationScenario);
+}
+
+test "a replaced contribution maintains the closure a rebuild would hold" {
+    var db: database.Database = .init(std.testing.allocator);
+    defer db.deinit();
+    try runQuietly(&db,
+        \\reach(X, Y) :- edge(X, Y).
+        \\reach(X, Z) :- reach(X, Y), edge(Y, Z).
+        \\node(a). node(b). node(c). node(d).
+        \\cut(X) :- node(X), not reach(a, X).
+        \\out(X, S) :- node(X), setof(Y, reach(X, Y), S).
+        \\reach(a, X)?
+    );
+    db.eval.cost.policy = .incremental;
+    const steps = [_]struct { []const u8, []const u8 }{
+        .{ "one.dl", "edge(a, b). edge(b, c)." },
+        .{ "two.dl", "edge(b, c). edge(c, d)." },
+        .{ "one.dl", "edge(a, b)." },
+        .{ "two.dl", "edge(c, d). edge(b, a)." },
+        .{ "one.dl", "" },
+        .{ "two.dl", "" },
+    };
+    for (steps) |step| {
+        const before = db.maintenanceStats().maintain_choices;
+        if (try contribute(&db, step[0], step[1])) {
+            // One decision per contribution that moved anything: the facts
+            // that moved took the update path as one batch.
+            try std.testing.expectEqual(before + 1, db.maintenanceStats().maintain_choices);
+        }
+        try std.testing.expect(db.canMaintain());
+        try test_support.expectClosureMatchesRebuild(&db);
+    }
+    // Nothing reaches anything any more.
+    try expectAnswers(&db, "cut(X)?", &.{ "a", "b", "c", "d" });
 }

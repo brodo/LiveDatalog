@@ -137,6 +137,23 @@ auxiliary view and is self-maintainable. Group identity is the projected
 values together with the head variables the outer goals bind; projected
 values alone are ambiguous.
 
+### Contributor
+
+Something that asserts base facts, such as one file of a program an embedder
+loads from several. A *contribution* is the set of base facts one contributor
+asserts, and it is replaced whole: a contributor says what it asserts now, not
+what changed. A base fact is present while at least one contributor asserts
+it, so two contributors asserting the same fact are one fact, and withdrawing
+one of them leaves it. Sameness is the engine's scalar identity, so `1` and
+`1.0`, or a cons chain and the list it spells, are one fact however each
+contributor wrote it.
+
+Facts asserted without naming a contributor — statements, `addFact`,
+`applyChanges` — belong to an implicit *direct* contributor. A deletion is not
+a contributor's: removing a fact, by `applyChanges` or a retraction, removes it
+from every contributor, so `p(a)~` still means that `p(a)` is gone. Only base
+facts are contributed; rules and schemas belong to the program.
+
 ### Relation store
 
 The indexed owner of ground facts (`relation_store.zig`). Its

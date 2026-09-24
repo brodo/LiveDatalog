@@ -34,7 +34,7 @@ pub fn factsEqual(a: Fact, b: Fact) bool {
     return a.predicate == b.predicate and std.mem.eql(ValueId, a.terms, b.terms);
 }
 
-fn factHash(fact: Fact) u64 {
+pub fn factHash(fact: Fact) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&fact.predicate));
     hasher.update(std.mem.sliceAsBytes(fact.terms));

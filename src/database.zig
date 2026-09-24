@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const auxiliary_view = @import("auxiliary_view.zig");
+const contribution = @import("contribution.zig");
 const cost_model = @import("cost_model.zig");
 const evaluator = @import("evaluator.zig");
 const intern_index = @import("intern_index.zig");
@@ -57,6 +58,10 @@ pub const Savepoint = struct {
     facts: usize,
     rules: usize,
     schemas: usize,
+    /// How many facts a named contributor asserts. A statement that fails
+    /// takes its record of who asserted its fact with it, as it takes the
+    /// fact, so this is checked like the fact count.
+    supported: usize,
 };
 
 pub const MaintenanceStats = struct {
@@ -103,6 +108,12 @@ pub const Database = struct {
     /// machinery that evaluates them against a fact store.
     eval: evaluator.Evaluator,
     facts: relation_store.RelationStore,
+    /// Which contributor asserts which base fact (see "Contributor" in
+    /// CONTEXT.md). Kept here, beside the facts, so that a staged copy
+    /// carries them and a commit installs both at once: a contribution
+    /// replaced on a copy that is then discarded leaves no trace in either.
+    /// Empty until someone names a contributor.
+    contributions: contribution.Contributions = .{},
     /// Persistent derived closure: the base facts plus every derived fact,
     /// exposed to evaluation as one unified read view. Null until the first
     /// evaluation on a database with rules.
@@ -168,6 +179,7 @@ pub const Database = struct {
         self.auxiliary.deinit(self.allocator);
         self.schemas.deinit(self.allocator);
         if (self.closure) |*closure| closure.deinit();
+        self.contributions.deinit(self.allocator);
         self.facts.deinit();
         self.eval.deinit();
         self.strings.deinit();
@@ -186,6 +198,8 @@ pub const Database = struct {
         errdefer result.eval.deinit();
         result.facts = try self.facts.clone();
         errdefer result.facts.deinit();
+        result.contributions = try self.contributions.clone(self.allocator);
+        errdefer result.contributions.deinit(self.allocator);
         if (self.closure) |*closure| result.closure = try closure.clone();
         errdefer if (result.closure) |*closure| closure.deinit();
         result.schemas = try self.schemas.clone(self.allocator);
@@ -216,8 +230,8 @@ pub const Database = struct {
 
     /// A copy holding, as base facts, exactly those of this database's facts
     /// — base or derived — whose name and arity `keep` admits, and nothing
-    /// else: no other fact, no rule, no derived closure, no auxiliary view and
-    /// no schema. The interned values and names all come with it, so an
+    /// else: no other fact, no rule, no derived closure, no auxiliary view, no
+    /// schema and no record of who asserted what. The interned values and names all come with it, so an
     /// identifier means the same in the copy as it does here.
     ///
     /// The facts are taken from the closure rather than from the base facts,
@@ -256,6 +270,8 @@ pub const Database = struct {
         copy.eval.rules.clearRetainingCapacity();
         copy.eval.invalidateAnalysis();
 
+        copy.contributions.deinit(copy.allocator);
+        copy.contributions = .{};
         copy.facts.clear();
         const stored = if (self.closure) |*closure| closure else &self.facts;
         for (0..stored.len()) |index| {
@@ -313,6 +329,10 @@ pub const Database = struct {
     /// Inserts one ground base fact with set semantics, returning it as the
     /// store now holds it, or null when the store already held it.
     ///
+    /// `by` names the contributor asserting it, or is null for the direct
+    /// contributor, and is recorded whether or not the store held the fact
+    /// already: a fact two contributors assert stays until both let go.
+    ///
     /// What the new fact means for the derived closure is not decided here.
     /// This module holds the state; whether the fact goes on to join a clean
     /// closure or instead dirties the strata that read it is the update path's
@@ -321,32 +341,61 @@ pub const Database = struct {
     /// The returned terms are borrowed from `facts`. Further insertions can
     /// move the entry holding them but not the terms themselves; a removal
     /// frees them.
-    pub fn applyInsertion(self: *Database, value: syntax.Expr) !?relation_store.Fact {
+    pub fn applyInsertion(self: *Database, value: syntax.Expr, by: ?[]const u8) !?relation_store.Fact {
         if (!value.isGround() or value.negated) return error.InvalidFact;
         const terms = try self.allocator.alloc(syntax.ValueId, value.terms.len);
         errdefer self.allocator.free(terms);
         for (value.terms, terms) |term, *id| id.* = try self.eval.termToValue(term, null);
-        return self.adoptInsertion(.{ .predicate = value.predicate, .terms = terms });
+        return self.adoptInsertion(.{ .predicate = value.predicate, .terms = terms }, by);
     }
 
     /// `applyInsertion` for a fact whose values are already interned, which is
-    /// the form incremental maintenance holds its additions in. `fact` is only
-    /// read: the store keeps a copy of its terms, so the caller may hand over
-    /// terms it is about to free.
+    /// the form incremental maintenance holds its additions in, asserted by
+    /// the direct contributor. `fact` is only read: the store keeps a copy of
+    /// its terms, so the caller may hand over terms it is about to free.
     pub fn applyFactInsertion(self: *Database, fact: relation_store.Fact) !?relation_store.Fact {
         const terms = try self.allocator.dupe(syntax.ValueId, fact.terms);
         errdefer self.allocator.free(terms);
-        return self.adoptInsertion(.{ .predicate = fact.predicate, .terms = terms });
+        return self.adoptInsertion(.{ .predicate = fact.predicate, .terms = terms }, null);
     }
 
     /// The half of an insertion both spellings share. On success the store
     /// owns `fact.terms`, whether or not the fact was new; on error the caller
-    /// still does.
-    fn adoptInsertion(self: *Database, fact: relation_store.Fact) !?relation_store.Fact {
+    /// still does, and neither the facts nor the records of who asserts them
+    /// have moved.
+    ///
+    /// Only a fact some named contributor asserts has a record the direct
+    /// contributor's assertion changes, so while nobody has named one, the
+    /// direct path asks nothing it did not ask before.
+    fn adoptInsertion(self: *Database, fact: relation_store.Fact, by: ?[]const u8) !?relation_store.Fact {
         if (!self.fitsSchema(fact.predicate, fact.terms)) return error.SchemaViolation;
+        if (by) |name| {
+            const present = try self.facts.contains(fact);
+            try self.contributions.assertNamed(self.allocator, name, fact, present);
+        } else if (self.contributions.supported() != 0) {
+            // A present fact's insertion below cannot fail, so this is
+            // recorded only for an insertion that will happen.
+            if (try self.facts.contains(fact)) self.contributions.assertDirectly(fact);
+        }
+        // Only an absent fact's insertion can fail, and then the record just
+        // made is that fact's only one.
+        errdefer if (by != null) self.contributions.retractEverywhere(self.allocator, fact);
         if (!try self.facts.insert(fact, false)) return null;
         self.fact_generation += 1;
         return self.facts.factAt(self.facts.len() - 1);
+    }
+
+    /// Takes back out the fact the last `applyInsertion` added, with the
+    /// record of who asserted it, for a statement that fails after its fact
+    /// went in. Allocates nothing.
+    ///
+    /// The fact stamp stays where the insertion left it, which is the one
+    /// direction it is allowed to be wrong in: a reader rebuilds something
+    /// that was still good, rather than keeping something that is not.
+    pub fn revokeInsertion(self: *Database) void {
+        const last = self.facts.len() - 1;
+        self.contributions.retractEverywhere(self.allocator, self.facts.factAt(last));
+        self.facts.removeAt(last);
     }
 
     /// Whether a fact with these values fits its predicate's schema. A
@@ -360,7 +409,9 @@ pub const Database = struct {
     }
 
     /// Takes one ground base fact back out, reporting whether the store held
-    /// it at all.
+    /// it at all. The fact goes from every contributor, named or direct: a
+    /// deletion is not any one contributor's (see "Contributor" in
+    /// CONTEXT.md). `fact` must not be borrowed from `facts`.
     ///
     /// This exists so that the fact stamp has one place to move: removal is
     /// the other half of `applyInsertion`, and a caller reaching past this
@@ -368,6 +419,7 @@ pub const Database = struct {
     /// they had not changed.
     pub fn applyRemoval(self: *Database, fact: relation_store.Fact) !bool {
         if (!try self.facts.removeFact(fact)) return false;
+        self.contributions.retractEverywhere(self.allocator, fact);
         self.fact_generation += 1;
         return true;
     }
@@ -383,6 +435,7 @@ pub const Database = struct {
             .facts = self.facts.len(),
             .rules = self.eval.rules.items.len,
             .schemas = self.schemas.count(),
+            .supported = self.contributions.supported(),
         };
     }
 
@@ -401,6 +454,7 @@ pub const Database = struct {
         std.debug.assert(self.facts.len() == mark.facts);
         std.debug.assert(self.eval.rules.items.len == mark.rules);
         std.debug.assert(self.schemas.count() == mark.schemas);
+        std.debug.assert(self.contributions.supported() == mark.supported);
         self.strings.truncate(mark.strings);
         self.eval.scalars.truncate(mark.scalars);
         self.eval.values.truncate(mark.values);
@@ -645,8 +699,8 @@ test "a copy retaining some predicates holds their facts as base facts and nothi
     const atom = try db.eval.scalars.internAtom("a");
 
     var ground = [_]syntax.Term{.{ .scalar = atom }};
-    _ = try db.applyInsertion(.{ .predicate = kept, .terms = &ground });
-    _ = try db.applyInsertion(.{ .predicate = dropped, .terms = &ground });
+    _ = try db.applyInsertion(.{ .predicate = kept, .terms = &ground }, null);
+    _ = try db.applyInsertion(.{ .predicate = dropped, .terms = &ground }, null);
     // A closure holding one fact no base fact states, as materializing a rule
     // deriving it would have left, and the rule itself.
     db.closure = try db.facts.clone();
@@ -691,4 +745,31 @@ test "a copy retaining some predicates holds their facts as base facts and nothi
     try testing.expectEqual(@as(usize, 2), db.facts.len());
     try testing.expectEqual(@as(usize, 3), db.closure.?.len());
     try testing.expectEqual(@as(usize, 1), db.eval.rules.items.len);
+}
+
+test "a copy carries who asserts each fact, and shares none of it" {
+    var db: Database = .init(testing.allocator);
+    defer db.deinit();
+    const p = try db.strings.intern("p");
+    var a = [_]syntax.Term{.{ .scalar = try db.eval.scalars.internAtom("a") }};
+    var b = [_]syntax.Term{.{ .scalar = try db.eval.scalars.internAtom("b") }};
+    _ = try db.applyInsertion(.{ .predicate = p, .terms = &a }, "one.dl");
+    _ = try db.applyInsertion(.{ .predicate = p, .terms = &a }, "two.dl");
+    _ = try db.applyInsertion(.{ .predicate = p, .terms = &b }, null);
+    var a_values = [_]syntax.ValueId{try db.eval.termToValue(a[0], null)};
+    const fact_a: relation_store.Fact = .{ .predicate = p, .terms = &a_values };
+
+    var copy = try db.clone();
+    defer copy.deinit();
+    try testing.expect(copy.contributions.asserts("one.dl", fact_a));
+    try testing.expect(copy.contributions.asserts("two.dl", fact_a));
+    try testing.expectEqual(@as(usize, 1), copy.contributions.supported());
+
+    // Deleting the fact takes it from both contributors of the original, and
+    // from neither of the copy's.
+    try testing.expect(try db.applyRemoval(fact_a));
+    try testing.expect(!db.contributions.asserts("one.dl", fact_a));
+    try testing.expectEqual(@as(usize, 0), db.contributions.supported());
+    try testing.expect(copy.contributions.asserts("one.dl", fact_a));
+    try testing.expectEqual(@as(usize, 2), copy.facts.len());
 }

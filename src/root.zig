@@ -10,6 +10,7 @@ const std = @import("std");
 const aggregate_view = @import("aggregate_view.zig");
 const auxiliary_view = @import("auxiliary_view.zig");
 const compile = @import("compile.zig");
+const contribution = @import("contribution.zig");
 const cost_model = @import("cost_model.zig");
 const database = @import("database.zig");
 const errors = @import("errors.zig");
@@ -146,7 +147,7 @@ pub const Jatalog = struct {
     pub fn addFact(self: *Jatalog, predicate: []const u8, terms: []const input.Term) !void {
         var staging = try self.state.clone();
         defer staging.deinit();
-        try program_runner.addFact(&staging, input.fact(predicate, terms));
+        try program_runner.addFact(&staging, input.fact(predicate, terms), null);
         self.state.commit(&staging);
     }
 
@@ -521,6 +522,7 @@ pub const Jatalog = struct {
             parsed.value.statements,
             .{ .text = source, .spans = parsed.value.spans },
             diagnostic,
+            null,
         );
     }
 
@@ -529,12 +531,50 @@ pub const Jatalog = struct {
     /// share one transaction, which is what makes loading many facts cheap; a
     /// statement that fails keeps every statement before it and none of
     /// itself, and `diagnostic` names it by index.
+    ///
+    /// The facts the statements assert are `contributor`'s, as though each
+    /// were added to its contribution in turn; null asserts them for the
+    /// direct contributor, as `execute` does. See "Contributor" in
+    /// CONTEXT.md. Everything else runs as it would without one: rules and
+    /// schemas belong to the program, and a retraction takes its facts from
+    /// every contributor at its place in the order, so `p(a)~. p(a).` leaves
+    /// `p(a)` asserted by `contributor` alone.
     pub fn executeStatements(
         self: *Jatalog,
         statements: []const input.Statement,
         diagnostic: ?*Diagnostic,
+        contributor: ?[]const u8,
     ) !results.ExecutionResult {
-        return program_runner.execute(&self.state, statements, null, diagnostic);
+        return program_runner.execute(&self.state, statements, null, diagnostic, contributor);
+    }
+
+    /// Replaces everything `contributor` asserts with `facts`, and returns
+    /// whether the set of base facts changed.
+    ///
+    /// A base fact is present while at least one contributor asserts it —
+    /// a named one like `contributor`, or the direct contributor that
+    /// `addFact`, `applyChanges` and statements run without a contributor
+    /// assert for — so only the facts this makes present or absent change
+    /// anything, and only they take the update path `applyChanges` takes,
+    /// maintained or recomputed as the cost model decides. Sameness is the
+    /// engine's scalar identity: `1` and `1.0` are one fact, and so are a
+    /// cons chain and the list it spells, whoever asserts each. An empty
+    /// `facts` withdraws the contributor. See "Contributor" in CONTEXT.md.
+    ///
+    /// Only base facts are contributed; rules and schemas belong to the
+    /// program. Deleting a fact — by `applyChanges` or a retraction — takes
+    /// it from every contributor, and it comes back only when one asserts it
+    /// again.
+    ///
+    /// Commits atomically: a contribution holding a fact that is not ground
+    /// (`InvalidFact`), or one its schema rejects (`SchemaViolation`), fails
+    /// whole and leaves both the facts and every contribution as they were.
+    pub fn setContribution(
+        self: *Jatalog,
+        contributor: []const u8,
+        facts: []const input.Relation,
+    ) !bool {
+        return transaction.contribute(&self.state, contributor, facts);
     }
 };
 
@@ -570,6 +610,7 @@ test {
     _ = aggregate_view;
     _ = auxiliary_view;
     _ = compile;
+    _ = contribution;
     _ = cost_model;
     _ = database;
     _ = evaluator;
@@ -2415,7 +2456,7 @@ test "running parsed statements is running the source" {
         defer stepped.deinit();
         const parsed = try parseProgram(std.testing.allocator, source, null);
         defer parsed.deinit();
-        var from_statements = try stepped.executeStatements(parsed.value.statements, null);
+        var from_statements = try stepped.executeStatements(parsed.value.statements, null, null);
         defer from_statements.deinit();
 
         const expected = try renderAnswers(std.testing.allocator, &from_source.query);
@@ -2429,12 +2470,35 @@ test "running parsed statements is running the source" {
     }
 }
 
+test "contributions are made through setContribution and statements, and a clone keeps them" {
+    var db: Jatalog = .init(std.testing.allocator);
+    defer db.deinit();
+    try std.testing.expect(try db.setContribution("a.dl", &.{
+        input.fact("p", &.{input.atom("a")}),
+        input.fact("p", &.{input.integer(1)}),
+    }));
+    const statements = try parseProgram(std.testing.allocator, "p(1.0). p(b).", null);
+    defer statements.deinit();
+    var loaded = try db.executeStatements(statements.value.statements, null, "b.dl");
+    loaded.deinit();
+
+    var copy = try db.clone();
+    defer copy.deinit();
+    try std.testing.expect(try db.setContribution("a.dl", &.{}));
+    try expectAnswerCount(&db, "p(X)?", 2);
+    // The copy's `a.dl` still asserts `a`, and withdrawing it there is what
+    // takes `a` out of the copy.
+    try expectAnswerCount(&copy, "p(X)?", 3);
+    try std.testing.expect(try copy.setContribution("a.dl", &.{}));
+    try expectAnswerCount(&copy, "p(X)?", 2);
+}
+
 test "parsed rules and goals feed the descriptor interface" {
     var db: Jatalog = .init(std.testing.allocator);
     defer db.deinit();
     const facts = try parseProgram(std.testing.allocator, "edge(a, b). edge(b, c).", null);
     defer facts.deinit();
-    var loaded = try db.executeStatements(facts.value.statements, null);
+    var loaded = try db.executeStatements(facts.value.statements, null, null);
     loaded.deinit();
 
     const rules = [_][]const u8{
@@ -2479,7 +2543,7 @@ test "a failing statement is named whether it was parsed or built by hand" {
         .{ .fact = input.fact("p", &.{input.variable("X")}) },
     };
     diagnostic = .{};
-    try std.testing.expectError(Error.InvalidFact, db.executeStatements(&statements, &diagnostic));
+    try std.testing.expectError(Error.InvalidFact, db.executeStatements(&statements, &diagnostic, null));
     try std.testing.expectEqual(@as(?usize, 1), diagnostic.statement);
     try std.testing.expectEqual(@as(?Span, null), diagnostic.span);
     try expectAnswerCount(&db, "p(X)?", 2);

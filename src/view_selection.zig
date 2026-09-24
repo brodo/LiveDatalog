@@ -824,7 +824,7 @@ const test_support = @import("test_support.zig");
 fn runSource(db: *database.Database, text: []const u8) !results.ExecutionResult {
     const parsed = try parser.parseProgram(db.allocator, text, null);
     defer parsed.deinit();
-    return program.execute(db, parsed.value.statements, null, null);
+    return program.execute(db, parsed.value.statements, null, null, null);
 }
 
 fn loadSource(db: *database.Database, text: []const u8) !void {
@@ -836,7 +836,7 @@ fn loadSource(db: *database.Database, text: []const u8) !void {
 /// public interface would do. A sweep over hundreds of databases cannot afford
 /// a clone per fact.
 fn addFact(db: *database.Database, predicate: []const u8, terms: []const input.Term) !void {
-    return program.addFact(db, input.fact(predicate, terms));
+    return program.addFact(db, input.fact(predicate, terms), null);
 }
 
 /// One line per answer, sorted, holding the values only. A folded answer and

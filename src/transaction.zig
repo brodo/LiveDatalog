@@ -104,22 +104,49 @@ pub fn commitRetraction(db: *database.Database, removed: *const relation_store.R
     db.commit(&committed);
 }
 
-pub fn addFactExpr(db: *database.Database, value: syntax.Expr) !void {
-    const fact = try db.applyInsertion(value) orelse return;
+/// Asserts one ground fact on behalf of `contributor`, or of the direct
+/// contributor when that is null (see "Contributor" in CONTEXT.md).
+pub fn addFactExpr(db: *database.Database, value: syntax.Expr, contributor: ?[]const u8) !void {
+    const fact = try db.applyInsertion(value, contributor) orelse return;
     const key: relation_store.PredicateKey = .{ .name = fact.predicate, .arity = fact.terms.len };
     db.markBaseChanged(key) catch |err| {
-        // The insertion comes back out. A statement leaves the fact store
-        // either as it was or with its fact in it and nothing between, which
-        // is what lets a run of assertions share one transaction and still be
-        // undone one statement at a time: see `Database.rollback`, which has
-        // no way to put a fact back.
-        //
-        // The fact stamp stays where the insertion left it, which is the one
-        // direction it is allowed to be wrong in: a reader rebuilds something
-        // that was still good, rather than keeping something that is not.
-        db.facts.removeAt(db.facts.len() - 1);
+        // The insertion comes back out, and so does the record of who
+        // asserted it. A statement leaves the fact store either as it was or
+        // with its fact in it and nothing between, which is what lets a run
+        // of assertions share one transaction and still be undone one
+        // statement at a time: see `Database.rollback`, which has no way to
+        // put a fact back.
+        db.revokeInsertion();
         return err;
     };
+}
+
+/// Replaces what `contributor` asserts with `facts`, and returns whether the
+/// base facts changed: what `Jatalog.setContribution` is. See "Contributor" in
+/// CONTEXT.md.
+///
+/// Staged on a copy of `db` and committed only once it has succeeded, so a
+/// contribution that fails — a fact that is not ground, one its schema
+/// rejects — fails whole and changes neither the facts nor the records of who
+/// asserts them. Only the facts that became present or absent take the update
+/// path; see `update.contribute`.
+pub fn contribute(db: *database.Database, contributor: []const u8, facts: []const input.Relation) !bool {
+    var staging = try db.clone();
+    defer staging.deinit();
+    const compiled = try staging.allocator.alloc(syntax.Expr, facts.len);
+    var built: usize = 0;
+    defer {
+        for (compiled[0..built]) |expression| syntax.freeExpr(staging.allocator, expression);
+        staging.allocator.free(compiled);
+    }
+    for (facts, compiled) |fact, *slot| {
+        slot.* = try compile.compileRelation(&staging, fact.predicate, fact.terms, false);
+        built += 1;
+    }
+    const outcome = try update.contribute(&staging, contributor, compiled);
+    try materialization.verifyShadow(&staging);
+    if (outcome.recorded) db.commit(&staging);
+    return outcome.changed > 0;
 }
 
 /// Adds a rule whose body may contain aggregate clauses. On success the
@@ -548,7 +575,7 @@ fn defineReachableRule(db: *database.Database) !void {
 fn addAtomFact(db: *database.Database, predicate: []const u8, atom: []const u8) !void {
     const expression = try compile.compileRelation(db, predicate, &.{input.atom(atom)}, false);
     defer syntax.freeExpr(db.allocator, expression);
-    try addFactExpr(db, expression);
+    try addFactExpr(db, expression, null);
 }
 
 /// Compiles one relational goal against `db`, interning whatever it names
@@ -621,7 +648,7 @@ test "a listing with names projects answers onto them, lists each once, and sort
     for ([_][2][]const u8{ .{ "a", "one" }, .{ "b", "three" }, .{ "a", "two" } }) |pair| {
         const expression = try compile.compileRelation(&db, "p", &.{ input.atom(pair[0]), input.atom(pair[1]) }, false);
         defer syntax.freeExpr(db.allocator, expression);
-        try addFactExpr(&db, expression);
+        try addFactExpr(&db, expression, null);
     }
     const goals = try compile.compileGoals(&db, &.{
         input.relation("p", &.{ input.variable("X"), input.variable("Y") }),

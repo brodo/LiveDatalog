@@ -156,6 +156,63 @@ fn internInto(
     };
 }
 
+/// What replacing a contribution did.
+pub const Contributed = struct {
+    /// How many base facts became present or absent, as `apply` counts them.
+    changed: usize,
+    /// Whether the contributor's own set of facts changed, which can happen
+    /// with no base fact moving: another contributor may assert every fact
+    /// it gained or lost.
+    recorded: bool,
+};
+
+/// Replaces the facts `contributor` asserts with `facts`, and applies to the
+/// base facts only what that changes: a fact no contributor asserts any more
+/// is deleted, and a fact no contributor asserted before is inserted. See
+/// "Contributor" in CONTEXT.md.
+///
+/// Those facts, and nothing else, go through `apply`, so the cost model is
+/// asked about the facts that really move rather than the whole contribution,
+/// and the closure is maintained as for any other batch. Mutates `db`
+/// throughout and fails with it half-changed, like `apply`: a caller runs this
+/// against a clone, as `transaction.contribute` does.
+pub fn contribute(
+    db: *database.Database,
+    contributor: []const u8,
+    facts: []const syntax.Expr,
+) !Contributed {
+    var interned: std.ArrayList(relation_store.Fact) = .empty;
+    defer {
+        for (interned.items) |fact| db.allocator.free(fact.terms);
+        interned.deinit(db.allocator);
+    }
+    try interned.ensureTotalCapacity(db.allocator, facts.len);
+    for (facts) |expression| {
+        if (!expression.isGround() or expression.negated) return error.InvalidFact;
+        const terms = try internTerms(db, expression);
+        interned.appendAssumeCapacity(.{ .predicate = expression.predicate, .terms = terms });
+    }
+
+    var gone: relation_store.RelationStore = .init(db.allocator);
+    defer gone.deinit();
+    var arriving: std.ArrayList(usize) = .empty;
+    defer arriving.deinit(db.allocator);
+    const recorded = try db.contributions.replace(
+        db.allocator,
+        contributor,
+        interned.items,
+        &db.facts,
+        &gone,
+        &arriving,
+    );
+    if (gone.len() == 0 and arriving.items.len == 0) return .{ .changed = 0, .recorded = recorded };
+
+    const insertions = try db.allocator.alloc(syntax.Expr, arriving.items.len);
+    defer db.allocator.free(insertions);
+    for (arriving.items, insertions) |position, *insertion| insertion.* = facts[position];
+    return .{ .changed = try apply(db, .{ .resolved = &gone }, insertions), .recorded = recorded };
+}
+
 /// Applies the batch to the base facts alone, dirtying the strata that read
 /// each predicate it really changed, for the next read to rebuild from.
 fn recompute(
@@ -179,7 +236,7 @@ fn recompute(
         },
     }
     for (insertions) |expression| {
-        const fact = try db.applyInsertion(expression) orelse continue;
+        const fact = try db.applyInsertion(expression, null) orelse continue;
         count += 1;
         try db.markBaseChanged(.{ .name = fact.predicate, .arity = fact.terms.len });
     }
