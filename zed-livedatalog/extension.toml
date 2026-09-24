@@ -1,0 +1,18 @@
+id = "livedatalog"
+name = "LiveDatalog"
+version = "0.1.0"
+schema_version = 1
+authors = ["brodo"]
+description = "LiveDatalog support: tree-sitter highlighting and the development server's language listener"
+repository = "https://github.com/brodo/LiveDatalog"
+
+# The grammar lives in this repository. `rev` must name a pushed commit that
+# contains it; move it forward whenever grammar.js changes.
+[grammars.livedatalog]
+repository = "https://github.com/brodo/LiveDatalog"
+rev = "b019cf3c85c569ba6cd35e9dd1c5a64c4b22dc0f"
+path = "tree-sitter-livedatalog"
+
+[language_servers.livedatalog]
+name = "LiveDatalog language listener"
+languages = ["LiveDatalog"]

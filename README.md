@@ -64,6 +64,10 @@ for `.dl` files. It includes highlighting, scope and folding queries for
 editors that use tree-sitter. For diagnostics, hover and go to definition,
 connect the editor to the development server's language listener.
 
+[`zed-livedatalog`](zed-livedatalog) is a [Zed](https://zed.dev) extension
+built from both. It uses the grammar for highlighting and the outline, and
+connects Zed to a running server's language listener.
+
 ### Development server
 
 `zig build` installs a second binary, `LiveDatalogServer`, for local

@@ -52,3 +52,29 @@ jobs:
 
       # Corpus and highlight tests, then parse every example program.
       - run: npm test
+
+      - name: Check the Zed extension's queries compile against the grammar
+        run: |
+          for query in ../zed-livedatalog/languages/livedatalog/*.scm; do
+            npx tree-sitter query --quiet "$query" ../examples/*.dl ../examples/*/*.dl
+          done
+
+  zed:
+    name: Zed extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zed-livedatalog
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: rustup target add wasm32-wasip2
+
+      - run: cargo fmt --check
+
+      - run: cargo clippy --target wasm32-wasip2 -- -D warnings
+
+      - run: cargo test
+
+      # The build Zed runs when it installs the extension.
+      - run: cargo build --release --target wasm32-wasip2
