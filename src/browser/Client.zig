@@ -44,24 +44,38 @@ pub fn close(self: *Client, gpa: std.mem.Allocator) void {
 
 /// Sends `line` and reads its response, allocated in `arena`.
 pub fn request(self: *Client, arena: std.mem.Allocator, line: []const u8) !Response {
+    self.send(line) catch |err| return self.cause(err);
+    return readResponse(arena, &self.reader.interface) catch |err| self.cause(err);
+}
+
+fn send(self: *Client, line: []const u8) !void {
     try self.writer.interface.print("{s}\n", .{line});
     try self.writer.interface.flush();
-    return readResponse(arena, &self.reader.interface);
 }
 
 /// Sends `.watch`, after which the connection only reads `nextGeneration`.
 pub fn watch(self: *Client) !void {
-    try self.writer.interface.writeAll(".watch\n");
-    try self.writer.interface.flush();
+    self.send(".watch") catch |err| return self.cause(err);
 }
 
 /// The generation the next `generation <n>` line of a watched connection
 /// reports.
 pub fn nextGeneration(self: *Client) !u64 {
-    const line = try takeLine(&self.reader.interface);
+    const line = takeLine(&self.reader.interface) catch |err| return self.cause(err);
     const prefix = "generation ";
     if (!std.mem.startsWith(u8, line, prefix)) return error.UnexpectedResponse;
     return std.fmt.parseInt(u64, line[prefix.len..], 10) catch error.UnexpectedResponse;
+}
+
+/// Why the stream failed, where the reader or writer says only that it did.
+/// A canceled read or write is reported that way too, and the caller has to
+/// see `Canceled` to stop rather than reconnect.
+fn cause(self: *Client, err: anyerror) anyerror {
+    return switch (err) {
+        error.ReadFailed => self.reader.err orelse err,
+        error.WriteFailed => self.writer.err orelse err,
+        else => err,
+    };
 }
 
 // ---------------------------------------------------------------------------

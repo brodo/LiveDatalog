@@ -471,6 +471,33 @@ fn evictFarthest(table: *Table, page: usize) void {
     table.pages.swapRemoveAt(farthest);
 }
 
+const testing = std.testing;
+
+fn ignoreWake(_: ?*anyopaque) void {}
+
+test "canceling the tasks stops them while they wait on the server" {
+    const io = testing.io;
+    var server = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var model: Model = undefined;
+    model.init(testing.allocator, io, server.socket.address, ignoreWake, null);
+    defer model.deinit();
+    var fetcher = try io.concurrent(runFetcher, .{&model});
+    var watcher = try io.concurrent(runWatcher, .{&model});
+
+    // Neither connection is ever answered, so the fetcher waits for its
+    // catalog and the watcher for its first generation until canceled — as
+    // they do when the window closes.
+    const first = try server.accept(io);
+    defer first.close(io);
+    const second = try server.accept(io);
+    defer second.close(io);
+    try io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectError(error.Canceled, fetcher.cancel(io));
+    try testing.expectError(error.Canceled, watcher.cancel(io));
+}
+
 test {
     _ = Client;
 }
