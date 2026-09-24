@@ -1,6 +1,6 @@
 # A non-numeric value in a rule's comparison fails every query
 
-Status: needs-triage
+Status: ready-for-agent
 
 ## Problem
 
@@ -64,3 +64,32 @@ what the caller wrote.
 - Rebuild, lazy materialization, incremental insertion, delete-and-rederive and
   seeded rules all agree on the same input, and shadow verification passes.
 - The tutorial's "Equality and comparisons" section states the chosen meaning.
+
+## Comments
+
+Decided (2026-09-24): **(a) Skip**, recorded in
+`docs/adr/0005-non-numeric-operands-fail-in-rules.md`. In a rule, a comparison
+or arithmetic goal on a non-number fails for that binding and evaluation
+continues, on every path. A query's own goals keep raising `NumericType`.
+Acceptance is the (a) case above.
+
+What is left to do:
+
+- Make a non-numeric operand fail the goal for that binding inside rule
+  evaluation (`evaluator.zig`: `evalBuiltin` and its caller in
+  `matchClauses`), and keep raising it for a query's own goals. A query
+  still materializes through the rules first, so the distinction is whether
+  the evaluation derives a rule's head or answers a query's goals.
+- The seeded path in `applyRule` catches the error around the whole seed
+  value, not the binding, so one bad element skips every derivation from that
+  seed. Once the error no longer reaches it, that catch is dead code; remove
+  it.
+- The catches in `maintenance.zig` (around 414 and 494) and
+  `materialization.zig` (around 182 and 209) exist only because the error used
+  to reach them. Remove the ones that become dead, and check that every path
+  still agrees with a rebuild.
+- Tests: the program above, `applyChanges` with the bad fact against a clean
+  closure (accepted, and no answer from it), shadow verification on, and a
+  query whose own goal compares an atom (still `NumericType`).
+- Update the tutorial's "Equality and comparisons" section and the "Update
+  path" glossary entry if it needs it.
