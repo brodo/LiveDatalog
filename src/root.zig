@@ -179,12 +179,8 @@ pub const Jatalog = struct {
         // The copy is discarded and the instrument is not: a query's
         // candidates are this database's candidates whichever copy examined
         // them. See `evaluationWork`.
-        const work_before = self.state.eval.cost.work;
         var staging = try self.state.clone();
-        defer {
-            self.noteStagedWork(work_before, &staging);
-            staging.deinit();
-        }
+        defer self.state.release(&staging);
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
@@ -193,28 +189,10 @@ pub const Jatalog = struct {
         return transaction.queryClauses(&staging, compiled, order);
     }
 
-    /// Charges this database with what evaluating on a staging copy cost,
-    /// before the copy goes. `baseline` is where the counter stood when the
-    /// copy was taken, so what is charged is what the copy did rather than
-    /// what it inherited — and it is added to wherever the counter stands
-    /// now, which need not be the baseline if the operation also committed
-    /// work of its own.
-    fn noteStagedWork(
-        self: *Jatalog,
-        baseline: u64,
-        staging: *const database.Database,
-    ) void {
-        self.state.eval.cost.work +|= staging.eval.cost.work -| baseline;
-    }
-
     pub fn retract(self: *Jatalog, goals: []const input.Goal) !bool {
         try materialization.ensureMaterialized(&self.state);
-        const work_before = self.state.eval.cost.work;
         var staging = try self.state.clone();
-        defer {
-            self.noteStagedWork(work_before, &staging);
-            staging.deinit();
-        }
+        defer self.state.release(&staging);
         const compiled = try compile.compileGoals(&staging, goals);
         defer {
             for (compiled) |clause| syntax.freeClauseTree(staging.allocator, clause);
@@ -619,9 +597,9 @@ pub const Jatalog = struct {
             // Past here the cache owns it, and taking it in allocates
             // nothing, so there is no window where it belongs to neither.
             self.plans.keep(fold.entry, staged);
-            self.noteStagedWork(
-                baseline,
+            self.state.chargeWork(
                 &self.plans.entries.items[fold.entry].reconstruction.?,
+                baseline,
             );
         } else {
             self.plans.reconstruction_hits += 1;
@@ -643,8 +621,7 @@ pub const Jatalog = struct {
             .{ .variables = entry.answer_variables, .names = fold.names },
             order,
         );
-        self.state.eval.cost.work +|=
-            entry.reconstruction.?.eval.cost.work -| work_before;
+        self.state.chargeWork(&entry.reconstruction.?, work_before);
         return answers;
     }
 

@@ -147,6 +147,12 @@ pub const Database = struct {
     fact_generation: u64 = 0,
     /// Debug mode: verify every maintained closure against a fresh rebuild.
     shadow_verification: bool = false,
+    /// Where `eval.cost.work` stood on the database this one was cloned from,
+    /// at the moment it was cloned. A copy inherits its original's counter,
+    /// so this is what separates the work a copy did from the work it merely
+    /// carries; `release` charges back only the first. Read only while this
+    /// is a copy: a committed copy keeps the value, and nothing reads it.
+    work_at_clone: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Database {
         return .{
@@ -193,6 +199,7 @@ pub const Database = struct {
         result.maintained_groups = self.maintained_groups;
         result.fact_generation = self.fact_generation;
         result.shadow_verification = self.shadow_verification;
+        result.work_at_clone = self.eval.cost.work;
         errdefer {
             for (result.auxiliary.items) |*view| view.deinit(self.allocator);
             result.auxiliary.deinit(self.allocator);
@@ -215,6 +222,40 @@ pub const Database = struct {
         const previous = self.*;
         self.* = staging.*;
         staging.* = previous;
+    }
+
+    /// Charges this database with the work `from` has done since its counter
+    /// stood at `baseline`. For a copy that is kept rather than committed or
+    /// discarded — a folded plan's reconstruction, which lives on in the plan
+    /// cache and is solved against again — so that each use is charged its
+    /// own share and no use is charged twice: the caller reads the copy's
+    /// counter before using it and passes that as `baseline`.
+    ///
+    /// Added to wherever this counter stands now rather than set from the
+    /// copy's, because this database may have done work of its own in the
+    /// meantime. Saturating, like the counter itself.
+    pub fn chargeWork(self: *Database, from: *const Database, baseline: u64) void {
+        self.eval.cost.work +|= from.eval.cost.work -| baseline;
+    }
+
+    /// Discards a copy this database made of itself, charging this database
+    /// with the work the copy did first. See "Evaluation work" in CONTEXT.md:
+    /// work done on a copy is the database's work whatever becomes of the
+    /// copy, and a query is exactly evaluation on a copy nobody keeps, so a
+    /// counter that went with the copy would report nothing for one.
+    ///
+    /// What is charged is what the copy did since it was cloned, not what it
+    /// inherited, which is why `clone` records `work_at_clone`. A copy that is
+    /// committed needs none of this — `commit` installs its counter with the
+    /// rest of it — and after a commit `copy` holds this database's previous
+    /// state, which must not be released through here.
+    ///
+    /// Written as `defer db.release(&staging)` straight after the clone, so
+    /// that a statement that fails part-way is charged for what it did before
+    /// failing.
+    pub fn release(self: *Database, copy: *Database) void {
+        self.chargeWork(copy, copy.work_at_clone);
+        copy.deinit();
     }
 
     /// Inserts one ground base fact with set semantics, returning it as the
@@ -485,3 +526,41 @@ pub const Database = struct {
         return &self.facts;
     }
 };
+
+const testing = std.testing;
+
+// These stand in for evaluation by counting candidates directly: the counter
+// is what is being tested, and evaluating anything is the layers above.
+
+test "releasing a copy charges what the copy did, not what it inherited" {
+    var db: Database = .init(testing.allocator);
+    defer db.deinit();
+    db.eval.cost.noteCandidates(9);
+    try testing.expectEqual(@as(u64, 10), db.eval.cost.work);
+
+    var copy = try db.clone();
+    try testing.expectEqual(@as(u64, 10), copy.work_at_clone);
+    copy.eval.cost.noteCandidates(4);
+    // The database goes on working while the copy exists, and what it did is
+    // its own, so the copy's share is added to it rather than replacing it.
+    db.eval.cost.noteCandidates(1);
+    db.release(&copy);
+    try testing.expectEqual(@as(u64, 10 + 2 + 5), db.eval.cost.work);
+}
+
+test "charging from a kept copy charges each use only its own share" {
+    var db: Database = .init(testing.allocator);
+    defer db.deinit();
+    db.eval.cost.noteCandidates(9);
+    var kept = try db.clone();
+    defer kept.deinit();
+
+    for ([_]usize{ 2, 0 }) |candidates| {
+        const baseline = kept.eval.cost.work;
+        kept.eval.cost.noteCandidates(candidates);
+        db.chargeWork(&kept, baseline);
+    }
+    // Ten of its own, then three and one: the copy's inherited ten and its
+    // first use are never charged a second time.
+    try testing.expectEqual(@as(u64, 10 + 3 + 1), db.eval.cost.work);
+}
