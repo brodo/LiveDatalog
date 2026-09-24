@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     // This will evaluate the `run` step rather than the default step.
     // For a top level step to actually do something, it must depend on other
     // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
+    const run_step = b.step("run", "Run the command-line interpreter");
 
     // This creates a RunArtifact step in the build graph. A RunArtifact step
     // invokes an executable compiled by Zig. Steps will only be executed by the
@@ -120,6 +120,39 @@ pub fn build(b: *std.Build) void {
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+
+    // The query server: watches a directory of .dl files and answers queries
+    // over TCP. `zig build run-server -- examples/researchers`
+    const nightwatch = b.dependency("nightwatch", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("nightwatch");
+
+    const server_exe = b.addExecutable(.{
+        .name = "LiveDatalogServer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "LiveDatalog", .module = mod },
+                .{ .name = "nightwatch", .module = nightwatch },
+            },
+        }),
+    });
+
+    b.installArtifact(server_exe);
+
+    const run_server_step = b.step("run-server", "Run the file-watching query server");
+
+    const run_server_cmd = b.addRunArtifact(server_exe);
+    run_server_step.dependOn(&run_server_cmd.step);
+
+    run_server_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_server_cmd.addArgs(args);
     }
 
     const benchmark_exe = b.addExecutable(.{
@@ -296,6 +329,12 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const server_tests = b.addTest(.{
+        .root_module = server_exe.root_module,
+    });
+
+    const run_server_tests = b.addRunArtifact(server_tests);
+
     // Exercise the installed command-line program against the language
     // tutorial example so documentation and executable behavior cannot drift.
     const run_cli_test = b.addRunArtifact(exe);
@@ -314,6 +353,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(lint_step);
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_server_tests.step);
     test_step.dependOn(&run_cli_test.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.

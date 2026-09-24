@@ -40,6 +40,10 @@
             .url = "git+https://github.com/hazre/linenoize.git?ref=feat/port-zig-0.16#2bbea8dd5f0168d97252025d52e97c290ca67605",
             .hash = "linenoize-0.1.1-J7HK8Ij0AABZHu5JxdH3U_-PTri09lsSxVXzInmRCcba",
         },
+        .nightwatch = .{
+            .url = "git+https://github.com/neurocyte/nightwatch#4cef501981369bdc09ab66f19837b957db6c14f0",
+            .hash = "nightwatch-1.0.0-uXzeH2MLAwAij-fvvYoxhHpdaxWOL59lZXRaQ28Ng5KC",
+        },
     },
     .paths = .{
         "build.zig",
