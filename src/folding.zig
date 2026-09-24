@@ -1697,9 +1697,9 @@ fn freeRules(allocator: std.mem.Allocator, rules: []fold_ir.Rule) void {
 
 /// A plan in the executable language, ready to be installed and run.
 ///
-/// It owns its rules and goals. A caller that installs a rule takes ownership
-/// of that rule's head and clauses from it and says so with `takeRule`, since
-/// the database it hands them to will free them itself.
+/// It owns its rules and goals, and keeps them: a caller installing the rules
+/// in a database installs copies, because the same plan is installed again
+/// every time what it reads changes.
 pub const Executable = struct {
     allocator: std.mem.Allocator,
     rules: []syntax.Rule,
@@ -1711,15 +1711,6 @@ pub const Executable = struct {
         for (self.goals) |clause| syntax.freeClauseTree(self.allocator, clause);
         self.allocator.free(self.goals);
         self.* = undefined;
-    }
-
-    /// Hands rule `index` to the caller and leaves nothing of it behind, so
-    /// that installing it and then releasing the rest does not release it
-    /// twice. The body slice stays the caller's either way.
-    pub fn takeRule(self: *Executable, index: usize) syntax.Rule {
-        const rule = self.rules[index];
-        self.rules[index] = .{ .head = .{ .predicate = 0, .terms = &.{} }, .body = &.{} };
-        return rule;
     }
 };
 

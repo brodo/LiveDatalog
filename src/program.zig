@@ -380,6 +380,32 @@ test "structural parsing and evaluation release every allocation on failure" {
     try test_support.expectEveryAllocationFailureReleased(structuralAllocationScenario);
 }
 
+/// Runs a query whose plan reads an aggregate and a negation, then explains
+/// the same goals: planning and rendering a plan, under every allocation
+/// failure.
+fn planningAllocationScenario(allocator: std.mem.Allocator) !void {
+    var db: database.Database = .init(allocator);
+    defer db.deinit();
+    var setup = try runSource(&db,
+        \\edge(a, b). edge(b, c). node(a). node(b). node(c).
+        \\path(X, Y) :- edge(X, Y).
+        \\path(X, Z) :- edge(X, Y), path(Y, Z).
+        \\reach(X, S) :- node(X), setof(Y, path(X, Y), S).
+    );
+    setup.deinit();
+    var result = try runSource(&db, "reach(a, S), not path(a, a)?");
+    result.deinit();
+    const explained = try transaction.explain(&db, &.{
+        input.relation("reach", &.{ input.variable("X"), input.variable("S") }),
+        input.not("path", &.{ input.variable("X"), input.variable("X") }),
+    });
+    allocator.free(explained);
+}
+
+test "planning and explaining release every allocation on failure" {
+    try test_support.expectEveryAllocationFailureReleased(planningAllocationScenario);
+}
+
 fn aggregateAllocationScenario(allocator: std.mem.Allocator) !void {
     var db: database.Database = .init(allocator);
     defer db.deinit();
